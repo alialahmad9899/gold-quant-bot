@@ -289,7 +289,7 @@ def detect_smc_setup(df):
 # ------------------------------------
 def get_market_data():
     try:
-        gold_t = yf.Ticker("GC=F")
+        gold_t = yf.Ticker("XAUUSD=X")
         dxy_t = yf.Ticker("DX-Y.NYB")
         us10y_t = yf.Ticker("^TNX")
 
@@ -312,8 +312,8 @@ def get_market_data():
 
 def analyze_institutional_engine():
     try:
-        df_gold_h1 = yf.download("GC=F", period="60d", interval="1h", progress=False)
-        df_gold_m15 = yf.download("GC=F", period="5d", interval="15m", progress=False)
+        df_gold_h1 = yf.download("XAUUSD=X", period="60d", interval="1h", progress=False)
+        df_gold_m15 = yf.download("XAUUSD=X", period="5d", interval="15m", progress=False)
         df_dxy_m15 = yf.download("DX-Y.NYB", period="5d", interval="15m", progress=False)
         df_us10y_m15 = yf.download("^TNX", period="5d", interval="15m", progress=False)
 
@@ -662,7 +662,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
 if __name__ == '__main__':
-    # تشغيل خادم الويب في عملية منفصلة تضمن فتح المنفذ واستجابة Render Web Service فوراً
     flask_process = Process(target=run_flask)
     flask_process.start()
 
