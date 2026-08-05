@@ -57,7 +57,7 @@ def get_main_keyboard():
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 # ------------------------------------
-# 1. إدارة قاعدة البيانات
+# 1. إدارة قاعدة البيانات وتحديث الهيكل
 # ------------------------------------
 def get_db_connection():
     conn = sqlite3.connect(DB_FILE, timeout=15)
@@ -78,10 +78,24 @@ def init_db():
             tp2 REAL,
             rsi REAL,
             dxy_corr REAL,
+            macd_diff REAL DEFAULT 0,
+            stoch_k REAL DEFAULT 0,
+            volatility_ratio REAL DEFAULT 0,
             outcome INTEGER,
             confidence REAL
         )
     ''')
+    
+    # التأكد من وجود الأعمدة المتقدمة للتعلم الذاتي في حال وجود قاعدة بيانات سابقة
+    cursor.execute("PRAGMA table_info(trades)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if "macd_diff" not in columns:
+        cursor.execute("ALTER TABLE trades ADD COLUMN macd_diff REAL DEFAULT 0")
+    if "stoch_k" not in columns:
+        cursor.execute("ALTER TABLE trades ADD COLUMN stoch_k REAL DEFAULT 0")
+    if "volatility_ratio" not in columns:
+        cursor.execute("ALTER TABLE trades ADD COLUMN volatility_ratio REAL DEFAULT 0")
+
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS subscribers (
             chat_id INTEGER PRIMARY KEY
@@ -163,7 +177,7 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, message: str):
         except Exception as e:
             print(f"خطأ في إرسال الإشعار للآدمن: {e}")
 
-def log_trade(signal_type, entry, sl, tp1, tp2, rsi, dxy_corr, confidence):
+def log_trade(signal_type, entry, sl, tp1, tp2, rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, confidence):
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute('''
@@ -173,9 +187,9 @@ def log_trade(signal_type, entry, sl, tp1, tp2, rsi, dxy_corr, confidence):
     
     if cursor.fetchone() is None:
         cursor.execute('''
-            INSERT INTO trades (timestamp, signal_type, entry_price, sl, tp1, tp2, rsi, dxy_corr, outcome, confidence)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
-        ''', (datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), signal_type, entry, sl, tp1, tp2, rsi, dxy_corr, confidence))
+            INSERT INTO trades (timestamp, signal_type, entry_price, sl, tp1, tp2, rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, outcome, confidence)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+        ''', (datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), signal_type, entry, sl, tp1, tp2, rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, confidence))
         conn.commit()
     conn.close()
 
@@ -227,21 +241,37 @@ def update_open_trades_outcome_historical(df_m15):
     conn.commit()
     conn.close()
 
+# --- خوارزمية التعلم الذاتي المحسّنة والمطوّرة ---
 def train_self_learning_model():
     conn = get_db_connection()
-    df = pd.read_sql_query("SELECT rsi, dxy_corr, outcome FROM trades WHERE outcome IS NOT NULL", conn)
+    df = pd.read_sql_query(
+        "SELECT rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, outcome FROM trades WHERE outcome IS NOT NULL", 
+        conn
+    )
     conn.close()
 
     if len(df) < 10:
         return None
 
-    X = df[['rsi', 'dxy_corr']]
+    feature_cols = ['rsi', 'dxy_corr', 'macd_diff', 'stoch_k', 'volatility_ratio']
+    
+    # التأكد من ملء أي قيم مفقودة
+    df[feature_cols] = df[feature_cols].fillna(0)
+    
+    X = df[feature_cols]
     y = df['outcome']
 
     if len(np.unique(y)) < 2:
         return None
 
-    clf = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
+    # نموذج Random Forest المحسن والموزون لمنع التحيز
+    clf = RandomForestClassifier(
+        n_estimators=150, 
+        max_depth=6, 
+        min_samples_split=4, 
+        class_weight='balanced',
+        random_state=42
+    )
     clf.fit(X, y)
     return clf
 
@@ -285,10 +315,11 @@ def detect_smc_setup(df):
     }
 
 # ------------------------------------
-# 4. محرك البيانات المتقاطعة
+# 4. محرك البيانات المتقاطعة (XAUUSD=X Spot Gold)
 # ------------------------------------
 def get_market_data():
     try:
+        # استخدام رمز الذهب الفوري XAUUSD=X لتطابق المنصات اللحظية
         gold_t = yf.Ticker("XAUUSD=X")
         dxy_t = yf.Ticker("DX-Y.NYB")
         us10y_t = yf.Ticker("^TNX")
@@ -312,6 +343,7 @@ def get_market_data():
 
 def analyze_institutional_engine():
     try:
+        # الذهب الفوري لضمان المطابقة الكاملة
         df_gold_h1 = yf.download("XAUUSD=X", period="60d", interval="1h", progress=False)
         df_gold_m15 = yf.download("XAUUSD=X", period="5d", interval="15m", progress=False)
         df_dxy_m15 = yf.download("DX-Y.NYB", period="5d", interval="15m", progress=False)
@@ -386,7 +418,7 @@ def analyze_institutional_engine():
         return None
 
 # ------------------------------------
-# 5. خوارزمية توليد الإشارات
+# 5. خوارزمية توليد الإشارات المحسّنة
 # ------------------------------------
 def generate_quant_signal():
     safe_news, news_reason = check_news_guard()
@@ -410,24 +442,31 @@ def generate_quant_signal():
     high = to_1d_series(df['High'])
     low = to_1d_series(df['Low'])
 
+    # المؤشرات الفنية المتقدمة
     rsi = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]
     atr = ta.volatility.AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1]
     ema_fast = ta.trend.EMAIndicator(close, window=9).ema_indicator().iloc[-1]
     ema_slow = ta.trend.EMAIndicator(close, window=21).ema_indicator().iloc[-1]
+    
+    # دمج مؤشرات فنية إضافية لنموذج التعلم الذاتي
+    macd_diff = ta.trend.MACD(close).macd_diff().iloc[-1]
+    stoch_k = ta.momentum.StochasticOscillator(high, low, close).stoch().iloc[-1]
 
-    volatility_ratio = (atr / current_price) * 100
+    volatility_ratio = round((atr / current_price) * 100, 4)
     if volatility_ratio < 0.03:
         return {"status": "WAIT", "reason": "ضعف تذبذب السوق (Low Volatility Ratio).", "price": current_price}
 
     if state == "RANGING":
         return {"status": "WAIT", "reason": "السوق في نطاق عرضي تذبذبي على M15.", "price": current_price}
 
+    # التنبؤ بواسطة نموذج التعلم الذاتي المطور
     clf = train_self_learning_model()
     confidence = 0.82
     if clf:
         try:
-            input_df = pd.DataFrame([[rsi, dxy_corr]], columns=['rsi', 'dxy_corr'])
-            prob = clf.predict_proba(input_df)[0]
+            input_features = pd.DataFrame([[rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio]], 
+                                          columns=['rsi', 'dxy_corr', 'macd_diff', 'stoch_k', 'volatility_ratio'])
+            prob = clf.predict_proba(input_features)[0]
             confidence = round(float(np.max(prob)), 2)
         except Exception:
             confidence = 0.82
@@ -442,7 +481,7 @@ def generate_quant_signal():
         tp2 = round(current_price + (atr * 3.0), 2)
 
         candle_timestamp = str(df.index[-1])
-        log_trade("BUY", current_price, sl, tp1, tp2, round(rsi, 1), dxy_corr, confidence)
+        log_trade("BUY", current_price, sl, tp1, tp2, round(rsi, 1), dxy_corr, round(macd_diff, 3), round(stoch_k, 1), volatility_ratio, confidence)
 
         return {
             "status": "SIGNAL", "type": "🟢 شراء مؤسسي (BUY)", "entry": current_price,
@@ -461,7 +500,7 @@ def generate_quant_signal():
         tp2 = round(current_price - (atr * 3.0), 2)
 
         candle_timestamp = str(df.index[-1])
-        log_trade("SELL", current_price, sl, tp1, tp2, round(rsi, 1), dxy_corr, confidence)
+        log_trade("SELL", current_price, sl, tp1, tp2, round(rsi, 1), dxy_corr, round(macd_diff, 3), round(stoch_k, 1), volatility_ratio, confidence)
 
         return {
             "status": "SIGNAL", "type": "🔴 بيع مؤسسي (SELL)", "entry": current_price,
@@ -588,7 +627,7 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     data = await asyncio.to_thread(get_market_data)
     if data:
-        msg = f"📊 **أسعار السوق اللحظية**\n🟡 الذهب: ${data['gold']}\n💵 الدولار: {data['dxy']}\n📈 السندات: {data['us10y']}%"
+        msg = f"📊 **أسعار السوق اللحظية (Spot Gold)**\n🟡 الذهب (XAUUSD): ${data['gold']}\n💵 مؤشر الدولار: {data['dxy']}\n📈 عوائد السندات: {data['us10y']}%"
         await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -602,9 +641,9 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
         smc = res['smc']
         smc_status = "صاعد (FVG/Sweep)" if smc['fvg_bullish'] or smc['sweep_bullish'] else ("هابط (FVG/Sweep)" if smc['fvg_bearish'] or smc['sweep_bearish'] else "محايد")
         msg = (
-            f"🤖 **تقرير بنية السوق المؤسسية**\n"
+            f"🤖 **تقرير بنية السوق المؤسسية (XAU/USD)**\n"
             f"───────────────────\n"
-            f"💰 سعر الذهب: ${res['last_price']}\n"
+            f"💰 سعر الذهب الفوري: ${res['last_price']}\n"
             f"📈 اتجاه H4 الحاكم: {res['h4_trend']}\n"
             f"📊 حالة HMM (M15): {res['state_label']}\n"
             f"🏦 هيكل السيولة (SMC): {smc_status}\n"
@@ -636,32 +675,76 @@ async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = f"⏸️ **تنبيه الانتظار المؤسسي**\n💡 السبب: {sig['reason'] if sig else 'لا توجد فرصة مطابقة'}"
     await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
+# --- قسم الإحصائيات والتقارير التفصيلية المطور ---
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not is_authenticated(chat_id):
         await update.message.reply_text("🔒 يرجى إدخال كلمة السر أولاً لاستخدام البوت.")
         return
+        
     conn = get_db_connection()
     cursor = conn.cursor()
+    
+    # 1. إحصائيات عامة
     cursor.execute("SELECT COUNT(*), SUM(CASE WHEN outcome = 1 THEN 1 ELSE 0 END) FROM trades WHERE outcome IS NOT NULL")
-    total, wins = cursor.fetchone()
+    total_eval, total_wins = cursor.fetchone()
+    total_eval = total_eval or 0
+    total_wins = total_wins or 0
+    overall_win_rate = round((total_wins / total_eval * 100), 1) if total_eval > 0 else 0
+
+    # 2. إحصائيات آخر 7 أيام (أسبوعية)
+    cursor.execute('''
+        SELECT COUNT(*), SUM(CASE WHEN outcome = 1 THEN 1 ELSE 0 END) 
+        FROM trades 
+        WHERE outcome IS NOT NULL AND datetime(timestamp) >= datetime('now', '-7 days')
+    ''')
+    week_eval, week_wins = cursor.fetchone()
+    week_eval = week_eval or 0
+    week_wins = week_wins or 0
+    weekly_win_rate = round((week_wins / week_eval * 100), 1) if week_eval > 0 else 0
+
+    # 3. إحصائيات آخر 30 يوماً (شهرية)
+    cursor.execute('''
+        SELECT COUNT(*), SUM(CASE WHEN outcome = 1 THEN 1 ELSE 0 END) 
+        FROM trades 
+        WHERE outcome IS NOT NULL AND datetime(datetime(timestamp)) >= datetime('now', '-30 days')
+    ''')
+    month_eval, month_wins = cursor.fetchone()
+    month_eval = month_eval or 0
+    month_wins = month_wins or 0
+    monthly_win_rate = round((month_wins / month_eval * 100), 1) if month_eval > 0 else 0
+
+    # 4. تفكيك الأداء حسب نوع الإشارة (BUY vs SELL)
+    cursor.execute("SELECT COUNT(*), SUM(CASE WHEN outcome = 1 THEN 1 ELSE 0 END) FROM trades WHERE outcome IS NOT NULL AND signal_type LIKE '%BUY%'")
+    buy_total, buy_wins = cursor.fetchone()
+    buy_total = buy_total or 0
+    buy_wins = buy_wins or 0
+    buy_rate = round((buy_wins / buy_total * 100), 1) if buy_total > 0 else 0
+
+    cursor.execute("SELECT COUNT(*), SUM(CASE WHEN outcome = 1 THEN 1 ELSE 0 END) FROM trades WHERE outcome IS NOT NULL AND signal_type LIKE '%SELL%'")
+    sell_total, sell_wins = cursor.fetchone()
+    sell_total = sell_total or 0
+    sell_wins = sell_wins or 0
+    sell_rate = round((sell_wins / sell_total * 100), 1) if sell_total > 0 else 0
+
     conn.close()
     
-    wins = wins or 0
-    win_rate = round((wins / total * 100), 1) if total and total > 0 else 0
-    
     msg = (
-        f"📈 **سجل أداء المحرك الكمي (Institutional Log)**\n"
+        f"📊 **تقرير أداء المحرك الكمي التفصيلي (Quant Analytics)**\n"
         f"───────────────────\n"
-        f"🔢 إجمالي الصفقات المُقيّمة: {total}\n"
-        f"✅ الصفقات الناجحة: {wins}\n"
-        f"🎯 نسبة النجاح العامة: {win_rate}%\n"
+        f"📈 **معدل النجاح الكلي:** {overall_win_rate}% ({total_wins}/{total_eval})\n"
+        f"📅 **أداء آخر 7 أيام:** {weekly_win_rate}% ({week_wins}/{week_eval})\n"
+        f"🗓️ **أداء آخر 30 يوماً:** {monthly_win_rate}% ({month_wins}/{month_eval})\n"
         f"───────────────────\n"
-        f"💡 *تم تفعيل التتبع التاريخي الآلي وتحديث نموذج التعلم الذاتي.*"
+        f"🟢 **صفقات الشراء (BUY):** {buy_rate}% نجاح ({buy_wins}/{buy_total})\n"
+        f"🔴 **صفقات البيع (SELL):** {sell_rate}% نجاح ({sell_wins}/{sell_total})\n"
+        f"───────────────────\n"
+        f"💡 *يتم تحديث النموذج وإعادة تدريب Random Forest أوتوماتيكياً مع كل تقييم.*"
     )
     await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
 if __name__ == '__main__':
+    # تشغيل خادم الويب في عملية منفصلة تضمن فتح المنفذ واستجابة Render Web Service فوراً
     flask_process = Process(target=run_flask)
     flask_process.start()
 
