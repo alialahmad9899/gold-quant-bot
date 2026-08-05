@@ -3,6 +3,7 @@ import asyncio
 import sqlite3
 import psycopg2
 import os
+import requests
 from datetime import datetime, timezone, timedelta
 import numpy as np
 import pandas as pd
@@ -387,41 +388,83 @@ def detect_smc_setup(df):
 # 4. محرك البيانات المتقاطعة والأسعار اللحظية (Spot Gold + Futures)
 # ------------------------------------
 def get_market_data():
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    
+    gold = None
+    dxy = None
+    us10y = None
+
+    # 1. جلب سعر الذهب الفوري (Spot Gold XAUUSD) المباشر
     try:
-        gold_t = yf.Ticker("XAUUSD=X")
-        dxy_t = yf.Ticker("DX-Y.NYB")
-        us10y_t = yf.Ticker("^TNX")
+        url_gold = "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval=1m&range=1d"
+        r = requests.get(url_gold, headers=headers, timeout=5)
+        if r.status_code == 200:
+            res = r.json()
+            gold = res['chart']['result'][0]['meta']['regularMarketPrice']
+    except Exception as e:
+        print(f"تعذر جلب XAUUSD=X المباشر: {e}")
 
-        gold = None
+    # احتياطي: إذا فشل الفوري، يجلب سعر الفيوتشرز GC=F
+    if gold is None or np.isnan(gold):
         try:
-            gold = gold_t.fast_info.get('lastPrice', None)
-            if gold is None or np.isnan(gold):
-                hist = gold_t.history(period="1d")
-                if not hist.empty:
-                    gold = hist['Close'].iloc[-1]
-        except Exception:
-            gold = None
-
-        if gold is None or np.isnan(gold):
             gc_t = yf.Ticker("GC=F")
             gold = gc_t.fast_info.get('lastPrice', None)
             if gold is None or np.isnan(gold):
                 hist_gc = gc_t.history(period="1d")
                 if not hist_gc.empty:
                     gold = hist_gc['Close'].iloc[-1]
+        except Exception:
+            gold = None
 
-        dxy = dxy_t.fast_info.get('lastPrice', None)
-        if dxy is None or np.isnan(dxy):
-            dxy = dxy_t.history(period="1d")['Close'].iloc[-1]
+    # 2. جلب مؤشر الدولار (DXY)
+    try:
+        url_dxy = "https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB?interval=1m&range=1d"
+        r = requests.get(url_dxy, headers=headers, timeout=5)
+        if r.status_code == 200:
+            res = r.json()
+            dxy = res['chart']['result'][0]['meta']['regularMarketPrice']
+    except Exception:
+        try:
+            dxy = yf.Ticker("DX-Y.NYB").fast_info.get('lastPrice', None)
+        except Exception:
+            dxy = None
 
-        us10y = us10y_t.fast_info.get('lastPrice', None)
-        if us10y is None or np.isnan(us10y):
-            us10y = us10y_t.history(period="1d")['Close'].iloc[-1]
+    if dxy is None or np.isnan(dxy):
+        try:
+            hist_dxy = yf.Ticker("DX-Y.NYB").history(period="1d")
+            if not hist_dxy.empty:
+                dxy = hist_dxy['Close'].iloc[-1]
+        except Exception:
+            dxy = 99.85
 
-        return {"gold": round(float(gold), 2), "dxy": round(float(dxy), 2), "us10y": round(float(us10y), 2)}
-    except Exception as e:
-        print(f"خطأ في جلب الأسعار اللحظية: {e}")
-        return None
+    # 3. جلب عوائد السندات (US10Y)
+    try:
+        url_us10y = "https://query1.finance.yahoo.com/v8/finance/chart/^TNX?interval=1m&range=1d"
+        r = requests.get(url_us10y, headers=headers, timeout=5)
+        if r.status_code == 200:
+            res = r.json()
+            us10y = res['chart']['result'][0]['meta']['regularMarketPrice']
+    except Exception:
+        try:
+            us10y = yf.Ticker("^TNX").fast_info.get('lastPrice', None)
+        except Exception:
+            us10y = None
+
+    if us10y is None or np.isnan(us10y):
+        try:
+            hist_us10y = yf.Ticker("^TNX").history(period="1d")
+            if not hist_us10y.empty:
+                us10y = hist_us10y['Close'].iloc[-1]
+        except Exception:
+            us10y = 4.63
+
+    return {
+        "gold": round(float(gold), 2) if gold is not None and not np.isnan(gold) else 0.0,
+        "dxy": round(float(dxy), 2) if dxy is not None and not np.isnan(dxy) else 0.0,
+        "us10y": round(float(us10y), 2) if us10y is not None and not np.isnan(us10y) else 0.0
+    }
 
 def analyze_institutional_engine():
     try:
