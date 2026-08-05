@@ -1,6 +1,7 @@
 import logging
 import asyncio
 import sqlite3
+import psycopg2
 import os
 from datetime import datetime, timezone, timedelta
 import numpy as np
@@ -26,8 +27,9 @@ def run_flask():
     port = int(os.environ.get("PORT", 10000))
     web_app.run(host="0.0.0.0", port=port)
 
-# 🔒 جلب التوكن من متغيرات البيئة
+# 🔒 جلب التوكن وقاعدة البيانات من متغيرات البيئة
 TOKEN = os.getenv("TELEGRAM_TOKEN", "8560548173:AAGrJpVfV9Et7l8mMdUtr6Xlj8SJ_lQzxNc")
+DATABASE_URL = os.getenv("DATABASE_URL")
 DB_FILE = "trades.db"
 
 # ------------------------------------
@@ -57,61 +59,92 @@ def get_main_keyboard():
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 # ------------------------------------
-# 1. إدارة قاعدة البيانات وتحديث الهيكل
+# 1. إدارة قاعدة البيانات الهجينة (PostgreSQL / SQLite)
 # ------------------------------------
+def is_postgres():
+    return DATABASE_URL is not None and len(DATABASE_URL.strip()) > 0
+
 def get_db_connection():
-    conn = sqlite3.connect(DB_FILE, timeout=15)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    return conn
+    if is_postgres():
+        url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+        conn = psycopg2.connect(url, sslmode='require')
+        return conn
+    else:
+        conn = sqlite3.connect(DB_FILE, timeout=15)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        return conn
 
 def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            signal_type TEXT,
-            entry_price REAL,
-            sl REAL,
-            tp1 REAL,
-            tp2 REAL,
-            rsi REAL,
-            dxy_corr REAL,
-            macd_diff REAL DEFAULT 0,
-            stoch_k REAL DEFAULT 0,
-            volatility_ratio REAL DEFAULT 0,
-            outcome INTEGER,
-            confidence REAL
-        )
-    ''')
     
-    # التأكد من وجود الأعمدة المتقدمة للتعلم الذاتي في حال وجود قاعدة بيانات سابقة
-    cursor.execute("PRAGMA table_info(trades)")
-    columns = [col[1] for col in cursor.fetchall()]
-    if "macd_diff" not in columns:
-        cursor.execute("ALTER TABLE trades ADD COLUMN macd_diff REAL DEFAULT 0")
-    if "stoch_k" not in columns:
-        cursor.execute("ALTER TABLE trades ADD COLUMN stoch_k REAL DEFAULT 0")
-    if "volatility_ratio" not in columns:
-        cursor.execute("ALTER TABLE trades ADD COLUMN volatility_ratio REAL DEFAULT 0")
+    if is_postgres():
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS trades (
+                id SERIAL PRIMARY KEY,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                signal_type VARCHAR(50),
+                entry_price REAL,
+                sl REAL,
+                tp1 REAL,
+                tp2 REAL,
+                rsi REAL,
+                dxy_corr REAL,
+                macd_diff REAL DEFAULT 0,
+                stoch_k REAL DEFAULT 0,
+                volatility_ratio REAL DEFAULT 0,
+                outcome INTEGER,
+                confidence REAL
+            );
+            CREATE TABLE IF NOT EXISTS subscribers (
+                chat_id BIGINT PRIMARY KEY
+            );
+            CREATE TABLE IF NOT EXISTS authenticated_users (
+                chat_id BIGINT PRIMARY KEY
+            );
+            CREATE TABLE IF NOT EXISTS config (
+                key VARCHAR(50) PRIMARY KEY,
+                value BIGINT
+            );
+        ''')
+    else:
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                signal_type TEXT,
+                entry_price REAL,
+                sl REAL,
+                tp1 REAL,
+                tp2 REAL,
+                rsi REAL,
+                dxy_corr REAL,
+                macd_diff REAL DEFAULT 0,
+                stoch_k REAL DEFAULT 0,
+                volatility_ratio REAL DEFAULT 0,
+                outcome INTEGER,
+                confidence REAL
+            )
+        ''')
+        cursor.execute("PRAGMA table_info(trades)")
+        columns = [col[1] for col in cursor.fetchall()]
+        if "macd_diff" not in columns:
+            cursor.execute("ALTER TABLE trades ADD COLUMN macd_diff REAL DEFAULT 0")
+        if "stoch_k" not in columns:
+            cursor.execute("ALTER TABLE trades ADD COLUMN stoch_k REAL DEFAULT 0")
+        if "volatility_ratio" not in columns:
+            cursor.execute("ALTER TABLE trades ADD COLUMN volatility_ratio REAL DEFAULT 0")
 
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS subscribers (
-            chat_id INTEGER PRIMARY KEY
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS authenticated_users (
-            chat_id INTEGER PRIMARY KEY
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS config (
-            key TEXT PRIMARY KEY,
-            value INTEGER
-        )
-    ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS subscribers (chat_id INTEGER PRIMARY KEY)
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS authenticated_users (chat_id INTEGER PRIMARY KEY)
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value INTEGER)
+        ''')
+
     conn.commit()
     conn.close()
 
@@ -122,7 +155,10 @@ def set_admin_id(chat_id):
     ADMIN_CHAT_ID = chat_id
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('admin_id', ?)", (chat_id,))
+    if is_postgres():
+        cursor.execute("INSERT INTO config (key, value) VALUES ('admin_id', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (chat_id,))
+    else:
+        cursor.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('admin_id', ?)", (chat_id,))
     conn.commit()
     conn.close()
 
@@ -130,7 +166,10 @@ def load_admin_id():
     global ADMIN_CHAT_ID
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT value FROM config WHERE key = 'admin_id'")
+    if is_postgres():
+        cursor.execute("SELECT value FROM config WHERE key = 'admin_id'")
+    else:
+        cursor.execute("SELECT value FROM config WHERE key = 'admin_id'")
     row = cursor.fetchone()
     conn.close()
     if row:
@@ -141,7 +180,8 @@ load_admin_id()
 def is_authenticated(chat_id):
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT chat_id FROM authenticated_users WHERE chat_id = ?", (chat_id,))
+    ph = "%s" if is_postgres() else "?"
+    cursor.execute(f"SELECT chat_id FROM authenticated_users WHERE chat_id = {ph}", (chat_id,))
     res = cursor.fetchone()
     conn.close()
     return res is not None
@@ -149,7 +189,10 @@ def is_authenticated(chat_id):
 def authenticate_user(chat_id):
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("INSERT OR IGNORE INTO authenticated_users (chat_id) VALUES (?)", (chat_id,))
+    if is_postgres():
+        cursor.execute("INSERT INTO authenticated_users (chat_id) VALUES (%s) ON CONFLICT DO NOTHING", (chat_id,))
+    else:
+        cursor.execute("INSERT OR IGNORE INTO authenticated_users (chat_id) VALUES (?)", (chat_id,))
     conn.commit()
     conn.close()
     if ADMIN_CHAT_ID == 0:
@@ -158,7 +201,10 @@ def authenticate_user(chat_id):
 def add_subscriber(chat_id):
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("INSERT OR IGNORE INTO subscribers (chat_id) VALUES (?)", (chat_id,))
+    if is_postgres():
+        cursor.execute("INSERT INTO subscribers (chat_id) VALUES (%s) ON CONFLICT DO NOTHING", (chat_id,))
+    else:
+        cursor.execute("INSERT OR IGNORE INTO subscribers (chat_id) VALUES (?)", (chat_id,))
     conn.commit()
     conn.close()
 
@@ -180,17 +226,30 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, message: str):
 def log_trade(signal_type, entry, sl, tp1, tp2, rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, confidence):
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('''
-        SELECT id FROM trades 
-        WHERE signal_type = ? AND entry_price = ? AND datetime(timestamp) >= datetime('now', '-15 minutes')
-    ''', (signal_type, entry))
     
-    if cursor.fetchone() is None:
+    if is_postgres():
         cursor.execute('''
-            INSERT INTO trades (timestamp, signal_type, entry_price, sl, tp1, tp2, rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, outcome, confidence)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
-        ''', (datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), signal_type, entry, sl, tp1, tp2, rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, confidence))
-        conn.commit()
+            SELECT id FROM trades 
+            WHERE signal_type = %s AND entry_price = %s AND timestamp >= NOW() - INTERVAL '15 minutes'
+        ''', (signal_type, entry))
+        if cursor.fetchone() is None:
+            cursor.execute('''
+                INSERT INTO trades (timestamp, signal_type, entry_price, sl, tp1, tp2, rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, outcome, confidence)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s)
+            ''', (datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), signal_type, entry, sl, tp1, tp2, rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, confidence))
+            conn.commit()
+    else:
+        cursor.execute('''
+            SELECT id FROM trades 
+            WHERE signal_type = ? AND entry_price = ? AND datetime(timestamp) >= datetime('now', '-15 minutes')
+        ''', (signal_type, entry))
+        if cursor.fetchone() is None:
+            cursor.execute('''
+                INSERT INTO trades (timestamp, signal_type, entry_price, sl, tp1, tp2, rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, outcome, confidence)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+            ''', (datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), signal_type, entry, sl, tp1, tp2, rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, confidence))
+            conn.commit()
+            
     conn.close()
 
 def update_open_trades_outcome_historical(df_m15):
@@ -211,10 +270,15 @@ def update_open_trades_outcome_historical(df_m15):
 
     highs = to_1d_series(df_m15['High'])
     lows = to_1d_series(df_m15['Low'])
+    ph = "%s" if is_postgres() else "?"
 
     for trade_id, trade_time_str, sig_type, sl, tp1 in open_trades:
         try:
-            trade_time = datetime.strptime(trade_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            if isinstance(trade_time_str, datetime):
+                trade_time = trade_time_str.replace(tzinfo=timezone.utc)
+            else:
+                trade_time = datetime.strptime(str(trade_time_str)[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                
             mask = df_index >= trade_time
             if not mask.any():
                 continue
@@ -227,21 +291,21 @@ def update_open_trades_outcome_historical(df_m15):
 
             if "BUY" in sig_type or "شراء" in sig_type:
                 if max_price_after_trade >= tp1:
-                    cursor.execute("UPDATE trades SET outcome = 1 WHERE id = ?", (trade_id,))
+                    cursor.execute(f"UPDATE trades SET outcome = 1 WHERE id = {ph}", (trade_id,))
                 elif min_price_after_trade <= sl:
-                    cursor.execute("UPDATE trades SET outcome = 0 WHERE id = ?", (trade_id,))
+                    cursor.execute(f"UPDATE trades SET outcome = 0 WHERE id = {ph}", (trade_id,))
             elif "SELL" in sig_type or "بيع" in sig_type:
                 if min_price_after_trade <= tp1:
-                    cursor.execute("UPDATE trades SET outcome = 1 WHERE id = ?", (trade_id,))
+                    cursor.execute(f"UPDATE trades SET outcome = 1 WHERE id = {ph}", (trade_id,))
                 elif max_price_after_trade >= sl:
-                    cursor.execute("UPDATE trades SET outcome = 0 WHERE id = ?", (trade_id,))
+                    cursor.execute(f"UPDATE trades SET outcome = 0 WHERE id = {ph}", (trade_id,))
         except Exception as e:
             print(f"خطأ في تقييم تتبع الصفقة رقم {trade_id}: {e}")
 
     conn.commit()
     conn.close()
 
-# --- خوارزمية التعلم الذاتي المحسّنة والمطوّرة ---
+# --- خوارزمية التعلم الذاتي المحسّنة ---
 def train_self_learning_model():
     conn = get_db_connection()
     df = pd.read_sql_query(
@@ -254,8 +318,6 @@ def train_self_learning_model():
         return None
 
     feature_cols = ['rsi', 'dxy_corr', 'macd_diff', 'stoch_k', 'volatility_ratio']
-    
-    # التأكد من ملء أي قيم مفقودة
     df[feature_cols] = df[feature_cols].fillna(0)
     
     X = df[feature_cols]
@@ -264,7 +326,6 @@ def train_self_learning_model():
     if len(np.unique(y)) < 2:
         return None
 
-    # نموذج Random Forest المحسن والموزون لمنع التحيز
     clf = RandomForestClassifier(
         n_estimators=150, 
         max_depth=6, 
@@ -319,7 +380,6 @@ def detect_smc_setup(df):
 # ------------------------------------
 def get_market_data():
     try:
-        # استخدام رمز الذهب الفوري XAUUSD=X لتطابق المنصات اللحظية
         gold_t = yf.Ticker("XAUUSD=X")
         dxy_t = yf.Ticker("DX-Y.NYB")
         us10y_t = yf.Ticker("^TNX")
@@ -343,7 +403,6 @@ def get_market_data():
 
 def analyze_institutional_engine():
     try:
-        # الذهب الفوري لضمان المطابقة الكاملة
         df_gold_h1 = yf.download("XAUUSD=X", period="60d", interval="1h", progress=False)
         df_gold_m15 = yf.download("XAUUSD=X", period="5d", interval="15m", progress=False)
         df_dxy_m15 = yf.download("DX-Y.NYB", period="5d", interval="15m", progress=False)
@@ -418,7 +477,7 @@ def analyze_institutional_engine():
         return None
 
 # ------------------------------------
-# 5. خوارزمية توليد الإشارات المحسّنة
+# 5. خوارزمية توليد الإشارات
 # ------------------------------------
 def generate_quant_signal():
     safe_news, news_reason = check_news_guard()
@@ -442,13 +501,11 @@ def generate_quant_signal():
     high = to_1d_series(df['High'])
     low = to_1d_series(df['Low'])
 
-    # المؤشرات الفنية المتقدمة
     rsi = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]
     atr = ta.volatility.AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1]
     ema_fast = ta.trend.EMAIndicator(close, window=9).ema_indicator().iloc[-1]
     ema_slow = ta.trend.EMAIndicator(close, window=21).ema_indicator().iloc[-1]
     
-    # دمج مؤشرات فنية إضافية لنموذج التعلم الذاتي
     macd_diff = ta.trend.MACD(close).macd_diff().iloc[-1]
     stoch_k = ta.momentum.StochasticOscillator(high, low, close).stoch().iloc[-1]
 
@@ -459,7 +516,6 @@ def generate_quant_signal():
     if state == "RANGING":
         return {"status": "WAIT", "reason": "السوق في نطاق عرضي تذبذبي على M15.", "price": current_price}
 
-    # التنبؤ بواسطة نموذج التعلم الذاتي المطور
     clf = train_self_learning_model()
     confidence = 0.82
     if clf:
@@ -675,7 +731,6 @@ async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = f"⏸️ **تنبيه الانتظار المؤسسي**\n💡 السبب: {sig['reason'] if sig else 'لا توجد فرصة مطابقة'}"
     await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
-# --- قسم الإحصائيات والتقارير التفصيلية المطور ---
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not is_authenticated(chat_id):
@@ -685,53 +740,47 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # 1. إحصائيات عامة
     cursor.execute("SELECT COUNT(*), SUM(CASE WHEN outcome = 1 THEN 1 ELSE 0 END) FROM trades WHERE outcome IS NOT NULL")
     total_eval, total_wins = cursor.fetchone()
     total_eval = total_eval or 0
     total_wins = total_wins or 0
     overall_win_rate = round((total_wins / total_eval * 100), 1) if total_eval > 0 else 0
 
-    # 2. إحصائيات آخر 7 أيام (أسبوعية)
-    cursor.execute('''
-        SELECT COUNT(*), SUM(CASE WHEN outcome = 1 THEN 1 ELSE 0 END) 
-        FROM trades 
-        WHERE outcome IS NOT NULL AND datetime(timestamp) >= datetime('now', '-7 days')
-    ''')
-    week_eval, week_wins = cursor.fetchone()
-    week_eval = week_eval or 0
-    week_wins = week_wins or 0
+    if is_postgres():
+        cursor.execute("SELECT COUNT(*), SUM(CASE WHEN outcome = 1 THEN 1 ELSE 0 END) FROM trades WHERE outcome IS NOT NULL AND timestamp >= NOW() - INTERVAL '7 days'")
+        week_eval, week_wins = cursor.fetchone()
+        cursor.execute("SELECT COUNT(*), SUM(CASE WHEN outcome = 1 THEN 1 ELSE 0 END) FROM trades WHERE outcome IS NOT NULL AND timestamp >= NOW() - INTERVAL '30 days'")
+        month_eval, month_wins = cursor.fetchone()
+    else:
+        cursor.execute("SELECT COUNT(*), SUM(CASE WHEN outcome = 1 THEN 1 ELSE 0 END) FROM trades WHERE outcome IS NOT NULL AND datetime(timestamp) >= datetime('now', '-7 days')")
+        week_eval, week_wins = cursor.fetchone()
+        cursor.execute("SELECT COUNT(*), SUM(CASE WHEN outcome = 1 THEN 1 ELSE 0 END) FROM trades WHERE outcome IS NOT NULL AND datetime(timestamp) >= datetime('now', '-30 days')")
+        month_eval, month_wins = cursor.fetchone()
+
+    week_eval, week_wins = week_eval or 0, week_wins or 0
     weekly_win_rate = round((week_wins / week_eval * 100), 1) if week_eval > 0 else 0
 
-    # 3. إحصائيات آخر 30 يوماً (شهرية)
-    cursor.execute('''
-        SELECT COUNT(*), SUM(CASE WHEN outcome = 1 THEN 1 ELSE 0 END) 
-        FROM trades 
-        WHERE outcome IS NOT NULL AND datetime(datetime(timestamp)) >= datetime('now', '-30 days')
-    ''')
-    month_eval, month_wins = cursor.fetchone()
-    month_eval = month_eval or 0
-    month_wins = month_wins or 0
+    month_eval, month_wins = month_eval or 0, month_wins or 0
     monthly_win_rate = round((month_wins / month_eval * 100), 1) if month_eval > 0 else 0
 
-    # 4. تفكيك الأداء حسب نوع الإشارة (BUY vs SELL)
     cursor.execute("SELECT COUNT(*), SUM(CASE WHEN outcome = 1 THEN 1 ELSE 0 END) FROM trades WHERE outcome IS NOT NULL AND signal_type LIKE '%BUY%'")
     buy_total, buy_wins = cursor.fetchone()
-    buy_total = buy_total or 0
-    buy_wins = buy_wins or 0
+    buy_total, buy_wins = buy_total or 0, buy_wins or 0
     buy_rate = round((buy_wins / buy_total * 100), 1) if buy_total > 0 else 0
 
     cursor.execute("SELECT COUNT(*), SUM(CASE WHEN outcome = 1 THEN 1 ELSE 0 END) FROM trades WHERE outcome IS NOT NULL AND signal_type LIKE '%SELL%'")
     sell_total, sell_wins = cursor.fetchone()
-    sell_total = sell_total or 0
-    sell_wins = sell_wins or 0
+    sell_total, sell_wins = sell_total or 0, sell_wins or 0
     sell_rate = round((sell_wins / sell_total * 100), 1) if sell_total > 0 else 0
 
     conn.close()
     
+    db_type_str = "Supabase PostgreSQL (سحابية دائمية)" if is_postgres() else "SQLite (محلية)"
+    
     msg = (
         f"📊 **تقرير أداء المحرك الكمي التفصيلي (Quant Analytics)**\n"
         f"───────────────────\n"
+        f"🗄️ **قاعدة البيانات:** {db_type_str}\n"
         f"📈 **معدل النجاح الكلي:** {overall_win_rate}% ({total_wins}/{total_eval})\n"
         f"📅 **أداء آخر 7 أيام:** {weekly_win_rate}% ({week_wins}/{week_eval})\n"
         f"🗓️ **أداء آخر 30 يوماً:** {monthly_win_rate}% ({month_wins}/{month_eval})\n"
@@ -744,7 +793,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
 if __name__ == '__main__':
-    # تشغيل خادم الويب في عملية منفصلة تضمن فتح المنفذ واستجابة Render Web Service فوراً
     flask_process = Process(target=run_flask)
     flask_process.start()
 
