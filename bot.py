@@ -718,8 +718,19 @@ def generate_quant_signal():
         }
 
 # ------------------------------------
-# 6. المراقبة الآلية ومراقب الذاكرة العشوائية
+# 6. المراقبة الآلية ومراقب الذاكرة العشوائية والحيويّة
 # ------------------------------------
+async def keep_alive_ping():
+    """إرسال طلب HTTP ذاتي كل 8 دقائق لإبقاء سيرفر Render نشطاً ومستيقظاً 24/7"""
+    url = os.getenv("RENDER_EXTERNAL_URL", "https://gold-quant-bot.onrender.com")
+    while True:
+        await asyncio.sleep(480)  # التكرار كل 8 دقائق (أقل من مهلة الخمول 15 دقيقة)
+        try:
+            await asyncio.to_thread(requests.get, url, timeout=5)
+            print("⚓ تم إرسال إشارة الاستيقاظ الذاتية لـ Render بنجاح.")
+        except Exception as e:
+            print(f"تنبيه فحص الاستيقاظ الذاتي: {e}")
+
 async def background_cache_worker():
     """تحديث الكاش كل 5 ثوان لتوازن مثالي بين السرعة واستقرار السيرفر"""
     while True:
@@ -768,6 +779,7 @@ async def auto_market_scanner(app):
 async def post_init(app):
     asyncio.create_task(background_cache_worker())
     asyncio.create_task(auto_market_scanner(app))
+    asyncio.create_task(keep_alive_ping())
 
 # --- الأوامر المباشرة ---
 async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
