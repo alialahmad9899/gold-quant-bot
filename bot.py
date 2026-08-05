@@ -68,7 +68,7 @@ def get_db_connection():
     if is_postgres():
         try:
             url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-            conn = psycopg2.connect(url, sslmode='require', connect_timeout=10)
+            conn = psycopg2.connect(url, sslmode='require', connect_timeout=5)
             return conn
         except Exception as e:
             print(f"⚠️ يتعذر الاتصال بـ PostgreSQL حالياً: {e}. جاري العمل على SQLite كخيار احتياطي.")
@@ -157,8 +157,6 @@ def init_db():
     except Exception as e:
         print(f"خطأ أثناء تهيئة قاعدة البيانات: {e}")
 
-init_db()
-
 def set_admin_id(chat_id):
     global ADMIN_CHAT_ID
     ADMIN_CHAT_ID = chat_id
@@ -173,18 +171,16 @@ def set_admin_id(chat_id):
 
 def load_admin_id():
     global ADMIN_CHAT_ID
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    if is_postgres() and isinstance(conn, psycopg2.extensions.connection):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
         cursor.execute("SELECT value FROM config WHERE key = 'admin_id'")
-    else:
-        cursor.execute("SELECT value FROM config WHERE key = 'admin_id'")
-    row = cursor.fetchone()
-    conn.close()
-    if row:
-        ADMIN_CHAT_ID = row[0]
-
-load_admin_id()
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            ADMIN_CHAT_ID = row[0]
+    except Exception as e:
+        print(f"خطأ في تحميل معرف الأدمن: {e}")
 
 def is_authenticated(chat_id):
     conn = get_db_connection()
@@ -406,7 +402,6 @@ def get_market_data():
         except Exception:
             gold = None
 
-        # خيار احتياطي لسعر الذهب في حال عدم توفر السعر الفوري اللحظي
         if gold is None or np.isnan(gold):
             gc_t = yf.Ticker("GC=F")
             gold = gc_t.fast_info.get('lastPrice', None)
@@ -430,7 +425,6 @@ def get_market_data():
 
 def analyze_institutional_engine():
     try:
-        # جلب شموع التحليل الفني من عقود الذهب الضامنة لعدم حدوث أخطاء 404
         df_gold_h1 = yf.download("GC=F", period="60d", interval="1h", progress=False)
         df_gold_m15 = yf.download("GC=F", period="5d", interval="15m", progress=False)
         df_dxy_m15 = yf.download("DX-Y.NYB", period="5d", interval="15m", progress=False)
@@ -488,7 +482,6 @@ def analyze_institutional_engine():
 
         smc = detect_smc_setup(df_gold_m15)
         
-        # ربط السعر المعروض بالسعر الفوري المطابق للمنصات (Spot Gold XAU/USD)
         spot_data = get_market_data()
         if spot_data and spot_data.get("gold"):
             last_price = spot_data["gold"]
@@ -829,9 +822,15 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
 if __name__ == '__main__':
+    # 1. تشغيل خادم Flask لإرضاء Render وفحص المنفذ فوراً
     flask_process = Process(target=run_flask)
     flask_process.start()
 
+    # 2. تهيئة قاعدة البيانات وتحميل الإعدادات بعد ضمان فتح المنفذ
+    init_db()
+    load_admin_id()
+
+    # 3. تشغيل بوت تليجرام
     app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
     
     app.add_handler(CommandHandler("start", start))
