@@ -5,6 +5,7 @@ import psycopg2
 import os
 import requests
 import re
+import gc
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
 import numpy as np
@@ -36,7 +37,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 DB_FILE = "trades.db"
 
 # ------------------------------------
-# 🔑 إعدادات الحماية والآدمن
+# 🔑 إعدادات الحماية والآدمن والكاش
 # ------------------------------------
 PASSWORD = "12341212"
 ADMIN_CHAT_ID = 0
@@ -47,6 +48,10 @@ GLOBAL_CACHE = {
     "analysis": None,
     "last_updated": None
 }
+
+# كاش حفظ نموذج الذكاء الاصطناعي لمنع استهلاك الذاكرة العشوائية (OOM)
+CACHED_MODEL = None
+LAST_TRAIN_TIME = None
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -323,17 +328,30 @@ def update_open_trades_outcome_historical(df_m15):
     conn.commit()
     conn.close()
 
-# --- خوارزمية التعلم الذاتي المحسّنة ---
+# --- خوارزمية التعلم الذاتي المحسّنة للذاكرة العشوائية ---
 def train_self_learning_model():
+    global CACHED_MODEL, LAST_TRAIN_TIME
+    
+    # إعادة التدريب فقط كل 30 دقيقة لحفظ استقرار السيرفر وذاكرة RAM
+    now = datetime.now(timezone.utc)
+    if CACHED_MODEL is not None and LAST_TRAIN_TIME is not None:
+        if (now - LAST_TRAIN_TIME).total_seconds() < 1800:
+            return CACHED_MODEL
+
     conn = get_db_connection()
-    df = pd.read_sql_query(
-        "SELECT rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, outcome FROM trades WHERE outcome IS NOT NULL", 
-        conn
-    )
-    conn.close()
+    try:
+        df = pd.read_sql_query(
+            "SELECT rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, outcome FROM trades WHERE outcome IS NOT NULL", 
+            conn
+        )
+    except Exception as e:
+        print(f"خطأ تدريب الموديل: {e}")
+        return CACHED_MODEL
+    finally:
+        conn.close()
 
     if len(df) < 10:
-        return None
+        return CACHED_MODEL
 
     feature_cols = ['rsi', 'dxy_corr', 'macd_diff', 'stoch_k', 'volatility_ratio']
     df[feature_cols] = df[feature_cols].fillna(0)
@@ -342,17 +360,25 @@ def train_self_learning_model():
     y = df['outcome']
 
     if len(np.unique(y)) < 2:
-        return None
+        return CACHED_MODEL
 
     clf = RandomForestClassifier(
-        n_estimators=150, 
-        max_depth=6, 
+        n_estimators=100, 
+        max_depth=5, 
         min_samples_split=4, 
         class_weight='balanced',
         random_state=42
     )
     clf.fit(X, y)
-    return clf
+    
+    CACHED_MODEL = clf
+    LAST_TRAIN_TIME = now
+    
+    # تفريغ الذاكرة المؤقتة فوراً
+    del df, X, y
+    gc.collect()
+    
+    return CACHED_MODEL
 
 # ------------------------------------
 # 2. فلتر الأخبار والسيولة
@@ -394,10 +420,10 @@ def detect_smc_setup(df):
     }
 
 # ------------------------------------
-# 4. محرك البيانات المتقاطعة الفورية (IFC Markets Spot Gold Direct)
+# 4. محرك البيانات المتقاطعة الفورية (Spot Gold Real-Time Feed)
 # ------------------------------------
 def fetch_live_spot_gold():
-    """جلب سعر الذهب الفوري Spot Gold مباشرة من منصة IFC Markets"""
+    """جلب سعر الذهب الفوري Spot Gold مباشرة مع خيارات احتياطية متعددة"""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -405,14 +431,13 @@ def fetch_live_spot_gold():
         'Referer': 'https://www.ifcmarkets.net/'
     }
     
-    # 1. المصدر الأساسي الأول: التجريف المباشر من صفحة IFC Markets الخاصة بالذهب
+    # 1. المصدر الأول: تجريف صفحة IFC Markets المباشرة للذهب
     try:
         url_ifc = "https://www.ifcmarkets.net/market-data/precious-metals-prices/xauusd"
-        r = requests.get(url_ifc, headers=headers, timeout=4)
+        r = requests.get(url_ifc, headers=headers, timeout=3)
         if r.status_code == 200:
             soup = BeautifulSoup(r.text, 'html.parser')
             
-            # البحث عن عناصر السعر في هيكلية IFC Markets
             price_elem = soup.find('span', {'class': re.compile(r'price|last|bid|ask', re.I)}) or \
                          soup.find('div', {'class': re.compile(r'price|last|bid|ask', re.I)})
             
@@ -423,7 +448,6 @@ def fetch_live_spot_gold():
                     if val > 1000:
                         return round(val, 2)
 
-            # البحث عبر الأنماط الرقمية الصريحة في نص الصفحة HTML
             matches = re.findall(r'"price"\s*:\s*"?([\d,]+\.?\d*)"?', r.text) or \
                       re.findall(r'"bid"\s*:\s*"?([\d,]+\.?\d*)"?', r.text) or \
                       re.findall(r'class="[^"]*price[^"]*"[^>]*>\s*([\d,]+\.?\d*)', r.text)
@@ -433,11 +457,11 @@ def fetch_live_spot_gold():
                 if clean_val > 1000:
                     return round(clean_val, 2)
     except Exception as e:
-        print(f"تنبيه IFC Markets Scraping: {e}")
+        print(f"تنبيه IFC Scraping: {e}")
 
-    # 2. المصدر الثاني الاحتياطي: PAX Gold (سعر أونصة الذهب الفوري اللحظي 1:1)
+    # 2. المصدر الثاني: Binance PAXG/USDT API (سعر الذهب الفوري اللحظي 1:1)
     try:
-        r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT", headers=headers, timeout=3)
+        r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT", headers=headers, timeout=2)
         if r.status_code == 200:
             price = float(r.json()['price'])
             if price > 1000:
@@ -445,9 +469,9 @@ def fetch_live_spot_gold():
     except Exception:
         pass
 
-    # 3. المصدر الثالث: واجهة التداول المباشر لأسواق الذهب الفوري
+    # 3. المصدر الثالث: Yahoo Chart API المباشر
     try:
-        r = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval=1m&range=1d", headers=headers, timeout=3)
+        r = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval=1m&range=1d", headers=headers, timeout=2)
         if r.status_code == 200:
             res = r.json()
             price = float(res['chart']['result'][0]['meta']['regularMarketPrice'])
@@ -456,7 +480,7 @@ def fetch_live_spot_gold():
     except Exception:
         pass
 
-    # 4. الاحتياطي الأخير: عقود الفيوتشرز GC=F
+    # 4. المصدر الاحتياطي الأخير: عقود الفيوتشرز GC=F
     try:
         gc_t = yf.Ticker("GC=F")
         price = gc_t.fast_info.get('lastPrice', None)
@@ -468,16 +492,15 @@ def fetch_live_spot_gold():
     return 0.0
 
 def get_market_data():
-    # إرجاع البيانات المحفوظة في الذاكرة العشوائية فوراً (استجابة في أقل من 1 ملي ثانية)
+    # إرجاع البيانات المحفوظة في الذاكرة العشوائية فوراً (استجابة خلال ملي ثوانٍ)
     if GLOBAL_CACHE["market_data"]["gold"] > 0:
         return GLOBAL_CACHE["market_data"]
     
-    # تحذير أولي في حال عدم اكتمال الدورة الأولى للتحديث
     gold_price = fetch_live_spot_gold()
     return {"gold": gold_price, "dxy": 99.85, "us10y": 4.63}
 
 def fetch_and_update_cache():
-    """وظيفة تحديث الذاكرة العشوائية في الخلفية بدون حجب الاستجابة"""
+    """تحديث الذاكرة العشوائية في الخلفية بدون حجب الاستجابة"""
     try:
         gold = fetch_live_spot_gold()
         
@@ -486,14 +509,14 @@ def fetch_and_update_cache():
         us10y = 4.63
 
         try:
-            r_dxy = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB?interval=1m&range=1d", headers=headers, timeout=3)
+            r_dxy = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB?interval=1m&range=1d", headers=headers, timeout=2)
             if r_dxy.status_code == 200:
                 dxy = float(r_dxy.json()['chart']['result'][0]['meta']['regularMarketPrice'])
         except Exception:
             pass
 
         try:
-            r_tnx = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/^TNX?interval=1m&range=1d", headers=headers, timeout=3)
+            r_tnx = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/^TNX?interval=1m&range=1d", headers=headers, timeout=2)
             if r_tnx.status_code == 200:
                 us10y = float(r_tnx.json()['chart']['result'][0]['meta']['regularMarketPrice'])
         except Exception:
@@ -576,7 +599,7 @@ def analyze_institutional_engine():
 
         update_open_trades_outcome_historical(df_gold_m15)
 
-        return {
+        res = {
             "h4_trend": h4_trend,
             "state_label": state_label,
             "last_price": last_price,
@@ -585,6 +608,12 @@ def analyze_institutional_engine():
             "us10y_trend": "DOWN" if close_us10y_m15.iloc[-1] < close_us10y_m15.iloc[-5] else "UP",
             "smc": smc
         }
+
+        # تنظيف الذاكرة العشوائية من الجداول الثقيلة
+        del df_gold_h1, df_dxy_m15, df_us10y_m15, aligned_returns, features, scaled_features
+        gc.collect()
+
+        return res
     except Exception as e:
         print(f"خطأ في التحليل المؤسسي: {e}")
         return None
@@ -637,6 +666,7 @@ def generate_quant_signal():
                                           columns=['rsi', 'dxy_corr', 'macd_diff', 'stoch_k', 'volatility_ratio'])
             prob = clf.predict_proba(input_features)[0]
             confidence = round(float(np.max(prob)), 2)
+            del input_features
         except Exception:
             confidence = 0.82
 
@@ -691,13 +721,13 @@ def generate_quant_signal():
 # 6. المراقبة الآلية ومراقب الذاكرة العشوائية
 # ------------------------------------
 async def background_cache_worker():
-    """حلقة مستمرة تعمل كل 3 ثوان لتحديث الذاكرة بالأسعار اللحظية الفورية بدون التأثير على رد البوت"""
+    """تحديث الكاش كل 5 ثوان لتوازن مثالي بين السرعة واستقرار السيرفر"""
     while True:
         try:
             await asyncio.to_thread(fetch_and_update_cache)
         except Exception as e:
             print(f"خطأ خلفية الكاش: {e}")
-        await asyncio.sleep(3)
+        await asyncio.sleep(5)
 
 async def auto_market_scanner(app):
     last_sent_candle = None
@@ -805,7 +835,7 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔒 يرجى إدخال كلمة السر أولاً لاستخدام البوت.")
         return
     
-    # القراءة الفورية المباشرة من الذاكرة العشوائية (RAM)
+    # القراءة المباشرة من الذاكرة العشوائية RAM
     data = get_market_data()
     msg = f"📊 **أسعار السوق اللحظية (Spot Gold)**\n🟡 الذهب (XAUUSD): ${data['gold']}\n💵 مؤشر الدولار: {data['dxy']}\n📈 عوائد السندات: {data['us10y']}%"
     await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
@@ -831,29 +861,6 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"───────────"
         )
         await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
-
-async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not is_authenticated(chat_id):
-        await update.message.reply_text("🔒 يرجى إدخال كلمة السر أولاً لاستخدام البوت.")
-        return
-    await update.message.reply_text("⚡ جاري مطابقة شروط التناغم وتأكيدات SMC...")
-    sig = await asyncio.to_thread(generate_quant_signal)
-    if sig and sig["status"] == "SIGNAL":
-        msg = (
-            f"🚨 **إشارة كمية مؤسسية**\n"
-            f"النوع: {sig['type']}\n"
-            f"🎯 نسبة الثقة: {sig['confidence']}%\n"
-            f"⚖️ اللوت الموصى به: {sig['risk']}\n"
-            f"💵 سعر الدخول: ${sig['entry']}\n"
-            f"🛑 SL: ${sig['sl']}\n"
-            f"🎯 TP1: ${sig['tp1']}\n"
-            f"🎯 TP2: ${sig['tp2']}\n"
-            f"💡 SMC: {sig['smc_note']}"
-        )
-    else:
-        msg = f"⏸️ **تنبيه الانتظار المؤسسي**\n💡 السبب: {sig['reason'] if sig else 'لا توجد فرصة مطابقة'}"
-    await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -916,6 +923,29 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"───────────────────\n"
         f"💡 *يتم تحديث النموذج وإعادة تدريب Random Forest أوتوماتيكياً مع كل تقييم.*"
     )
+    await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+
+async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not is_authenticated(chat_id):
+        await update.message.reply_text("🔒 يرجى إدخال كلمة السر أولاً لاستخدام البوت.")
+        return
+    await update.message.reply_text("⚡ جاري مطابقة شروط التناغم وتأكيدات SMC...")
+    sig = await asyncio.to_thread(generate_quant_signal)
+    if sig and sig["status"] == "SIGNAL":
+        msg = (
+            f"🚨 **إشارة كمية مؤسسية**\n"
+            f"النوع: {sig['type']}\n"
+            f"🎯 نسبة الثقة: {sig['confidence']}%\n"
+            f"⚖️ اللوت الموصى به: {sig['risk']}\n"
+            f"💵 سعر الدخول: ${sig['entry']}\n"
+            f"🛑 SL: ${sig['sl']}\n"
+            f"🎯 TP1: ${sig['tp1']}\n"
+            f"🎯 TP2: ${sig['tp2']}\n"
+            f"💡 SMC: {sig['smc_note']}"
+        )
+    else:
+        msg = f"⏸️ **تنبيه الانتظار المؤسسي**\n💡 السبب: {sig['reason'] if sig else 'لا توجد فرصة مطابقة'}"
     await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
 if __name__ == '__main__':
