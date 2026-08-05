@@ -6,3 +6,4 @@ scikit-learn
 hmmlearn
 ta
 flask
+psycopg2-binary
