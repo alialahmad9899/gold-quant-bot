@@ -66,87 +66,96 @@ def is_postgres():
 
 def get_db_connection():
     if is_postgres():
-        url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-        conn = psycopg2.connect(url, sslmode='require')
-        return conn
+        try:
+            url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+            conn = psycopg2.connect(url, sslmode='require', connect_timeout=10)
+            return conn
+        except Exception as e:
+            print(f"⚠️ يتعذر الاتصال بـ PostgreSQL حالياً: {e}. جاري العمل على SQLite كخيار احتياطي.")
+            conn = sqlite3.connect(DB_FILE, timeout=15)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            return conn
     else:
         conn = sqlite3.connect(DB_FILE, timeout=15)
         conn.execute("PRAGMA journal_mode=WAL;")
         return conn
 
 def init_db():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    if is_postgres():
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS trades (
-                id SERIAL PRIMARY KEY,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                signal_type VARCHAR(50),
-                entry_price REAL,
-                sl REAL,
-                tp1 REAL,
-                tp2 REAL,
-                rsi REAL,
-                dxy_corr REAL,
-                macd_diff REAL DEFAULT 0,
-                stoch_k REAL DEFAULT 0,
-                volatility_ratio REAL DEFAULT 0,
-                outcome INTEGER,
-                confidence REAL
-            );
-            CREATE TABLE IF NOT EXISTS subscribers (
-                chat_id BIGINT PRIMARY KEY
-            );
-            CREATE TABLE IF NOT EXISTS authenticated_users (
-                chat_id BIGINT PRIMARY KEY
-            );
-            CREATE TABLE IF NOT EXISTS config (
-                key VARCHAR(50) PRIMARY KEY,
-                value BIGINT
-            );
-        ''')
-    else:
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT,
-                signal_type TEXT,
-                entry_price REAL,
-                sl REAL,
-                tp1 REAL,
-                tp2 REAL,
-                rsi REAL,
-                dxy_corr REAL,
-                macd_diff REAL DEFAULT 0,
-                stoch_k REAL DEFAULT 0,
-                volatility_ratio REAL DEFAULT 0,
-                outcome INTEGER,
-                confidence REAL
-            )
-        ''')
-        cursor.execute("PRAGMA table_info(trades)")
-        columns = [col[1] for col in cursor.fetchall()]
-        if "macd_diff" not in columns:
-            cursor.execute("ALTER TABLE trades ADD COLUMN macd_diff REAL DEFAULT 0")
-        if "stoch_k" not in columns:
-            cursor.execute("ALTER TABLE trades ADD COLUMN stoch_k REAL DEFAULT 0")
-        if "volatility_ratio" not in columns:
-            cursor.execute("ALTER TABLE trades ADD COLUMN volatility_ratio REAL DEFAULT 0")
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        if is_postgres() and isinstance(conn, psycopg2.extensions.connection):
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS trades (
+                    id SERIAL PRIMARY KEY,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    signal_type VARCHAR(50),
+                    entry_price REAL,
+                    sl REAL,
+                    tp1 REAL,
+                    tp2 REAL,
+                    rsi REAL,
+                    dxy_corr REAL,
+                    macd_diff REAL DEFAULT 0,
+                    stoch_k REAL DEFAULT 0,
+                    volatility_ratio REAL DEFAULT 0,
+                    outcome INTEGER,
+                    confidence REAL
+                );
+                CREATE TABLE IF NOT EXISTS subscribers (
+                    chat_id BIGINT PRIMARY KEY
+                );
+                CREATE TABLE IF NOT EXISTS authenticated_users (
+                    chat_id BIGINT PRIMARY KEY
+                );
+                CREATE TABLE IF NOT EXISTS config (
+                    key VARCHAR(50) PRIMARY KEY,
+                    value BIGINT
+                );
+            ''')
+        else:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT,
+                    signal_type TEXT,
+                    entry_price REAL,
+                    sl REAL,
+                    tp1 REAL,
+                    tp2 REAL,
+                    rsi REAL,
+                    dxy_corr REAL,
+                    macd_diff REAL DEFAULT 0,
+                    stoch_k REAL DEFAULT 0,
+                    volatility_ratio REAL DEFAULT 0,
+                    outcome INTEGER,
+                    confidence REAL
+                )
+            ''')
+            cursor.execute("PRAGMA table_info(trades)")
+            columns = [col[1] for col in cursor.fetchall()]
+            if "macd_diff" not in columns:
+                cursor.execute("ALTER TABLE trades ADD COLUMN macd_diff REAL DEFAULT 0")
+            if "stoch_k" not in columns:
+                cursor.execute("ALTER TABLE trades ADD COLUMN stoch_k REAL DEFAULT 0")
+            if "volatility_ratio" not in columns:
+                cursor.execute("ALTER TABLE trades ADD COLUMN volatility_ratio REAL DEFAULT 0")
 
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS subscribers (chat_id INTEGER PRIMARY KEY)
-        ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS authenticated_users (chat_id INTEGER PRIMARY KEY)
-        ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value INTEGER)
-        ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS subscribers (chat_id INTEGER PRIMARY KEY)
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS authenticated_users (chat_id INTEGER PRIMARY KEY)
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value INTEGER)
+            ''')
 
-    conn.commit()
-    conn.close()
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"خطأ أثناء تهيئة قاعدة البيانات: {e}")
 
 init_db()
 
@@ -155,7 +164,7 @@ def set_admin_id(chat_id):
     ADMIN_CHAT_ID = chat_id
     conn = get_db_connection()
     cursor = conn.cursor()
-    if is_postgres():
+    if is_postgres() and isinstance(conn, psycopg2.extensions.connection):
         cursor.execute("INSERT INTO config (key, value) VALUES ('admin_id', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (chat_id,))
     else:
         cursor.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('admin_id', ?)", (chat_id,))
@@ -166,7 +175,7 @@ def load_admin_id():
     global ADMIN_CHAT_ID
     conn = get_db_connection()
     cursor = conn.cursor()
-    if is_postgres():
+    if is_postgres() and isinstance(conn, psycopg2.extensions.connection):
         cursor.execute("SELECT value FROM config WHERE key = 'admin_id'")
     else:
         cursor.execute("SELECT value FROM config WHERE key = 'admin_id'")
@@ -180,7 +189,7 @@ load_admin_id()
 def is_authenticated(chat_id):
     conn = get_db_connection()
     cursor = conn.cursor()
-    ph = "%s" if is_postgres() else "?"
+    ph = "%s" if is_postgres() and isinstance(conn, psycopg2.extensions.connection) else "?"
     cursor.execute(f"SELECT chat_id FROM authenticated_users WHERE chat_id = {ph}", (chat_id,))
     res = cursor.fetchone()
     conn.close()
@@ -189,7 +198,7 @@ def is_authenticated(chat_id):
 def authenticate_user(chat_id):
     conn = get_db_connection()
     cursor = conn.cursor()
-    if is_postgres():
+    if is_postgres() and isinstance(conn, psycopg2.extensions.connection):
         cursor.execute("INSERT INTO authenticated_users (chat_id) VALUES (%s) ON CONFLICT DO NOTHING", (chat_id,))
     else:
         cursor.execute("INSERT OR IGNORE INTO authenticated_users (chat_id) VALUES (?)", (chat_id,))
@@ -201,7 +210,7 @@ def authenticate_user(chat_id):
 def add_subscriber(chat_id):
     conn = get_db_connection()
     cursor = conn.cursor()
-    if is_postgres():
+    if is_postgres() and isinstance(conn, psycopg2.extensions.connection):
         cursor.execute("INSERT INTO subscribers (chat_id) VALUES (%s) ON CONFLICT DO NOTHING", (chat_id,))
     else:
         cursor.execute("INSERT OR IGNORE INTO subscribers (chat_id) VALUES (?)", (chat_id,))
@@ -227,7 +236,7 @@ def log_trade(signal_type, entry, sl, tp1, tp2, rsi, dxy_corr, macd_diff, stoch_
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    if is_postgres():
+    if is_postgres() and isinstance(conn, psycopg2.extensions.connection):
         cursor.execute('''
             SELECT id FROM trades 
             WHERE signal_type = %s AND entry_price = %s AND timestamp >= NOW() - INTERVAL '15 minutes'
@@ -270,7 +279,7 @@ def update_open_trades_outcome_historical(df_m15):
 
     highs = to_1d_series(df_m15['High'])
     lows = to_1d_series(df_m15['Low'])
-    ph = "%s" if is_postgres() else "?"
+    ph = "%s" if is_postgres() and isinstance(conn, psycopg2.extensions.connection) else "?"
 
     for trade_id, trade_time_str, sig_type, sl, tp1 in open_trades:
         try:
@@ -765,13 +774,15 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_db_connection()
     cursor = conn.cursor()
     
+    is_pg = is_postgres() and isinstance(conn, psycopg2.extensions.connection)
+    
     cursor.execute("SELECT COUNT(*), SUM(CASE WHEN outcome = 1 THEN 1 ELSE 0 END) FROM trades WHERE outcome IS NOT NULL")
     total_eval, total_wins = cursor.fetchone()
     total_eval = total_eval or 0
     total_wins = total_wins or 0
     overall_win_rate = round((total_wins / total_eval * 100), 1) if total_eval > 0 else 0
 
-    if is_postgres():
+    if is_pg:
         cursor.execute("SELECT COUNT(*), SUM(CASE WHEN outcome = 1 THEN 1 ELSE 0 END) FROM trades WHERE outcome IS NOT NULL AND timestamp >= NOW() - INTERVAL '7 days'")
         week_eval, week_wins = cursor.fetchone()
         cursor.execute("SELECT COUNT(*), SUM(CASE WHEN outcome = 1 THEN 1 ELSE 0 END) FROM trades WHERE outcome IS NOT NULL AND timestamp >= NOW() - INTERVAL '30 days'")
@@ -800,7 +811,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn.close()
     
-    db_type_str = "Supabase PostgreSQL (سحابية دائمية)" if is_postgres() else "SQLite (محلية)"
+    db_type_str = "Supabase PostgreSQL (سحابية دائمية)" if is_pg else "SQLite (محلية / احتياطية)"
     
     msg = (
         f"📊 **تقرير أداء المحرك الكمي التفصيلي (Quant Analytics)**\n"
