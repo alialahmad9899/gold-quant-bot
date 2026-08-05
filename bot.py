@@ -275,7 +275,10 @@ def update_open_trades_outcome_historical(df_m15):
     for trade_id, trade_time_str, sig_type, sl, tp1 in open_trades:
         try:
             if isinstance(trade_time_str, datetime):
-                trade_time = trade_time_str.replace(tzinfo=timezone.utc)
+                if trade_time_str.tzinfo is None:
+                    trade_time = trade_time_str.replace(tzinfo=timezone.utc)
+                else:
+                    trade_time = trade_time_str.astimezone(timezone.utc)
             else:
                 trade_time = datetime.strptime(str(trade_time_str)[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
                 
@@ -376,7 +379,7 @@ def detect_smc_setup(df):
     }
 
 # ------------------------------------
-# 4. محرك البيانات المتقاطعة (XAUUSD=X Spot Gold)
+# 4. محرك البيانات المتقاطعة والأسعار اللحظية (Spot Gold + Futures)
 # ------------------------------------
 def get_market_data():
     try:
@@ -384,16 +387,31 @@ def get_market_data():
         dxy_t = yf.Ticker("DX-Y.NYB")
         us10y_t = yf.Ticker("^TNX")
 
-        gold = gold_t.fast_info.get('lastPrice', None)
-        if gold is None:
-            gold = gold_t.history(period="1d")['Close'].iloc[-1]
+        gold = None
+        try:
+            gold = gold_t.fast_info.get('lastPrice', None)
+            if gold is None or np.isnan(gold):
+                hist = gold_t.history(period="1d")
+                if not hist.empty:
+                    gold = hist['Close'].iloc[-1]
+        except Exception:
+            gold = None
+
+        # خيار احتياطي لسعر الذهب في حال عدم توفر السعر الفوري اللحظي
+        if gold is None or np.isnan(gold):
+            gc_t = yf.Ticker("GC=F")
+            gold = gc_t.fast_info.get('lastPrice', None)
+            if gold is None or np.isnan(gold):
+                hist_gc = gc_t.history(period="1d")
+                if not hist_gc.empty:
+                    gold = hist_gc['Close'].iloc[-1]
 
         dxy = dxy_t.fast_info.get('lastPrice', None)
-        if dxy is None:
+        if dxy is None or np.isnan(dxy):
             dxy = dxy_t.history(period="1d")['Close'].iloc[-1]
 
         us10y = us10y_t.fast_info.get('lastPrice', None)
-        if us10y is None:
+        if us10y is None or np.isnan(us10y):
             us10y = us10y_t.history(period="1d")['Close'].iloc[-1]
 
         return {"gold": round(float(gold), 2), "dxy": round(float(dxy), 2), "us10y": round(float(us10y), 2)}
@@ -403,8 +421,9 @@ def get_market_data():
 
 def analyze_institutional_engine():
     try:
-        df_gold_h1 = yf.download("XAUUSD=X", period="60d", interval="1h", progress=False)
-        df_gold_m15 = yf.download("XAUUSD=X", period="5d", interval="15m", progress=False)
+        # جلب شموع التحليل الفني من عقود الذهب الضامنة لعدم حدوث أخطاء 404
+        df_gold_h1 = yf.download("GC=F", period="60d", interval="1h", progress=False)
+        df_gold_m15 = yf.download("GC=F", period="5d", interval="15m", progress=False)
         df_dxy_m15 = yf.download("DX-Y.NYB", period="5d", interval="15m", progress=False)
         df_us10y_m15 = yf.download("^TNX", period="5d", interval="15m", progress=False)
 
@@ -459,7 +478,13 @@ def analyze_institutional_engine():
             state_label = "RANGING"
 
         smc = detect_smc_setup(df_gold_m15)
-        last_price = round(close_gold_m15.iloc[-1], 2)
+        
+        # ربط السعر المعروض بالسعر الفوري المطابق للمنصات (Spot Gold XAU/USD)
+        spot_data = get_market_data()
+        if spot_data and spot_data.get("gold"):
+            last_price = spot_data["gold"]
+        else:
+            last_price = round(close_gold_m15.iloc[-1], 2)
 
         update_open_trades_outcome_historical(df_gold_m15)
 
