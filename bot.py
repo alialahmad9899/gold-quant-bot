@@ -2,7 +2,6 @@ import logging
 import asyncio
 import sqlite3
 import os
-import threading
 from datetime import datetime, timezone, timedelta
 import numpy as np
 import pandas as pd
@@ -14,13 +13,14 @@ import ta
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 from flask import Flask
+from multiprocessing import Process
 
-# --- خادم صغير لإرضاء Render Web Service ---
+# --- 1. خادم الويب الأساسي لإرضاء Render Web Service وفحص المنفذ فوراً ---
 web_app = Flask(__name__)
 
 @web_app.route('/')
 def home():
-    return "Bot is alive and running 24/7!"
+    return "XAU/USD Quant Signal Bot is Live and Running 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -336,14 +336,14 @@ def analyze_institutional_engine():
         returns_gold = np.log(close_gold_m15 / close_gold_m15.shift(1))
         returns_dxy = np.log(close_dxy_m15 / close_dxy_m15.shift(1))
         
-        aligned_returns = pd.concat([returns_gold, returns_dxy], axis=1).dropna()
+        aligned_returns = pd.concat([returns_gold, returns_dxy], axis=1, sort=False).dropna()
         aligned_returns.columns = ['Gold', 'DXY']
 
         dxy_corr = aligned_returns['Gold'].corr(aligned_returns['DXY'])
         dxy_corr = 0.0 if np.isnan(dxy_corr) else dxy_corr
 
         volatility = aligned_returns['Gold'].rolling(window=10).std().dropna()
-        features = pd.concat([aligned_returns['Gold'], volatility], axis=1).dropna()
+        features = pd.concat([aligned_returns['Gold'], volatility], axis=1, sort=False).dropna()
         features.columns = ['Returns', 'Volatility']
 
         scaler = StandardScaler()
@@ -662,9 +662,10 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
 if __name__ == '__main__':
-    # تشغيل خادم الويب في خلفية منفصلة لتفادي إغلاق Render للخدمة المجانية
-    threading.Thread(target=run_flask, daemon=True).start()
-    
+    # تشغيل خادم الويب في عملية منفصلة تضمن فتح المنفذ واستجابة Render Web Service فوراً
+    flask_process = Process(target=run_flask)
+    flask_process.start()
+
     app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
     
     app.add_handler(CommandHandler("start", start))
@@ -675,5 +676,5 @@ if __name__ == '__main__':
     
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
     
-    print("🤖 البوت والسيرفر يعطلان كافة أسباب التوقف ومستعدان للإنطلاق 24/7...")
+    print("🤖 البوت والخادم يعملان بكفاءة تامة وجاهزون للمراقبة 24/7...")
     app.run_polling()
