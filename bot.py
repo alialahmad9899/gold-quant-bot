@@ -2,6 +2,7 @@ import logging
 import asyncio
 import sqlite3
 import os
+import threading
 from datetime import datetime, timezone, timedelta
 import numpy as np
 import pandas as pd
@@ -12,8 +13,20 @@ from sklearn.preprocessing import StandardScaler
 import ta
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from flask import Flask
 
-# 🔒 جلب التوكن من متغيرات البيئة لمنع سرقته عند الرفع على GitHub العام
+# --- خادم صغير لإرضاء Render Web Service ---
+web_app = Flask(__name__)
+
+@web_app.route('/')
+def home():
+    return "Bot is alive and running 24/7!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    web_app.run(host="0.0.0.0", port=port)
+
+# 🔒 جلب التوكن من متغيرات البيئة
 TOKEN = os.getenv("TELEGRAM_TOKEN", "8560548173:AAGrJpVfV9Et7l8mMdUtr6Xlj8SJ_lQzxNc")
 DB_FILE = "trades.db"
 
@@ -21,7 +34,7 @@ DB_FILE = "trades.db"
 # 🔑 إعدادات الحماية والآدمن
 # ------------------------------------
 PASSWORD = "12341212"
-ADMIN_CHAT_ID = 0  # يتم تعيينه تلقائياً لأول مستخدم يوثق الدخول
+ADMIN_CHAT_ID = 0
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -32,13 +45,11 @@ logging.basicConfig(
 # 🛠️ أدوات مساعدة وتجهيز البيانات
 # ------------------------------------
 def to_1d_series(df_col):
-    """تحويل أي عمود من yfinance إلى Series أحادية البعد بأمان تام"""
     if isinstance(df_col, pd.DataFrame):
         return df_col.iloc[:, 0]
     return df_col
 
 def get_main_keyboard():
-    """كيبورد أزرار التحكم التفاعلية"""
     keyboard = [
         [KeyboardButton("⚡ إشارة فورية"), KeyboardButton("🧠 تحليل بنية السوق")],
         [KeyboardButton("📊 الأسعار اللحظية"), KeyboardButton("📈 إحصائيات النظام")]
@@ -46,10 +57,9 @@ def get_main_keyboard():
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 # ------------------------------------
-# 1. إدارة قاعدة البيانات وقاعدة التعلم الذاتي
+# 1. إدارة قاعدة البيانات
 # ------------------------------------
 def get_db_connection():
-    """فتح اتصال آمن بـ SQLite مع تفعيل خيار WAL لمنع القفل"""
     conn = sqlite3.connect(DB_FILE, timeout=15)
     conn.execute("PRAGMA journal_mode=WAL;")
     return conn
@@ -154,11 +164,8 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, message: str):
             print(f"خطأ في إرسال الإشعار للآدمن: {e}")
 
 def log_trade(signal_type, entry, sl, tp1, tp2, rsi, dxy_corr, confidence):
-    """حفظ الصفقة مع منع التكرار التلقائي للصفقات المتشابهة في نفس النطاق الزمني"""
     conn = get_db_connection()
     cursor = conn.cursor()
-    
-    # فحص لمنع التكرار خلال آخر 15 دقيقة
     cursor.execute('''
         SELECT id FROM trades 
         WHERE signal_type = ? AND entry_price = ? AND datetime(timestamp) >= datetime('now', '-15 minutes')
@@ -173,7 +180,6 @@ def log_trade(signal_type, entry, sl, tp1, tp2, rsi, dxy_corr, confidence):
     conn.close()
 
 def update_open_trades_outcome_historical(df_m15):
-    """تحديث نتائج الصفقات المفتوحة بدقة عبر تتبع الحركة التاريخية وتطبيق المعايرة الزمنية الصحيحة"""
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id, timestamp, signal_type, sl, tp1 FROM trades WHERE outcome IS NULL")
@@ -183,7 +189,6 @@ def update_open_trades_outcome_historical(df_m15):
         conn.close()
         return
 
-    # توحيد النطاق الزمني لـ Index البيانات
     df_index = df_m15.index
     if df_index.tz is None:
         df_index = df_index.tz_localize(timezone.utc)
@@ -253,7 +258,7 @@ def check_news_guard():
     return True, "الظروف الإخبارية والسيولة مستقرة."
 
 # ------------------------------------
-# 3. محرك تحليل SMC & Fair Value Gaps
+# 3. محرك تحليل SMC
 # ------------------------------------
 def detect_smc_setup(df):
     if len(df) < 10:
@@ -280,7 +285,7 @@ def detect_smc_setup(df):
     }
 
 # ------------------------------------
-# 4. محرك البيانات المتقاطعة والأطر الزمنية
+# 4. محرك البيانات المتقاطعة
 # ------------------------------------
 def get_market_data():
     try:
@@ -320,7 +325,6 @@ def analyze_institutional_engine():
         close_dxy_m15 = to_1d_series(df_dxy_m15['Close'])
         close_us10y_m15 = to_1d_series(df_us10y_m15['Close'])
 
-        # 1. اتجاه H4 المحسوب بدقة بدون قيم NaN
         ema200 = ta.trend.EMAIndicator(close_h1, window=200).ema_indicator().dropna()
         ema500 = ta.trend.EMAIndicator(close_h1, window=500).ema_indicator().dropna()
         
@@ -329,7 +333,6 @@ def analyze_institutional_engine():
         else:
             h4_trend = "BULLISH" if close_h1.iloc[-1] > close_h1.iloc[-50] else "BEARISH"
 
-        # 2. محاذاة البيانات بين الذهب والدولار
         returns_gold = np.log(close_gold_m15 / close_gold_m15.shift(1))
         returns_dxy = np.log(close_dxy_m15 / close_dxy_m15.shift(1))
         
@@ -339,7 +342,6 @@ def analyze_institutional_engine():
         dxy_corr = aligned_returns['Gold'].corr(aligned_returns['DXY'])
         dxy_corr = 0.0 if np.isnan(dxy_corr) else dxy_corr
 
-        # 3. نموذج HMM المعاير
         volatility = aligned_returns['Gold'].rolling(window=10).std().dropna()
         features = pd.concat([aligned_returns['Gold'], volatility], axis=1).dropna()
         features.columns = ['Returns', 'Volatility']
@@ -368,7 +370,6 @@ def analyze_institutional_engine():
         smc = detect_smc_setup(df_gold_m15)
         last_price = round(close_gold_m15.iloc[-1], 2)
 
-        # تحديث نتائج الصفقات المفتوحة حياً
         update_open_trades_outcome_historical(df_gold_m15)
 
         return {
@@ -485,7 +486,6 @@ async def auto_market_scanner(app):
     last_sent_candle = None
     while True:
         try:
-            # تشغيل تحليلات السوق الشديدة في Thread مستقل لمنع تجميد البوت
             sig = await asyncio.to_thread(generate_quant_signal)
             if sig and sig["status"] == "SIGNAL":
                 current_candle = sig.get("candle_id")
@@ -521,7 +521,7 @@ async def auto_market_scanner(app):
 async def post_init(app):
     asyncio.create_task(auto_market_scanner(app))
 
-# --- معالجة الضغطات والأوامر ---
+# --- الأوامر المباشرة ---
 async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
@@ -559,7 +559,6 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
             reply_markup=get_main_keyboard()
         )
 
-# --- الأوامر المباشرة ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
@@ -663,6 +662,9 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
 if __name__ == '__main__':
+    # تشغيل خادم الويب في خلفية منفصلة لتفادي إغلاق Render للخدمة المجانية
+    threading.Thread(target=run_flask, daemon=True).start()
+    
     app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
     
     app.add_handler(CommandHandler("start", start))
@@ -673,5 +675,5 @@ if __name__ == '__main__':
     
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
     
-    print("🤖 البوت تم فحصه وتصحيحه حرفياً، وجاهز للعمل المستمر والمستقر 24/7...")
+    print("🤖 البوت والسيرفر يعطلان كافة أسباب التوقف ومستعدان للإنطلاق 24/7...")
     app.run_polling()
