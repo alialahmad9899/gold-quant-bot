@@ -4,6 +4,8 @@ import sqlite3
 import psycopg2
 import os
 import requests
+import re
+from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
 import numpy as np
 import pandas as pd
@@ -392,15 +394,48 @@ def detect_smc_setup(df):
     }
 
 # ------------------------------------
-# 4. محرك البيانات المتقاطعة الفورية (Spot Gold Real-Time)
+# 4. محرك البيانات المتقاطعة الفورية (IFC Markets Spot Gold Direct)
 # ------------------------------------
 def fetch_live_spot_gold():
-    """جلب سعر الذهب الفوري Spot Gold الحقيقي المباشر بدون تأخير وبدون حظر IP"""
+    """جلب سعر الذهب الفوري Spot Gold مباشرة من منصة IFC Markets"""
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://www.ifcmarkets.net/'
     }
     
-    # 1. المصدر المباشر الأول: PAX Gold (سعر أونصة الذهب الفوري اللحظي 1:1)
+    # 1. المصدر الأساسي الأول: التجريف المباشر من صفحة IFC Markets الخاصة بالذهب
+    try:
+        url_ifc = "https://www.ifcmarkets.net/market-data/precious-metals-prices/xauusd"
+        r = requests.get(url_ifc, headers=headers, timeout=4)
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, 'html.parser')
+            
+            # البحث عن عناصر السعر في هيكلية IFC Markets
+            price_elem = soup.find('span', {'class': re.compile(r'price|last|bid|ask', re.I)}) or \
+                         soup.find('div', {'class': re.compile(r'price|last|bid|ask', re.I)})
+            
+            if price_elem:
+                clean_text = re.sub(r'[^\d.]', '', price_elem.text)
+                if clean_text:
+                    val = float(clean_text)
+                    if val > 1000:
+                        return round(val, 2)
+
+            # البحث عبر الأنماط الرقمية الصريحة في نص الصفحة HTML
+            matches = re.findall(r'"price"\s*:\s*"?([\d,]+\.?\d*)"?', r.text) or \
+                      re.findall(r'"bid"\s*:\s*"?([\d,]+\.?\d*)"?', r.text) or \
+                      re.findall(r'class="[^"]*price[^"]*"[^>]*>\s*([\d,]+\.?\d*)', r.text)
+            
+            for m in matches:
+                clean_val = float(m.replace(',', ''))
+                if clean_val > 1000:
+                    return round(clean_val, 2)
+    except Exception as e:
+        print(f"تنبيه IFC Markets Scraping: {e}")
+
+    # 2. المصدر الثاني الاحتياطي: PAX Gold (سعر أونصة الذهب الفوري اللحظي 1:1)
     try:
         r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT", headers=headers, timeout=3)
         if r.status_code == 200:
@@ -410,7 +445,7 @@ def fetch_live_spot_gold():
     except Exception:
         pass
 
-    # 2. المصدر الثاني: واجهة التداول المباشر لأسواق الذهب الفوري
+    # 3. المصدر الثالث: واجهة التداول المباشر لأسواق الذهب الفوري
     try:
         r = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval=1m&range=1d", headers=headers, timeout=3)
         if r.status_code == 200:
@@ -421,7 +456,7 @@ def fetch_live_spot_gold():
     except Exception:
         pass
 
-    # 3. الاحتياطي الأخير: عقود الفيوتشرز
+    # 4. الاحتياطي الأخير: عقود الفيوتشرز GC=F
     try:
         gc_t = yf.Ticker("GC=F")
         price = gc_t.fast_info.get('lastPrice', None)
