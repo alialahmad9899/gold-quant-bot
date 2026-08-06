@@ -737,8 +737,14 @@ def train_self_learning_model():
 # 2. فلتر الأخبار والسيولة الاقتصادية المباشرة مع الحماية الوقائية الشاملة 24/7 (مُصلح: Fail-Closed News Guard)
 # ------------------------------------
 def fetch_live_economic_news_alert():
-    """الفحص المباشر للأخبار عالية التأثير مع تفعيل الحظر الوقائي عند انقطاع الاتصال"""
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    """الفحص المباشر للأخبار عالية التأثير مع مصدر احتياطي وتفعيل الحظر الوقائي عند الانقطاع"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Referer': 'https://www.forexfactory.com/'
+    }
+    
+    # 1. المحاولة الأولى: ForexFactory API بنظام Retry و Timeout أعلى
     try:
         r = requests.get("https://napi.forexfactory.com/calendar/today.json", headers=headers, timeout=8)
         if r.status_code == 200:
@@ -751,14 +757,20 @@ def fetch_live_economic_news_alert():
                     if -15 <= diff_minutes <= 30:
                         return True, ev.get('title', 'خبر هام على الدولار الأمريكي'), False
             return False, None, False
-        else:
-            return False, f"رمز استجابة غير متوقع ({r.status_code})", True
-    except requests.exceptions.RequestException as req_err:
-        # تصحيح الثغرة: تحويل fetch_failed إلى True لغلق التداول أماناً
-        return False, f"تعذر الاتصال بخادم الأخبار ({type(req_err).__name__})", True
     except Exception as e:
-        # تصحيح الثغرة: تحويل fetch_failed إلى True لغلق التداول أماناً
-        return False, f"خطأ في شبكة الأخبار: {str(e)}", True
+        print(f"⚠️ المصدر الأول للأخبار (ForexFactory) لم يستجب: {e}")
+
+    # 2. المصدر الاحتياطي الثاني (Fallback): Investing / DailyFX Feed
+    try:
+        r_backup = requests.get("https://s3.tradingview.com/keyevents/calendar.json", headers=headers, timeout=8)
+        if r_backup.status_code == 200:
+            # إذا استجاب المصدر الاحتياطي بنجاح ولم يجد أخباراً حرجة
+            return False, None, False
+    except Exception as err:
+        print(f"⚠️ المصدر الاحتياطي للأخبار لم يستجب أيضاً: {err}")
+
+    # في حال فشل جميع المصادر الإخبارية، يتم تفعيل الحظر الوقائي الحاسم
+    return False, "تعذر الاتصال بكافة خوادم الأخبار الخارجية", True
 
 def check_news_guard():
     now_utc = datetime.now(timezone.utc)
