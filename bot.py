@@ -43,8 +43,9 @@ DB_FILE = "trades.db"
 PASSWORD = "12341212"
 ADMIN_CHAT_ID = 0
 
-# قفل التزامن لحماية الذاكرة العشوائية من أخطاء Race Conditions
+# قفل التزامن لحماية الذاكرة العشوائية وقفل جلب البيانات الفردي
 cache_lock = threading.Lock()
+fetch_lock = threading.Lock()
 
 # ذاكرة عشوائية فائقة السرعة للأسعار والتحليل (In-Memory Cache)
 GLOBAL_CACHE = {
@@ -387,7 +388,6 @@ def update_open_trades_outcome_historical(df_m15):
                     low_val = float(row['Low'])
 
                     if "BUY" in sig_type or "شراء" in sig_type:
-                        # فحص الأولوية الدقيقة داخل الشمعة بناءً على سعر الافتتاح
                         if low_val <= sl and high_val >= tp1:
                             if abs(open_val - sl) < abs(open_val - tp1):
                                 outcome = 0
@@ -402,7 +402,6 @@ def update_open_trades_outcome_historical(df_m15):
                             break
 
                     elif "SELL" in sig_type or "بيع" in sig_type:
-                        # تصحيح تقييم الشموع التشاركية لصفقات البيع
                         if high_val >= sl and low_val <= tp1:
                             if abs(open_val - sl) < abs(open_val - tp1):
                                 outcome = 0
@@ -443,7 +442,6 @@ def build_historic_market_features():
     low = to_1d_series(df_clean['Low'])
     open_p = to_1d_series(df_clean['Open'])
 
-    # توحيد حساب dxy_corr بنفس النافذة المتحركة (20 شمعة) المستخدمة في المحرك اللحظي
     if df_dxy_m15 is not None and not df_dxy_m15.empty:
         df_dxy_clean = clean_df_columns(df_dxy_m15.copy())
         close_dxy = to_1d_series(df_dxy_clean['Close'])
@@ -486,7 +484,6 @@ def build_historic_market_features():
         tp_target = c_price + (c_atr * 1.6)
         sl_target = c_price - (c_atr * 1.3)
 
-        # فحص الفواصل الزمنية شمعة بشمعة لمعرفة الأولوية التاريخية الزمنية ومنع الانحياز
         outcome = None
         for future_idx in range(loc + 1, loc + 13):
             f_open = open_vals[future_idx]
@@ -541,7 +538,6 @@ def train_self_learning_model():
         X = df[feature_cols]
         y = df['outcome']
     else:
-        # بناء البيانات على مستوى السوق بأكمله عند البداية لتفادي التخمين وانحياز الاختيار
         X, y = build_historic_market_features()
         if X is None or y is None or len(np.unique(y)) < 2:
             return CACHED_MODEL
@@ -605,24 +601,19 @@ def check_news_guard():
     weekday = now_utc.weekday()
     day_of_month = now_utc.day
 
-    # 1. فحص API الأخبار الفوري الحقيقي مع حماية الفشل الوقائي الشاملة Fail-Closed على مدار 24 ساعة
     is_news_high, news_title, fetch_failed = fetch_live_economic_news_alert()
     if is_news_high:
         return False, f"حظر آلي: صدور خبر شديد التأثير في السوق الآن ({news_title})."
     
-    # حظر وقائي آمن شامل طوال اليوم عند تعذر الوصول لشبكة الأخبار
     if fetch_failed:
         return False, f"حظر وقائي آمن شمولياً (Fail-Closed 24/7): تعذر التحقق من الأخبار اللحظية ({news_title})."
 
-    # 2. إغلاق ساعات السبريد والتغليف اليومي
     if hour in [21, 22]:
         return False, "اتساع السبريد وساعات التغليف اليومي للأسواق."
 
-    # 3. فلتر تقرير الوظائف الأمريكي (NFP): الجمعة الأولى من الشهر (12:30 - 15:00 UTC)
     if weekday == 4 and day_of_month <= 7 and (12 <= hour <= 15):
         return False, "حظر آلي: نافذة صدور تقرير الوظائف الأمريكي (NFP)."
 
-    # 4. فلتر بيانات التضخم والتسديد (CPI/PPI): منتصف الشهر (12:30 - 15:00 UTC)
     if (10 <= day_of_month <= 15) and (12 <= hour <= 14):
         return False, "حظر آلي: نافذة صدور أرقام التضخم الأمريكية (CPI/PPI)."
 
@@ -657,18 +648,49 @@ def detect_smc_setup(df):
     }
 
 # ------------------------------------
-# 4. محرك البيانات الفورية والموحدة (Spot Gold Feed)
+# 4. محرك البيانات الفورية الموحد والمُحصن بـ Direct API & Custom Session
 # ------------------------------------
+def fetch_yahoo_direct(symbol, range_str="10d", interval_str="15m"):
+    """جلب الشموع مباشرة عبر Yahoo Finance v8 API مع تجنب حظر yfinance"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'application/json,text/html,application/xhtml+xml',
+        'Referer': 'https://finance.yahoo.com/'
+    }
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval={interval_str}&range={range_str}"
+    try:
+        r = requests.get(url, headers=headers, timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            result = data['chart']['result'][0]
+            timestamps = result['timestamp']
+            quote = result['indicators']['quote'][0]
+            
+            df = pd.DataFrame({
+                'Open': quote['open'],
+                'High': quote['high'],
+                'Low': quote['low'],
+                'Close': quote['close'],
+                'Volume': quote.get('volume', [0] * len(timestamps))
+            }, index=pd.to_datetime(timestamps, unit='s', utc=True))
+            
+            df = df.dropna(subset=['Close'])
+            if not df.empty:
+                return df
+    except Exception as e:
+        print(f"تنبيه الاستدعاء المباشر لـ {symbol}: {e}")
+    return pd.DataFrame()
+
 def fetch_live_spot_gold():
     """جلب سعر الذهب الفوري Spot Gold المباشر مع دعم مصادر متعددة"""
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Referer': 'https://www.ifcmarkets.net/'
     }
     
     try:
-        r = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval=1m&range=1d", headers=headers, timeout=2)
+        r = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval=1m&range=1d", headers=headers, timeout=3)
         if r.status_code == 200:
             res = r.json()
             price = float(res['chart']['result'][0]['meta']['regularMarketPrice'])
@@ -746,29 +768,50 @@ def fetch_and_update_cache():
         print(f"خطأ تحديث كاش البيانات: {e}")
 
 def get_chart_data_cached():
+    """جلب الرسوم البيانية مع حماية Single-Flight وقفل تحصين الاستدعاءات التكرارية"""
     now = datetime.now(timezone.utc)
     
     with cache_lock:
         last = MARKET_DATA_CACHE["last_fetch"]
-        if last is not None and (now - last).total_seconds() < 120 and not MARKET_DATA_CACHE["df_gold_m15"].empty:
+        # صلاحية الكاش 300 ثانية (5 دقائق) لمنع تجاوز حدود الطلبات Rate Limits
+        if last is not None and (now - last).total_seconds() < 300 and not MARKET_DATA_CACHE["df_gold_m15"].empty:
             return MARKET_DATA_CACHE.copy()
 
-    try:
-        df_gold_h1 = clean_df_columns(yf.download("XAUUSD=X", period="60d", interval="1h", progress=False))
-        df_gold_m15 = clean_df_columns(yf.download("XAUUSD=X", period="10d", interval="15m", progress=False))
-        df_dxy_m15 = clean_df_columns(yf.download("DX-Y.NYB", period="10d", interval="15m", progress=False))
-        df_us10y_m15 = clean_df_columns(yf.download("^TNX", period="10d", interval="15m", progress=False))
+    # تنفيذ الجلب عبر قفل استدعاء فردي أحادي
+    with fetch_lock:
+        # فحص إضافي محمي داخل القفل لمنع الجلب المزدوج
+        with cache_lock:
+            last = MARKET_DATA_CACHE["last_fetch"]
+            if last is not None and (now - last).total_seconds() < 300 and not MARKET_DATA_CACHE["df_gold_m15"].empty:
+                return MARKET_DATA_CACHE.copy()
 
-        if not df_gold_m15.empty:
-            with cache_lock:
-                MARKET_DATA_CACHE["df_gold_h1"] = df_gold_h1
-                MARKET_DATA_CACHE["df_gold_m15"] = df_gold_m15
-                MARKET_DATA_CACHE["df_dxy_m15"] = df_dxy_m15
-                MARKET_DATA_CACHE["df_us10y_m15"] = df_us10y_m15
-                MARKET_DATA_CACHE["last_fetch"] = now
-    except Exception as e:
-        print(f"تنبيه تحميل جداول الأسعار: {e}")
-        
+        try:
+            # 1. الاستدعاء المباشر لـ Yahoo Finance API
+            df_gold_h1 = fetch_yahoo_direct("XAUUSD=X", range_str="60d", interval_str="1h")
+            df_gold_m15 = fetch_yahoo_direct("XAUUSD=X", range_str="10d", interval_str="15m")
+            df_dxy_m15 = fetch_yahoo_direct("DX-Y.NYB", range_str="10d", interval_str="15m")
+            df_us10y_m15 = fetch_yahoo_direct("^TNX", range_str="10d", interval_str="15m")
+
+            # 2. خطة التغطية الاحتياطية باستخدام yfinance إذا فشل المباشر
+            if df_gold_m15.empty:
+                df_gold_m15 = clean_df_columns(yf.download("XAUUSD=X", period="10d", interval="15m", progress=False))
+            if df_gold_h1.empty:
+                df_gold_h1 = clean_df_columns(yf.download("XAUUSD=X", period="60d", interval="1h", progress=False))
+            if df_dxy_m15.empty:
+                df_dxy_m15 = clean_df_columns(yf.download("DX-Y.NYB", period="10d", interval="15m", progress=False))
+            if df_us10y_m15.empty:
+                df_us10y_m15 = clean_df_columns(yf.download("^TNX", period="10d", interval="15m", progress=False))
+
+            if not df_gold_m15.empty:
+                with cache_lock:
+                    MARKET_DATA_CACHE["df_gold_h1"] = df_gold_h1
+                    MARKET_DATA_CACHE["df_gold_m15"] = df_gold_m15
+                    MARKET_DATA_CACHE["df_dxy_m15"] = df_dxy_m15
+                    MARKET_DATA_CACHE["df_us10y_m15"] = df_us10y_m15
+                    MARKET_DATA_CACHE["last_fetch"] = now
+        except Exception as e:
+            print(f"تنبيه تحميل جداول الأسعار: {e}")
+            
     with cache_lock:
         return MARKET_DATA_CACHE.copy()
 
@@ -798,12 +841,10 @@ def analyze_institutional_engine():
 
         returns_gold = np.log(close_gold_m15 / close_gold_m15.shift(1))
         
-        # تصحيح محاذاة البيانات الزمنية لمنع حذف الشموع وتشويه الارتباط
         returns_dxy_aligned = np.log(close_dxy_m15 / close_dxy_m15.shift(1)).reindex(index=returns_gold.index).ffill().fillna(0)
         
         aligned_returns = pd.DataFrame({'Gold': returns_gold, 'DXY': returns_dxy_aligned}).dropna()
 
-        # توحيد طريقة حساب الارتباط اللحظية مع عينات التدريب (Rolling window = 20)
         rolling_corr = aligned_returns['Gold'].rolling(window=20).corr(aligned_returns['DXY']).dropna()
         dxy_corr = round(float(rolling_corr.iloc[-1]), 2) if not rolling_corr.empty else 0.0
 
@@ -813,7 +854,6 @@ def analyze_institutional_engine():
         scaler = StandardScaler()
         scaled_features = scaler.fit_transform(features)
 
-        # استقرار HMM وتفادي Label Switching بفرز صارم للحالات
         model = GaussianHMM(n_components=3, covariance_type="diag", n_iter=100, random_state=42)
         model.fit(scaled_features)
         hidden_states = model.predict(scaled_features)
@@ -902,7 +942,6 @@ def generate_quant_signal():
         return {"status": "WAIT", "reason": "السوق في نطاق عرضي تذبذبي على M15.", "price": current_price}
 
     clf = train_self_learning_model()
-    # الثقة الأساسية في غياب الموديل تُحدد عند حد محافظ (60%) لضمان عدم مجازفة اللوت
     confidence = 0.60
     if clf:
         try:
@@ -1023,7 +1062,6 @@ def run_quant_backtest():
 
         signals += 1
         
-        # التقييم التسلسلي الزمني الدقيق شمعة بشمعة
         outcome = None
 
         if is_buy:
