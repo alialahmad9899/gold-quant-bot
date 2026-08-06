@@ -762,6 +762,7 @@ def fetch_live_economic_news_alert():
                     diff_minutes = (event_time - now).total_seconds() / 60.0
                     if -15 <= diff_minutes <= 30:
                         return True, ev.get('title', 'خبر هام على الدولار الأمريكي (ForexFactory Today)'), False
+            print("✅ [فحص الأخبار]: تم الاتصال بـ ForexFactory بنجاح - لا توجد أخبار حاسمة حالياً.")
             return False, None, False
     except Exception as e:
         print(f"⚠️ المصدر 1 (ForexFactory Today) لم يستجب: {e}")
@@ -779,6 +780,7 @@ def fetch_live_economic_news_alert():
                         diff_minutes = (event_time - now).total_seconds() / 60.0
                         if -15 <= diff_minutes <= 30:
                             return True, ev.get('title', 'خبر هام على الدولار الأمريكي (FF Weekly)'), False
+            print("✅ [فحص الأخبار]: تم الاتصال بـ ForexFactory Weekly بنجاح - لا توجد أخبار حاسمة حالياً.")
             return False, None, False
     except Exception as e:
         print(f"⚠️ المصدر 2 (ForexFactory Weekly) لم يستجب: {e}")
