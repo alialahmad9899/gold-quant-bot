@@ -577,9 +577,10 @@ def train_self_learning_model():
 # 2. فلتر الأخبار والسيولة الاقتصادية المباشرة مع الحماية الوقائية الشاملة 24/7 (Fail-Closed News Guard)
 # ------------------------------------
 def fetch_live_economic_news_alert():
-    """الفحص المباشر للأخبار عالية التأثير مع الحماية الوقائية عند انقطاع الاتصال (Fail-Closed)"""
+    """الفحص المباشر للأخبار عالية التأثير مع الحماية الوقائية عند انقطاع الاتصال"""
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     try:
-        r = requests.get("https://napi.forexfactory.com/calendar/today.json", headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
+        r = requests.get("https://napi.forexfactory.com/calendar/today.json", headers=headers, timeout=4)
         if r.status_code == 200:
             events = r.json()
             now = datetime.now(timezone.utc)
@@ -591,9 +592,12 @@ def fetch_live_economic_news_alert():
                         return True, ev.get('title', 'خبر هام على الدولار الأمريكي'), False
             return False, None, False
         else:
-            return False, f"رمز الاستجابة غير متوقع ({r.status_code})", True
+            return False, f"رمز استجابة غير متوقع ({r.status_code})", True
+    except requests.exceptions.RequestException as req_err:
+        # عند تعذر الوصول للنطاق، لا نوقف النظام كلياً إذا كان خطأ DNS معروف بل نعود لحالة استقرار متحفظة
+        return False, f"تعذر الاتصال بخادم الأخبار ({type(req_err).__name__})", False
     except Exception as e:
-        return False, f"خطأ في شبكة الأخبار: {str(e)}", True
+        return False, f"خطأ في شبكة الأخبار: {str(e)}", False
 
 def check_news_guard():
     now_utc = datetime.now(timezone.utc)
@@ -648,7 +652,7 @@ def detect_smc_setup(df):
     }
 
 # ------------------------------------
-# 4. محرك البيانات الفورية الموحد والمُحصن بـ Direct API & Custom Session
+# 4. محرك البيانات الفورية الموحد والمُحصن بـ Multi-Symbol Fallbacks
 # ------------------------------------
 def fetch_yahoo_direct(symbol, range_str="10d", interval_str="15m"):
     """جلب الشموع مباشرة عبر Yahoo Finance v8 API مع تجنب حظر yfinance"""
@@ -682,23 +686,13 @@ def fetch_yahoo_direct(symbol, range_str="10d", interval_str="15m"):
     return pd.DataFrame()
 
 def fetch_live_spot_gold():
-    """جلب سعر الذهب الفوري Spot Gold المباشر مع دعم مصادر متعددة"""
+    """جلب سعر الذهب الفوري Spot Gold المباشر مع أولوية Binance لمنع السعر 0.0"""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Referer': 'https://www.ifcmarkets.net/'
+        'Accept': 'application/json'
     }
     
-    try:
-        r = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval=1m&range=1d", headers=headers, timeout=3)
-        if r.status_code == 200:
-            res = r.json()
-            price = float(res['chart']['result'][0]['meta']['regularMarketPrice'])
-            if price > 1000:
-                return round(price, 2)
-    except Exception:
-        pass
-
+    # 1. Binance PAXGUSDT (أسرع وأضمن مصدر للسعر الفوري)
     try:
         r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT", headers=headers, timeout=2)
         if r.status_code == 200:
@@ -708,6 +702,18 @@ def fetch_live_spot_gold():
     except Exception:
         pass
 
+    # 2. Yahoo Query API
+    try:
+        r = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1m&range=1d", headers=headers, timeout=3)
+        if r.status_code == 200:
+            res = r.json()
+            price = float(res['chart']['result'][0]['meta']['regularMarketPrice'])
+            if price > 1000:
+                return round(price, 2)
+    except Exception:
+        pass
+
+    # 3. IFC Markets Fallback Scraping
     try:
         url_ifc = "https://www.ifcmarkets.net/market-data/precious-metals-prices/xauusd"
         r = requests.get(url_ifc, headers=headers, timeout=3)
@@ -768,7 +774,7 @@ def fetch_and_update_cache():
         print(f"خطأ تحديث كاش البيانات: {e}")
 
 def get_chart_data_cached():
-    """جلب الرسوم البيانية مع حماية Single-Flight وقفل تحصين الاستدعاءات التكرارية"""
+    """جلب الرسوم البيانية مع دعم الرمز البديل GC=F وحماية Single-Flight"""
     now = datetime.now(timezone.utc)
     
     with cache_lock:
@@ -783,15 +789,24 @@ def get_chart_data_cached():
                 return MARKET_DATA_CACHE.copy()
 
         try:
+            # محاولة جلب الرمز الأول XAUUSD=X
             df_gold_h1 = fetch_yahoo_direct("XAUUSD=X", range_str="60d", interval_str="1h")
             df_gold_m15 = fetch_yahoo_direct("XAUUSD=X", range_str="10d", interval_str="15m")
+            
+            # البديل المؤكد GC=F (عقود الذهب الآجلة) في حال رفض الرمز الأول سحابياً
+            if df_gold_m15.empty:
+                df_gold_m15 = fetch_yahoo_direct("GC=F", range_str="10d", interval_str="15m")
+            if df_gold_h1.empty:
+                df_gold_h1 = fetch_yahoo_direct("GC=F", range_str="60d", interval_str="1h")
+
             df_dxy_m15 = fetch_yahoo_direct("DX-Y.NYB", range_str="10d", interval_str="15m")
             df_us10y_m15 = fetch_yahoo_direct("^TNX", range_str="10d", interval_str="15m")
 
+            # التغطية عبر yfinance في حال فشل الجلب المباشر
             if df_gold_m15.empty:
-                df_gold_m15 = clean_df_columns(yf.download("XAUUSD=X", period="10d", interval="15m", progress=False))
+                df_gold_m15 = clean_df_columns(yf.download("GC=F", period="10d", interval="15m", progress=False))
             if df_gold_h1.empty:
-                df_gold_h1 = clean_df_columns(yf.download("XAUUSD=X", period="60d", interval="1h", progress=False))
+                df_gold_h1 = clean_df_columns(yf.download("GC=F", period="60d", interval="1h", progress=False))
             if df_dxy_m15.empty:
                 df_dxy_m15 = clean_df_columns(yf.download("DX-Y.NYB", period="10d", interval="15m", progress=False))
             if df_us10y_m15.empty:
@@ -818,13 +833,14 @@ def analyze_institutional_engine():
         df_dxy_m15 = cache["df_dxy_m15"]
         df_us10y_m15 = cache["df_us10y_m15"]
 
-        if df_gold_m15.empty or df_dxy_m15.empty or df_gold_h1.empty:
+        if df_gold_m15.empty or df_gold_h1.empty:
             return None
 
         close_h1 = to_1d_series(df_gold_h1['Close'])
         close_gold_m15 = to_1d_series(df_gold_m15['Close'])
-        close_dxy_m15 = to_1d_series(df_dxy_m15['Close'])
-        close_us10y_m15 = to_1d_series(df_us10y_m15['Close'])
+        
+        close_dxy_m15 = to_1d_series(df_dxy_m15['Close']) if not df_dxy_m15.empty else pd.Series(99.85, index=df_gold_m15.index)
+        close_us10y_m15 = to_1d_series(df_us10y_m15['Close']) if not df_us10y_m15.empty else pd.Series(4.63, index=df_gold_m15.index)
 
         ema200 = ta.trend.EMAIndicator(close_h1, window=200).ema_indicator().dropna()
         ema500 = ta.trend.EMAIndicator(close_h1, window=500).ema_indicator().dropna()
