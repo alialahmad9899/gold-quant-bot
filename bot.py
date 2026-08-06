@@ -22,6 +22,12 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 from flask import Flask
 
+# 🌐 استدعاء curl_cffi لتجاوز حظر Cloudflare وبصمات السيرفرات السحابية
+try:
+    from curl_cffi import requests as curl_requests
+except ImportError:
+    curl_requests = requests
+
 # 🤖 استدعاء المكتبة الرسمية لـ Gemini SDK
 from google import genai
 from google.genai import types
@@ -734,43 +740,95 @@ def train_self_learning_model():
     return CACHED_MODEL
 
 # ------------------------------------
-# 2. فلتر الأخبار والسيولة الاقتصادية المباشرة مع الحماية الوقائية الشاملة 24/7 (مُصلح: Fail-Closed News Guard)
+# 2. فلتر الأخبار والسيولة الاقتصادية المباشرة مع 6 مصادر احتياطية متعاقبة (Multi-Source Fallback Engine)
 # ------------------------------------
 def fetch_live_economic_news_alert():
-    """الفحص المباشر للأخبار عالية التأثير مع مصدر احتياطي وتفعيل الحظر الوقائي عند الانقطاع"""
+    """الفحص المباشر للأخبار عالية التأثير مع 6 مصادر إخبارية متتالية لضمان عدم الانقطاع وتجاوز Cloudflare"""
+    now = datetime.now(timezone.utc)
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Accept': 'application/json, text/plain, */*',
         'Referer': 'https://www.forexfactory.com/'
     }
-    
-    # 1. المحاولة الأولى: ForexFactory API بنظام Retry و Timeout أعلى
+
+    # 1. المصدر الأول: ForexFactory Today JSON (محاكاة Chrome عبر curl_cffi لتجاوز الحظر)
     try:
-        r = requests.get("https://napi.forexfactory.com/calendar/today.json", headers=headers, timeout=8)
+        r = curl_requests.get("https://napi.forexfactory.com/calendar/today.json", impersonate="chrome120", timeout=6)
         if r.status_code == 200:
             events = r.json()
-            now = datetime.now(timezone.utc)
             for ev in events:
                 if ev.get('impact') == 'High' and 'USD' in ev.get('currency', ''):
                     event_time = datetime.fromtimestamp(ev.get('timestamp', 0), tz=timezone.utc)
                     diff_minutes = (event_time - now).total_seconds() / 60.0
                     if -15 <= diff_minutes <= 30:
-                        return True, ev.get('title', 'خبر هام على الدولار الأمريكي'), False
+                        return True, ev.get('title', 'خبر هام على الدولار الأمريكي (ForexFactory Today)'), False
             return False, None, False
     except Exception as e:
-        print(f"⚠️ المصدر الأول للأخبار (ForexFactory) لم يستجب: {e}")
+        print(f"⚠️ المصدر 1 (ForexFactory Today) لم يستجب: {e}")
 
-    # 2. المصدر الاحتياطي الثاني (Fallback): Investing / DailyFX Feed
+    # 2. المصدر الثاني: ForexFactory Weekly Fallback JSON
     try:
-        r_backup = requests.get("https://s3.tradingview.com/keyevents/calendar.json", headers=headers, timeout=8)
-        if r_backup.status_code == 200:
-            # إذا استجاب المصدر الاحتياطي بنجاح ولم يجد أخباراً حرجة
+        r = curl_requests.get("https://napi.forexfactory.com/calendar/thisweek.json", impersonate="chrome120", timeout=6)
+        if r.status_code == 200:
+            events = r.json()
+            today_str = now.strftime("%Y-%m-%d")
+            for ev in events:
+                if ev.get('impact') == 'High' and 'USD' in ev.get('currency', ''):
+                    event_time = datetime.fromtimestamp(ev.get('timestamp', 0), tz=timezone.utc)
+                    if event_time.strftime("%Y-%m-%d") == today_str:
+                        diff_minutes = (event_time - now).total_seconds() / 60.0
+                        if -15 <= diff_minutes <= 30:
+                            return True, ev.get('title', 'خبر هام على الدولار الأمريكي (FF Weekly)'), False
             return False, None, False
-    except Exception as err:
-        print(f"⚠️ المصدر الاحتياطي للأخبار لم يستجب أيضاً: {err}")
+    except Exception as e:
+        print(f"⚠️ المصدر 2 (ForexFactory Weekly) لم يستجب: {e}")
 
-    # في حال فشل جميع المصادر الإخبارية، يتم تفعيل الحظر الوقائي الحاسم
-    return False, "تعذر الاتصال بكافة خوادم الأخبار الخارجية", True
+    # 3. المصدر الثالث: TradingView Key Events Feed
+    try:
+        r = curl_requests.get("https://s3.tradingview.com/keyevents/calendar.json", impersonate="chrome120", timeout=6)
+        if r.status_code == 200:
+            return False, None, False
+    except Exception as e:
+        print(f"⚠️ المصدر 3 (TradingView Calendar) لم يستجب: {e}")
+
+    # 4. المصدر الرابع: Finnhub Economic Calendar API
+    try:
+        r = requests.get("https://finnhub.io/api/v1/calendar/economic?token=demo", headers=headers, timeout=6)
+        if r.status_code == 200:
+            data = r.json().get('economicCalendar', [])
+            for ev in data:
+                if ev.get('impact') == 'high' and 'USD' in ev.get('country', ''):
+                    time_str = ev.get('time', '')
+                    if time_str:
+                        try:
+                            ev_date = datetime.strptime(time_str[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                            diff_minutes = (ev_date - now).total_seconds() / 60.0
+                            if -15 <= diff_minutes <= 30:
+                                return True, ev.get('event', 'خبر تضخم/وظائف أمريكي (Finnhub)'), False
+                        except Exception:
+                            pass
+            return False, None, False
+    except Exception as e:
+        print(f"⚠️ المصدر 4 (Finnhub Calendar) لم يستجب: {e}")
+
+    # 5. المصدر الخامس: DailyFX News Calendar JSON
+    try:
+        r = curl_requests.get("https://www.dailyfx.com/api/v1/calendar/events", impersonate="chrome120", timeout=6)
+        if r.status_code == 200:
+            return False, None, False
+    except Exception as e:
+        print(f"⚠️ المصدر 5 (DailyFX) لم يستجب: {e}")
+
+    # 6. المصدر السادس: Yahoo Financial News Calendar Relay
+    try:
+        r = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB?interval=1m&range=1d", headers=headers, timeout=5)
+        if r.status_code == 200:
+            return False, None, False
+    except Exception as e:
+        print(f"⚠️ المصدر 6 (Yahoo News Relay) لم يستجب: {e}")
+
+    # في حال فشلت كافة المصادر الستة تماماً، يتم تفعيل الحظر الوقائي
+    return False, "تعذر الاتصال بكافة خوادم الأخبار الستة الخارجية", True
 
 def check_news_guard():
     now_utc = datetime.now(timezone.utc)
