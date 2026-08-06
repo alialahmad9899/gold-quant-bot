@@ -740,7 +740,7 @@ def fetch_live_economic_news_alert():
     """الفحص المباشر للأخبار عالية التأثير مع تفعيل الحظر الوقائي عند انقطاع الاتصال"""
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     try:
-        r = requests.get("https://napi.forexfactory.com/calendar/today.json", headers=headers, timeout=4)
+        r = requests.get("https://napi.forexfactory.com/calendar/today.json", headers=headers, timeout=8)
         if r.status_code == 200:
             events = r.json()
             now = datetime.now(timezone.utc)
