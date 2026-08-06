@@ -773,26 +773,21 @@ def get_chart_data_cached():
     
     with cache_lock:
         last = MARKET_DATA_CACHE["last_fetch"]
-        # صلاحية الكاش 300 ثانية (5 دقائق) لمنع تجاوز حدود الطلبات Rate Limits
         if last is not None and (now - last).total_seconds() < 300 and not MARKET_DATA_CACHE["df_gold_m15"].empty:
             return MARKET_DATA_CACHE.copy()
 
-    # تنفيذ الجلب عبر قفل استدعاء فردي أحادي
     with fetch_lock:
-        # فحص إضافي محمي داخل القفل لمنع الجلب المزدوج
         with cache_lock:
             last = MARKET_DATA_CACHE["last_fetch"]
             if last is not None and (now - last).total_seconds() < 300 and not MARKET_DATA_CACHE["df_gold_m15"].empty:
                 return MARKET_DATA_CACHE.copy()
 
         try:
-            # 1. الاستدعاء المباشر لـ Yahoo Finance API
             df_gold_h1 = fetch_yahoo_direct("XAUUSD=X", range_str="60d", interval_str="1h")
             df_gold_m15 = fetch_yahoo_direct("XAUUSD=X", range_str="10d", interval_str="15m")
             df_dxy_m15 = fetch_yahoo_direct("DX-Y.NYB", range_str="10d", interval_str="15m")
             df_us10y_m15 = fetch_yahoo_direct("^TNX", range_str="10d", interval_str="15m")
 
-            # 2. خطة التغطية الاحتياطية باستخدام yfinance إذا فشل المباشر
             if df_gold_m15.empty:
                 df_gold_m15 = clean_df_columns(yf.download("XAUUSD=X", period="10d", interval="15m", progress=False))
             if df_gold_h1.empty:
@@ -1207,6 +1202,10 @@ async def auto_market_scanner(app):
             
         await asyncio.sleep(120)
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """معالج الأخطاء لمنع توقف البوت عند استثناءات التعارض والشبكة"""
+    print(f"⚠️ استثناء في التلغرام: {context.error}")
+
 async def post_init(app):
     asyncio.create_task(background_cache_worker())
     asyncio.create_task(auto_market_scanner(app))
@@ -1412,6 +1411,7 @@ if __name__ == '__main__':
     load_admin_id()
 
     app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
+    app.add_error_handler(error_handler)
     
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("price", price))
@@ -1423,4 +1423,4 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
     
     print("🤖 البوت والخادم يعملان بكفاءة تامة وجاهزون للمراقبة 24/7...")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
