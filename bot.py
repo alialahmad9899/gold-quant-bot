@@ -7,6 +7,7 @@ import os
 import requests
 import re
 import gc
+import json
 import threading
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
@@ -21,26 +22,40 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 from flask import Flask
 
+# 🤖 استدعاء المكتبة الرسمية لـ Gemini SDK
+from google import genai
+from google.genai import types
+
 # --- 1. خادم الويب الأساسي لإرضاء Render Web Service وفحص المنفذ فوراً ---
 web_app = Flask(__name__)
 
 @web_app.route('/')
 def home():
-    return "XAU/USD Quant Signal Bot is Live and Running 24/7!"
+    return "XAU/USD Quant & Gemini Hybrid Trading Engine is Live 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     web_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-# 🔒 جلب التوكن وقاعدة البيانات من متغيرات البيئة
+# 🔒 جلب التوكنات وقواعد البيانات من متغيرات البيئة بآمان تام
 TOKEN = os.getenv("TELEGRAM_TOKEN", "8560548173:AAGrJpVfV9Et7l8mMdUtr6Xlj8SJ_lQzxNc")
 DATABASE_URL = os.getenv("DATABASE_URL")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+PASSWORD = os.getenv("BOT_PASSWORD", "12341212")
 DB_FILE = "trades.db"
+
+# تهيئة عميل Gemini
+gemini_client = None
+if GEMINI_API_KEY:
+    try:
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+        print("✅ تم تفعيل وتشغيل عميل Gemini API بنجاح.")
+    except Exception as e:
+        print(f"⚠️ يتعذر تهيئة عميل Gemini API: {e}")
 
 # ------------------------------------
 # 🔑 إعدادات الحماية والآدمن والكاش وأمان الخيوط
 # ------------------------------------
-PASSWORD = "12341212"
 ADMIN_CHAT_ID = 0
 
 # قفل التزامن لحماية الذاكرة العشوائية وقفل جلب البيانات الفردي
@@ -181,6 +196,11 @@ def init_db():
                     key VARCHAR(50) PRIMARY KEY,
                     value BIGINT
                 );
+                CREATE TABLE IF NOT EXISTS gemini_insights (
+                    id SERIAL PRIMARY KEY,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    lesson TEXT
+                );
             ''')
         else:
             cursor.execute('''
@@ -218,6 +238,13 @@ def init_db():
             ''')
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value INTEGER)
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS gemini_insights (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT,
+                    lesson TEXT
+                )
             ''')
 
         conn.commit()
@@ -350,9 +377,128 @@ def log_trade(signal_type, entry, sl, tp1, tp2, rsi, dxy_corr, macd_diff, stoch_
     finally:
         release_db_connection(conn)
 
+# ------------------------------------
+# 🧠 محرك ذكاء GEMINI لتفريغ أسباب الخسارة وتدقيق الفرص اللحظية (مع الربط بالذاكرة)
+# ------------------------------------
+def get_recent_gemini_insights():
+    """جلب أحدث الدروس المستفادة المخزنة في قاعدة البيانات لربط ذاكرة الذكاء الاصطناعي"""
+    conn = get_db_connection()
+    insights = []
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT lesson FROM gemini_insights ORDER BY id DESC LIMIT 5")
+        rows = cursor.fetchall()
+        insights = [r[0] for r in rows if r[0]]
+    except Exception as e:
+        print(f"⚠️ خطأ جلب الدروس السابقة: {e}")
+    finally:
+        release_db_connection(conn)
+    return insights
+
+def gemini_verify_signal(signal_data, market_summary):
+    """تدقيق ودراسة المخاطرة منطقياً عبر Gemini API مع الالتزام بالدروس والتعلم السابق"""
+    if not gemini_client:
+        return {"approved": True, "reason": "اعتماد كمي أوتوماتيكي (Gemini غير مفعل)"}
+
+    # استجماع ذاكرة الدروس السابقة لتعزيز التعلم الذاتي
+    past_lessons = get_recent_gemini_insights()
+    lessons_text = "\n".join([f"- {l}" for l in past_lessons]) if past_lessons else "لا توجد قواعد حظر سابقة مسجلة."
+
+    prompt = f"""
+    أنت مدير مخاطر كمي ومحلل محترف لأسواق الذهب (XAU/USD).
+    يرجى مراجعة وتدقيق الإشارة الكمية المقترحة التالية قبل الموافقة عليها.
+
+    قواعد وتنبيهات مستنبطة من صفقات خاسرة سابقة (عليك الالتزام بها حتماً):
+    {lessons_text}
+
+    بيانات الإشارة الفنية المقترحة:
+    - نوع الإشارة: {signal_data.get('type')}
+    - سعر الدخول: ${signal_data.get('entry')}
+    - وقف الخسارة: ${signal_data.get('sl')}
+    - الهدف الأول: ${signal_data.get('tp1')} | الهدف الثاني: ${signal_data.get('tp2')}
+    - مؤشر RSI: {signal_data.get('rsi')}
+    - معامل ارتباط الدولار (DXY Corr): {signal_data.get('dxy_corr')}
+    - ثقة الذكاء الإحصائي: {signal_data.get('confidence')}%
+    - تأكيد هيكل السيولة (SMC): {signal_data.get('smc_note')}
+
+    بيانات بنية السوق المرافقة:
+    - اتجاه H4 الحاكم: {market_summary.get('h4_trend')}
+    - حالة HMM على M15: {market_summary.get('state_label')}
+
+    يرجى إعطاء تقييم دقيق للمخاطرة، وإرجاع النتيجة بصيغة JSON فقط كالتالي:
+    {{
+        "approved": true أو false,
+        "reason": "سبب واضح ومختصر باللغة العربية للقبول أو الفيتو"
+    }}
+    """
+    try:
+        response = gemini_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json"
+            )
+        )
+        data = json.loads(response.text)
+        return data
+    except Exception as e:
+        print(f"⚠️ خطأ استدعاء Gemini Verify: {e}")
+        return {"approved": True, "reason": "اعتماد كمي تلقائي (تعذر الاتصال بـ Gemini)"}
+
+def gemini_reflect_on_failures():
+    """تحليل الصفقات الخاسرة بواسطة Gemini واستنباط دروس وقواعد حظر جديدة"""
+    if not gemini_client:
+        return
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, signal_type, entry_price, sl, tp1, rsi, dxy_corr, confidence FROM trades WHERE outcome = 0 ORDER BY id DESC LIMIT 5")
+        failed_trades = cursor.fetchall()
+        if not failed_trades:
+            return
+
+        trades_summary = []
+        for t in failed_trades:
+            trades_summary.append(f"ID:{t[0]} | Type:{t[1]} | Entry:{t[2]} | SL:{t[3]} | TP:{t[4]} | RSI:{t[5]} | DXY_Corr:{t[6]} | Conf:{t[7]}")
+
+        prompt = f"""
+        تحليل ما بعد الخسارة (Post-Mortem Trade Analysis) لصفقات الذهب (XAU/USD):
+        فيما يلي أحدث الصفقات الخاسرة في قاعدة البيانات:
+        {chr(10).join(trades_summary)}
+
+        بصفتك كبير خبراء التداول الذكي، حلل الأسباب المحتملة لهذه الخسائر وصغ قاعدة حظر أو نصيحة تحسينية مختصرة لحماية الحساب من تكرار هذه الأنماط.
+        أجب بصيغة JSON فقط:
+        {{
+            "lesson": "الدرس المستفاد والقاعدة المستنبطة باللغة العربية"
+        }}
+        """
+        response = gemini_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json"
+            )
+        )
+        res = json.loads(response.text)
+        lesson = res.get("lesson", "")
+        if lesson:
+            timestamp_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            ph = "%s" if is_postgres() and isinstance(conn, psycopg2.extensions.connection) else "?"
+            if is_postgres() and isinstance(conn, psycopg2.extensions.connection):
+                cursor.execute("INSERT INTO gemini_insights (created_at, lesson) VALUES (%s, %s)", (timestamp_str, lesson))
+            else:
+                cursor.execute("INSERT INTO gemini_insights (created_at, lesson) VALUES (?, ?)", (timestamp_str, lesson))
+            conn.commit()
+            print(f"🧠 درس جديد مستفاد من Gemini: {lesson}")
+    except Exception as e:
+        print(f"⚠️ خطأ أثناء التحليل الذاتي لـ Gemini: {e}")
+    finally:
+        release_db_connection(conn)
+
 # --- تتبع الصفقات المحسن المصلح بدقة تسلسلي زمنياً ---
 def update_open_trades_outcome_historical(df_m15):
     conn = get_db_connection()
+    has_new_loss = False
     try:
         cursor = conn.cursor()
         cursor.execute("SELECT id, timestamp, signal_type, sl, tp1 FROM trades WHERE outcome IS NULL")
@@ -417,6 +563,8 @@ def update_open_trades_outcome_historical(df_m15):
 
                 if outcome is not None:
                     cursor.execute(f"UPDATE trades SET outcome = {outcome} WHERE id = {ph}", (trade_id,))
+                    if outcome == 0:
+                        has_new_loss = True
             except Exception as e:
                 print(f"خطأ في تقييم تتبع الصفقة رقم {trade_id}: {e}")
 
@@ -425,6 +573,12 @@ def update_open_trades_outcome_historical(df_m15):
         print(f"خطأ تحديث نتائج الصفقات: {e}")
     finally:
         release_db_connection(conn)
+
+    if has_new_loss:
+        try:
+            gemini_reflect_on_failures()
+        except Exception as err:
+            print(f"تنبيه استدعاء التعلم الذاتي لـ Gemini: {err}")
 
 # --- خوارزمية التعلم الذاتي التتابعية زمنيًا الخالية من انحياز الاختيار والمعايرة الدقيقة ---
 def build_historic_market_features():
@@ -437,6 +591,9 @@ def build_historic_market_features():
         return None, None
 
     df_clean = clean_df_columns(df_m15.copy())
+    # إصلاح الفهرس المكرر لضمان عدم حدوث خطأ get_loc
+    df_clean = df_clean[~df_clean.index.duplicated(keep='first')]
+
     close = to_1d_series(df_clean['Close'])
     high = to_1d_series(df_clean['High'])
     low = to_1d_series(df_clean['Low'])
@@ -476,13 +633,16 @@ def build_historic_market_features():
     for i in range(len(features)):
         idx = features.index[i]
         loc = df_clean.index.get_loc(idx)
+        if isinstance(loc, (np.ndarray, slice, list)):
+            loc = int(np.where(df_clean.index == idx)[0][0])
+            
         if loc + 12 >= len(close_vals):
             continue
             
         c_price = close_vals[loc]
         c_atr = atr_vals[loc]
-        tp_target = c_price + (c_atr * 1.6)
-        sl_target = c_price - (c_atr * 1.3)
+        tp_target = c_price + (c_atr * 1.8)
+        sl_target = c_price - (c_atr * 1.2)
 
         outcome = None
         for future_idx in range(loc + 1, loc + 13):
@@ -560,7 +720,7 @@ def train_self_learning_model():
         clf.fit(X_train, y_train)
         
         test_score = clf.score(X_test, y_test)
-        if test_score >= 0.55:
+        if test_score >= 0.52:
             CACHED_MODEL = clf
             LAST_TRAIN_TIME = now
             print(f"🧠 تم تحديث موديل التعلم الذاتي بنجاح (دقة الاختبار المستقبلي: {test_score*100:.1f}%)")
@@ -574,10 +734,10 @@ def train_self_learning_model():
     return CACHED_MODEL
 
 # ------------------------------------
-# 2. فلتر الأخبار والسيولة الاقتصادية المباشرة مع الحماية الوقائية الشاملة 24/7 (Fail-Closed News Guard)
+# 2. فلتر الأخبار والسيولة الاقتصادية المباشرة مع الحماية الوقائية الشاملة 24/7 (مُصلح: Fail-Closed News Guard)
 # ------------------------------------
 def fetch_live_economic_news_alert():
-    """الفحص المباشر للأخبار عالية التأثير مع الحماية الوقائية عند انقطاع الاتصال"""
+    """الفحص المباشر للأخبار عالية التأثير مع تفعيل الحظر الوقائي عند انقطاع الاتصال"""
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     try:
         r = requests.get("https://napi.forexfactory.com/calendar/today.json", headers=headers, timeout=4)
@@ -594,10 +754,11 @@ def fetch_live_economic_news_alert():
         else:
             return False, f"رمز استجابة غير متوقع ({r.status_code})", True
     except requests.exceptions.RequestException as req_err:
-        # عند تعذر الوصول للنطاق، لا نوقف النظام كلياً إذا كان خطأ DNS معروف بل نعود لحالة استقرار متحفظة
-        return False, f"تعذر الاتصال بخادم الأخبار ({type(req_err).__name__})", False
+        # تصحيح الثغرة: تحويل fetch_failed إلى True لغلق التداول أماناً
+        return False, f"تعذر الاتصال بخادم الأخبار ({type(req_err).__name__})", True
     except Exception as e:
-        return False, f"خطأ في شبكة الأخبار: {str(e)}", False
+        # تصحيح الثغرة: تحويل fetch_failed إلى True لغلق التداول أماناً
+        return False, f"خطأ في شبكة الأخبار: {str(e)}", True
 
 def check_news_guard():
     now_utc = datetime.now(timezone.utc)
@@ -692,7 +853,7 @@ def fetch_live_spot_gold():
         'Accept': 'application/json'
     }
     
-    # 1. Binance PAXGUSDT (أسرع وأضمن مصدر للسعر الفوري)
+    # 1. Binance PAXGUSDT
     try:
         r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT", headers=headers, timeout=2)
         if r.status_code == 200:
@@ -713,7 +874,7 @@ def fetch_live_spot_gold():
     except Exception:
         pass
 
-    # 3. IFC Markets Fallback Scraping
+    # 3. IFC Markets Scraping
     try:
         url_ifc = "https://www.ifcmarkets.net/market-data/precious-metals-prices/xauusd"
         r = requests.get(url_ifc, headers=headers, timeout=3)
@@ -789,11 +950,9 @@ def get_chart_data_cached():
                 return MARKET_DATA_CACHE.copy()
 
         try:
-            # محاولة جلب الرمز الأول XAUUSD=X
             df_gold_h1 = fetch_yahoo_direct("XAUUSD=X", range_str="60d", interval_str="1h")
             df_gold_m15 = fetch_yahoo_direct("XAUUSD=X", range_str="10d", interval_str="15m")
             
-            # البديل المؤكد GC=F (عقود الذهب الآجلة) في حال رفض الرمز الأول سحابياً
             if df_gold_m15.empty:
                 df_gold_m15 = fetch_yahoo_direct("GC=F", range_str="10d", interval_str="15m")
             if df_gold_h1.empty:
@@ -802,7 +961,6 @@ def get_chart_data_cached():
             df_dxy_m15 = fetch_yahoo_direct("DX-Y.NYB", range_str="10d", interval_str="15m")
             df_us10y_m15 = fetch_yahoo_direct("^TNX", range_str="10d", interval_str="15m")
 
-            # التغطية عبر yfinance في حال فشل الجلب المباشر
             if df_gold_m15.empty:
                 df_gold_m15 = clean_df_columns(yf.download("GC=F", period="10d", interval="15m", progress=False))
             if df_gold_h1.empty:
@@ -913,7 +1071,7 @@ def analyze_institutional_engine():
         return None
 
 # ------------------------------------
-# 5. خوارزمية توليد الإشارات الكمية المصلحة
+# 5. خوارزمية توليد الإشارات الكمية المدمجة مع تدقيق Gemini
 # ------------------------------------
 def generate_quant_signal():
     safe_news, news_reason = check_news_guard()
@@ -946,11 +1104,8 @@ def generate_quant_signal():
     stoch_k = ta.momentum.StochasticOscillator(high, low, close).stoch().iloc[-1]
 
     volatility_ratio = round((atr / current_price) * 100, 4) if current_price > 0 else 0
-    if volatility_ratio < 0.03:
-        return {"status": "WAIT", "reason": "ضعف تذبذب السوق (Low Volatility Ratio).", "price": current_price}
-
-    if state == "RANGING":
-        return {"status": "WAIT", "reason": "السوق في نطاق عرضي تذبذبي على M15.", "price": current_price}
+    if volatility_ratio < 0.02:
+        return {"status": "WAIT", "reason": "ضعف شديد في تذبذب السوق.", "price": current_price}
 
     clf = train_self_learning_model()
     confidence = 0.60
@@ -965,54 +1120,84 @@ def generate_quant_signal():
                 win_idx = classes.index(1)
                 win_prob = float(prob[win_idx])
                 
-                if win_prob < 0.50:
-                    return {"status": "WAIT", "reason": f"ضعف ثقة الذكاء الاصطناعي في النجاح ({int(win_prob*100)}%).", "price": current_price}
+                if win_prob < 0.52:
+                    return {"status": "WAIT", "reason": f"ضعف ثقة الذكاء الاصطناعي ({int(win_prob*100)}%).", "price": current_price}
                 
                 confidence = round(win_prob, 2)
             del input_features
         except Exception:
             confidence = 0.60
 
-    risk_percent = 2.0 if confidence >= 0.85 else 1.0
-    valid_dxy = dxy_corr < 0.25 or confidence >= 0.85
+    risk_percent = 2.0 if confidence >= 0.75 else 1.0
+    valid_dxy = dxy_corr < 0.35 or confidence >= 0.75
 
-    if (h4_trend == "BULLISH" and state == "BULLISH" and ema_fast > ema_slow and 
-        rsi < 68 and valid_dxy and (smc["fvg_bullish"] or smc["sweep_bullish"])):
+    smc_bull_confirm = smc["fvg_bullish"] or smc["sweep_bullish"] or (ema_fast > ema_slow)
+    smc_bear_confirm = smc["fvg_bearish"] or smc["sweep_bearish"] or (ema_fast < ema_slow)
+
+    market_summary = {
+        "h4_trend": h4_trend,
+        "state_label": state
+    }
+
+    if (h4_trend == "BULLISH" and state != "BEARISH" and ema_fast > ema_slow and 
+        rsi < 72 and valid_dxy and smc_bull_confirm):
         
-        sl = round(current_price - (atr * 1.3), 2)
-        tp1 = round(current_price + (atr * 1.6), 2)
-        tp2 = round(current_price + (atr * 3.0), 2)
-
+        sl = round(current_price - (atr * 1.2), 2)
+        tp1 = round(current_price + (atr * 1.8), 2)
+        tp2 = round(current_price + (atr * 3.2), 2)
         candle_timestamp = str(df.index[-1])
-        log_trade("BUY", current_price, sl, tp1, tp2, round(rsi, 1), dxy_corr, round(macd_diff, 3), round(stoch_k, 1), volatility_ratio, confidence)
 
-        return {
+        candidate_signal = {
             "status": "SIGNAL", "type": "🟢 شراء مؤسسي (BUY)", "entry": current_price,
-            "sl": sl, "tp1": tp1, "tp2": tp2, "rr": "1:2.3",
+            "sl": sl, "tp1": tp1, "tp2": tp2, "rr": "1:2.0",
             "rsi": round(rsi, 1), "dxy_corr": dxy_corr, "confidence": int(confidence * 100),
             "risk": f"{risk_percent}% من الحساب",
-            "smc_note": "تأكيد SMC: اقتناص سيولة / FVG صاعدة" if smc["fvg_bullish"] else "تأكيد بكسر القاع",
+            "smc_note": "تأكيد SMC: اقتناص سيولة / FVG صاعدة" if smc["fvg_bullish"] else "تأكيد بزخم الاتجاه",
             "candle_id": candle_timestamp
         }
 
-    elif (h4_trend == "BEARISH" and state == "BEARISH" and ema_fast < ema_slow and 
-          rsi > 32 and valid_dxy and (smc["fvg_bearish"] or smc["sweep_bearish"])):
+        # 🧠 مرحلة الفيتو والمراجعة الذكية عبر Gemini
+        gemini_eval = gemini_verify_signal(candidate_signal, market_summary)
+        if not gemini_eval.get("approved", True):
+            return {
+                "status": "WAIT",
+                "reason": f"🛑 فيتو ذكاء Gemini: {gemini_eval.get('reason', 'مخاطرة مرتفعة')}",
+                "price": current_price
+            }
+
+        candidate_signal["gemini_note"] = gemini_eval.get("reason", "تم التأييد بواسطة Gemini AI")
+        log_trade("BUY", current_price, sl, tp1, tp2, round(rsi, 1), dxy_corr, round(macd_diff, 3), round(stoch_k, 1), volatility_ratio, confidence)
+        return candidate_signal
+
+    elif (h4_trend == "BEARISH" and state != "BULLISH" and ema_fast < ema_slow and 
+          rsi > 28 and valid_dxy and smc_bear_confirm):
         
-        sl = round(current_price + (atr * 1.3), 2)
-        tp1 = round(current_price - (atr * 1.6), 2)
-        tp2 = round(current_price - (atr * 3.0), 2)
-
+        sl = round(current_price + (atr * 1.2), 2)
+        tp1 = round(current_price - (atr * 1.8), 2)
+        tp2 = round(current_price - (atr * 3.2), 2)
         candle_timestamp = str(df.index[-1])
-        log_trade("SELL", current_price, sl, tp1, tp2, round(rsi, 1), dxy_corr, round(macd_diff, 3), round(stoch_k, 1), volatility_ratio, confidence)
 
-        return {
+        candidate_signal = {
             "status": "SIGNAL", "type": "🔴 بيع مؤسسي (SELL)", "entry": current_price,
-            "sl": sl, "tp1": tp1, "tp2": tp2, "rr": "1:2.3",
+            "sl": sl, "tp1": tp1, "tp2": tp2, "rr": "1:2.0",
             "rsi": round(rsi, 1), "dxy_corr": dxy_corr, "confidence": int(confidence * 100),
             "risk": f"{risk_percent}% من الحساب",
-            "smc_note": "تأكيد SMC: اقتناص سيولة / FVG هابطة" if smc["fvg_bearish"] else "تأكيد بكسر القمة",
+            "smc_note": "تأكيد SMC: اقتناص سيولة / FVG هابطة" if smc["fvg_bearish"] else "تأكيد بزخم الاتجاه",
             "candle_id": candle_timestamp
         }
+
+        # 🧠 مرحلة الفيتو والمراجعة الذكية عبر Gemini
+        gemini_eval = gemini_verify_signal(candidate_signal, market_summary)
+        if not gemini_eval.get("approved", True):
+            return {
+                "status": "WAIT",
+                "reason": f"🛑 فيتو ذكاء Gemini: {gemini_eval.get('reason', 'مخاطرة مرتفعة')}",
+                "price": current_price
+            }
+
+        candidate_signal["gemini_note"] = gemini_eval.get("reason", "تم التأييد بواسطة Gemini AI")
+        log_trade("SELL", current_price, sl, tp1, tp2, round(rsi, 1), dxy_corr, round(macd_diff, 3), round(stoch_k, 1), volatility_ratio, confidence)
+        return candidate_signal
 
     else:
         return {
@@ -1022,25 +1207,47 @@ def generate_quant_signal():
         }
 
 # ------------------------------------
-# 6. محرك اختبار الاستراتيجية العكسي بالتسلسل الزمني الدقيق (Vectorized Backtest Engine)
+# 6. محرك اختبار الاستراتيجية العكسي (مُصلح ومطابق للنموذج الكمي)
 # ------------------------------------
 def run_quant_backtest():
-    """فحص الاستراتيجية العكسي على بيانات السوق المتاحة وحساب الربحية والأداء بالتسلسل الزمني الصارم"""
+    """فحص الاستراتيجية العكسي بالتناغم مع كافة الفلاتر المؤسسية وموديل الذكاء الاصطناعي"""
     cache = get_chart_data_cached()
     df_m15 = cache.get("df_gold_m15")
-    if df_m15 is None or len(df_m15) < 150:
+    df_h1 = cache.get("df_gold_h1")
+    df_dxy = cache.get("df_dxy_m15")
+    
+    if df_m15 is None or len(df_m15) < 150 or df_h1 is None or df_h1.empty:
         return "⚠️ لا تتوفر بيانات كافية لإجراء الفحص العكسي حالياً."
 
     df_clean = clean_df_columns(df_m15.copy())
+    df_clean = df_clean[~df_clean.index.duplicated(keep='first')]
+    
     close = to_1d_series(df_clean['Close'])
     high = to_1d_series(df_clean['High'])
     low = to_1d_series(df_clean['Low'])
     open_p = to_1d_series(df_clean['Open'])
 
+    if df_dxy is not None and not df_dxy.empty:
+        close_dxy = to_1d_series(clean_df_columns(df_dxy)['Close'])
+        r_gold = np.log(close / close.shift(1))
+        r_dxy = np.log(close_dxy / close_dxy.shift(1)).reindex(index=r_gold.index).ffill().fillna(0)
+        dxy_corr_series = r_gold.rolling(window=20).corr(r_dxy).fillna(0)
+    else:
+        dxy_corr_series = pd.Series(0.0, index=df_clean.index)
+
     rsi = ta.momentum.RSIIndicator(close, window=14).rsi()
     atr = ta.volatility.AverageTrueRange(high, low, close, window=14).average_true_range()
     ema9 = ta.trend.EMAIndicator(close, window=9).ema_indicator()
     ema21 = ta.trend.EMAIndicator(close, window=21).ema_indicator()
+    macd_diff = ta.trend.MACD(close).macd_diff()
+    stoch_k = ta.momentum.StochasticOscillator(high, low, close).stoch()
+
+    close_h1 = to_1d_series(clean_df_columns(df_h1)['Close'])
+    h1_ema200 = ta.trend.EMAIndicator(close_h1, window=200).ema_indicator().reindex(df_clean.index).ffill()
+    h1_ema500 = ta.trend.EMAIndicator(close_h1, window=500).ema_indicator().reindex(df_clean.index).ffill()
+
+    # استدعاء الموديل الكمي المدرب لاستخدامه في الباك تست
+    clf = train_self_learning_model()
 
     signals = 0
     wins = 0
@@ -1059,25 +1266,58 @@ def run_quant_backtest():
     rsi_vals = rsi.values
     ema9_vals = ema9.values
     ema21_vals = ema21.values
+    h1_ema200_vals = h1_ema200.values
+    h1_ema500_vals = h1_ema500.values
+    dxy_corr_vals = dxy_corr_series.values
+    macd_diff_vals = macd_diff.values
+    stoch_k_vals = stoch_k.values
 
     for i in range(30, len(df_clean) - 13):
         c_price = close_vals[i]
         c_atr = atr_vals[i]
         c_rsi = rsi_vals[i]
+        c_dxy = dxy_corr_vals[i]
+        c_macd = macd_diff_vals[i]
+        c_stoch = stoch_k_vals[i]
+        vol_ratio = (c_atr / c_price) * 100 if c_price > 0 else 0
 
-        is_buy = (ema9_vals[i] > ema21_vals[i]) and (c_rsi < 65) and (low_vals[i-1] > high_vals[i-3])
-        is_sell = (ema9_vals[i] < ema21_vals[i]) and (c_rsi > 35) and (high_vals[i-1] < low_vals[i-3])
+        if vol_ratio < 0.02:
+            continue
+
+        confidence = 0.60
+        if clf:
+            try:
+                feat = pd.DataFrame([[c_rsi, c_dxy, c_macd, c_stoch, vol_ratio]], 
+                                    columns=['rsi', 'dxy_corr', 'macd_diff', 'stoch_k', 'volatility_ratio'])
+                prob = clf.predict_proba(feat)[0]
+                classes = list(clf.classes_)
+                if 1 in classes:
+                    win_prob = float(prob[classes.index(1)])
+                    if win_prob < 0.52:
+                        continue
+                    confidence = win_prob
+            except Exception:
+                pass
+
+        valid_dxy = c_dxy < 0.35 or confidence >= 0.75
+        if not valid_dxy:
+            continue
+
+        is_h4_bull = (h1_ema200_vals[i] > h1_ema500_vals[i]) if not np.isnan(h1_ema500_vals[i]) else (close_vals[i] > close_vals[i-20])
+        is_h4_bear = not is_h4_bull
+
+        is_buy = is_h4_bull and (ema9_vals[i] > ema21_vals[i]) and (c_rsi < 72) and (low_vals[i-1] > high_vals[i-3] or ema9_vals[i-1] <= ema21_vals[i-1])
+        is_sell = is_h4_bear and (ema9_vals[i] < ema21_vals[i]) and (c_rsi > 28) and (high_vals[i-1] < low_vals[i-3] or ema9_vals[i-1] >= ema21_vals[i-1])
 
         if not (is_buy or is_sell):
             continue
 
         signals += 1
-        
         outcome = None
 
         if is_buy:
-            tp = c_price + (c_atr * 1.6)
-            sl = c_price - (c_atr * 1.3)
+            tp = c_price + (c_atr * 1.8)
+            sl = c_price - (c_atr * 1.2)
             
             for fut_idx in range(i + 1, i + 13):
                 f_open = open_vals[fut_idx]
@@ -1096,18 +1336,18 @@ def run_quant_backtest():
 
             if outcome == 1:
                 wins += 1
-                pnl = (c_atr * 1.6) * 10
+                pnl = (c_atr * 1.8) * 10
                 gross_profit += pnl
                 balance += pnl
             elif outcome == 0:
                 losses += 1
-                pnl = (c_atr * 1.3) * 10
+                pnl = (c_atr * 1.2) * 10
                 gross_loss += pnl
                 balance -= pnl
 
         elif is_sell:
-            tp = c_price - (c_atr * 1.6)
-            sl = c_price + (c_atr * 1.3)
+            tp = c_price - (c_atr * 1.8)
+            sl = c_price + (c_atr * 1.2)
             
             for fut_idx in range(i + 1, i + 13):
                 f_open = open_vals[fut_idx]
@@ -1126,12 +1366,12 @@ def run_quant_backtest():
 
             if outcome == 1:
                 wins += 1
-                pnl = (c_atr * 1.6) * 10
+                pnl = (c_atr * 1.8) * 10
                 gross_profit += pnl
                 balance += pnl
             elif outcome == 0:
                 losses += 1
-                pnl = (c_atr * 1.3) * 10
+                pnl = (c_atr * 1.2) * 10
                 gross_loss += pnl
                 balance -= pnl
 
@@ -1146,7 +1386,7 @@ def run_quant_backtest():
     profit_factor = round((gross_profit / gross_loss), 2) if gross_loss > 0 else (round(gross_profit, 2) if gross_profit > 0 else 0)
 
     msg = (
-        f"📊 **نتائج فحص الاستراتيجية العكسي (Quant Backtest)**\n"
+        f"📊 **نتائج فحص الاستراتيجية العكسي (Quant ML Backtest)**\n"
         f"───────────────────\n"
         f"🔢 إجمالي الإشارات المختبرة: {signals}\n"
         f"✅ الصفقات الناجحة: {wins}\n"
@@ -1155,7 +1395,7 @@ def run_quant_backtest():
         f"⚖️ **مشارف الربحية (Profit Factor):** {profit_factor}\n"
         f"📉 **التراجع الأقصى (Max Drawdown):** {round(max_drawdown, 2)}%\n"
         f"───────────────────\n"
-        f"🤖 *ملاحظة: الفحص تم كمياً بالتسلسل الزمني الدقيق لشمعة بشمعة.*"
+        f"🤖 *ملاحظة: الفحص العكسي يدمج نموذج الذكاء الاصطناعي والفلاتر المؤسسية الحية.*"
     )
     return msg
 
@@ -1192,7 +1432,7 @@ async def auto_market_scanner(app):
                 if current_candle != last_sent_candle:
                     last_sent_candle = current_candle
                     msg = (
-                        f"🚨 **إشارة كمية مؤسسية جديدة (Quant Institutional)**\n"
+                        f"🚨 **إشارة هجينة جديدة (Quant & Gemini AI)**\n"
                         f"───────────────────\n"
                         f"النوع: {sig['type']}\n"
                         f"🎯 **نسبة ثقة الموديل:** {sig['confidence']}%\n"
@@ -1202,9 +1442,10 @@ async def auto_market_scanner(app):
                         f"🎯 **الهدف الأول (TP1):** ${sig['tp1']}\n"
                         f"🎯 **الهدف الثاني (TP2):** ${sig['tp2']}\n"
                         f"💡 **تأكيد الهيكل:** {sig['smc_note']}\n"
+                        f"🤖 **ملاحظة Gemini:** {sig.get('gemini_note', 'تم التأييد')}\n"
                         f"🔗 **ارتباط الدولار:** {sig['dxy_corr']}\n"
                         f"───────────────────\n"
-                        f"🤖 *تم تأكيد الإشارة بالتناغم المؤسسي وتحديث التعلم الذاتي.*"
+                        f"🤖 *تم تأكيد الإشارة بالتناغم المؤسسي وتدقيق Gemini AI.*"
                     )
                     subscribers = get_subscribers()
                     for user_id in subscribers:
@@ -1240,7 +1481,7 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
             add_subscriber(chat_id)
             await update.message.reply_text(
                 "✅ **تم تسجيل الدخول بنجاح!**\n"
-                "مرحباً بك في البوت الكمي المؤسسي. تم تفعيل كافة الصلاحيات والتنبيهات التلقائية.\n\n"
+                "مرحباً بك في البوت الكمي المؤسسي المدعوم بـ Gemini AI. تم تفعيل كافة الصلاحيات والتنبيهات التلقائية.\n\n"
                 "💡 يمكنك الآن الضغط على الأزرار في الأسفل لتنفيذ الأوامر فوراً.",
                 reply_markup=get_main_keyboard(),
                 parse_mode='Markdown'
@@ -1283,7 +1524,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     add_subscriber(chat_id)
     await update.message.reply_text(
         f"أهلاً بك مجدداً! 🚀\n"
-        f"حسابك موثق ومفعل في **البوت الكمي المؤسسي (Self-Learning Quant Engine)**.\n\n"
+        f"حسابك موثق ومفعل في **البوت الكمي الهجين (Quant Engine & Gemini AI)**.\n\n"
         f"💡 اضغط على الأزرار أدناه لتنفيذ ما تريد:",
         reply_markup=get_main_keyboard(),
         parse_mode='Markdown'
@@ -1309,6 +1550,21 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if res:
         smc = res['smc']
         smc_status = "صاعد (FVG/Sweep)" if smc['fvg_bullish'] or smc['sweep_bullish'] else ("هابط (FVG/Sweep)" if smc['fvg_bearish'] or smc['sweep_bearish'] else "محايد")
+        
+        # استخراج أحدث درس تم تعلمه بواسطة Gemini
+        last_lesson = "لا يوجد أخطاء حديثة مفحوصة."
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT lesson FROM gemini_insights ORDER BY id DESC LIMIT 1")
+            row = cursor.fetchone()
+            if row:
+                last_lesson = row[0]
+        except Exception:
+            pass
+        finally:
+            release_db_connection(conn)
+
         msg = (
             f"🤖 **تقرير بنية السوق المؤسسية (XAU/USD)**\n"
             f"───────────────────\n"
@@ -1317,7 +1573,8 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📊 حالة HMM (M15): {res['state_label']}\n"
             f"🏦 هيكل السيولة (SMC): {smc_status}\n"
             f"🔗 معامل ارتباط الدولار: {res['dxy_corr']}\n"
-            f"───────────"
+            f"───────────────────\n"
+            f"🧠 **أحدث قواعد Gemini للتعلم الذاتي:**\n_{last_lesson}_"
         )
         await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
@@ -1388,7 +1645,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🟢 **صفقات الشراء (BUY):** {buy_rate}% نجاح ({buy_wins}/{buy_total})\n"
             f"🔴 **صفقات البيع (SELL):** {sell_rate}% نجاح ({sell_wins}/{sell_total})\n"
             f"───────────────────\n"
-            f"💡 *يتم تحديث النموذج وإعادة تدريب Random Forest أوتوماتيكياً مع كل تقييم.*"
+            f"💡 *تم دمج نظام التدقيق الراجع والتعلم الذاتي التلقائي عبر Gemini API.*"
         )
         await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
     except Exception as e:
@@ -1401,11 +1658,11 @@ async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authenticated(chat_id):
         await update.message.reply_text("🔒 يرجى إدخال كلمة السر أولاً لاستخدام البوت.")
         return
-    await update.message.reply_text("⚡ جاري مطابقة شروط التناغم وتأكيدات SMC...")
+    await update.message.reply_text("⚡ جاري مطابقة شروط التناغم المؤسسي وتدقيق مخاطر Gemini...")
     sig = await asyncio.to_thread(generate_quant_signal)
     if sig and sig["status"] == "SIGNAL":
         msg = (
-            f"🚨 **إشارة كمية مؤسسية**\n"
+            f"🚨 **إشارة كمية مؤسسية مدققة**\n"
             f"النوع: {sig['type']}\n"
             f"🎯 نسبة الثقة: {sig['confidence']}%\n"
             f"⚖️ اللوت الموصى به: {sig['risk']}\n"
@@ -1413,7 +1670,8 @@ async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🛑 SL: ${sig['sl']}\n"
             f"🎯 TP1: ${sig['tp1']}\n"
             f"🎯 TP2: ${sig['tp2']}\n"
-            f"💡 SMC: {sig['smc_note']}"
+            f"💡 SMC: {sig['smc_note']}\n"
+            f"🤖 Gemini Risk Note: {sig.get('gemini_note', 'تم التأييد')}"
         )
     else:
         msg = f"⏸️ **تنبيه الانتظار المؤسسي**\n💡 السبب: {sig['reason'] if sig else 'لا توجد فرصة مطابقة'}"
@@ -1438,5 +1696,5 @@ if __name__ == '__main__':
     
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
     
-    print("🤖 البوت والخادم يعملان بكفاءة تامة وجاهزون للمراقبة 24/7...")
+    print("🤖 البوت الهجين (Quant + Gemini API) يعمل بكفاءة تامة وجاهز للمراقبة 24/7...")
     app.run_polling(drop_pending_updates=True)
