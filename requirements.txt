@@ -7,3 +7,4 @@ hmmlearn
 ta
 flask
 psycopg2-binary
+google-genai
