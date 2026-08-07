@@ -501,7 +501,7 @@ def gemini_reflect_on_failures():
     finally:
         release_db_connection(conn)
 
-# --- تتبع الصفقات المحسن المصلح بدقة تسلسلي زمنياً ---
+# --- تتبع الصفقات المحسن المصلح بدقة تسلسلي زمنياً بالاعتماد على السعر الفوري والشموع ---
 def update_open_trades_outcome_historical(df_m15):
     conn = get_db_connection()
     has_new_loss = False
@@ -510,62 +510,75 @@ def update_open_trades_outcome_historical(df_m15):
         cursor.execute("SELECT id, timestamp, signal_type, sl, tp1 FROM trades WHERE outcome IS NULL")
         open_trades = cursor.fetchall()
 
-        if not open_trades or df_m15.empty:
+        if not open_trades:
             return
 
-        df_clean = clean_df_columns(df_m15.copy())
-        df_index = df_clean.index
-        if df_index.tz is None:
-            df_index = df_index.tz_localize(timezone.utc)
-        else:
-            df_index = df_index.tz_convert(timezone.utc)
+        # 💡 جلب السعر اللحظي الفوري لحسم الصفقة فوراً بدون انتظار تأخر الشموع
+        spot_data = get_market_data()
+        live_price = spot_data.get("gold", 0.0) if spot_data else 0.0
+
+        df_clean = clean_df_columns(df_m15.copy()) if df_m15 is not None and not df_m15.empty else pd.DataFrame()
+        if not df_clean.empty:
+            df_index = df_clean.index
+            if df_index.tz is None:
+                df_index = df_index.tz_localize(timezone.utc)
+            else:
+                df_index = df_index.tz_convert(timezone.utc)
 
         ph = "%s" if is_postgres() and isinstance(conn, psycopg2.extensions.connection) else "?"
 
         for trade_id, trade_time_str, sig_type, sl, tp1 in open_trades:
             try:
-                if isinstance(trade_time_str, datetime):
-                    trade_time = trade_time_str if trade_time_str.tzinfo else trade_time_str.replace(tzinfo=timezone.utc)
-                else:
-                    trade_time = datetime.strptime(str(trade_time_str)[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                    
-                sub_df = df_clean[df_index >= trade_time]
-                if sub_df.empty:
-                    continue
-
                 outcome = None
-                for idx, row in sub_df.iterrows():
-                    open_val = float(row['Open'])
-                    high_val = float(row['High'])
-                    low_val = float(row['Low'])
 
+                # 1️⃣ الفحص الفوري المباشر عبر السعر اللحظي
+                if live_price > 1000:
                     if "BUY" in sig_type or "شراء" in sig_type:
-                        if low_val <= sl and high_val >= tp1:
-                            if abs(open_val - sl) < abs(open_val - tp1):
-                                outcome = 0
-                            else:
-                                outcome = 1
-                            break
-                        elif low_val <= sl:
-                            outcome = 0
-                            break
-                        elif high_val >= tp1:
+                        if live_price >= tp1:
                             outcome = 1
-                            break
-
+                        elif live_price <= sl:
+                            outcome = 0
                     elif "SELL" in sig_type or "بيع" in sig_type:
-                        if high_val >= sl and low_val <= tp1:
-                            if abs(open_val - sl) < abs(open_val - tp1):
-                                outcome = 0
-                            else:
-                                outcome = 1
-                            break
-                        elif high_val >= sl:
-                            outcome = 0
-                            break
-                        elif low_val <= tp1:
+                        if live_price <= tp1:
                             outcome = 1
-                            break
+                        elif live_price >= sl:
+                            outcome = 0
+
+                # 2️⃣ فحص الشموع التاريخية M15 في حال لم تُحسم الصفقة بالسعر اللحظي
+                if outcome is None and not df_clean.empty:
+                    if isinstance(trade_time_str, datetime):
+                        trade_time = trade_time_str if trade_time_str.tzinfo else trade_time_str.replace(tzinfo=timezone.utc)
+                    else:
+                        trade_time = datetime.strptime(str(trade_time_str)[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                        
+                    sub_df = df_clean[df_index >= trade_time]
+                    if not sub_df.empty:
+                        for idx, row in sub_df.iterrows():
+                            open_val = float(row['Open'])
+                            high_val = float(row['High'])
+                            low_val = float(row['Low'])
+
+                            if "BUY" in sig_type or "شراء" in sig_type:
+                                if low_val <= sl and high_val >= tp1:
+                                    outcome = 0 if abs(open_val - sl) < abs(open_val - tp1) else 1
+                                    break
+                                elif low_val <= sl:
+                                    outcome = 0
+                                    break
+                                elif high_val >= tp1:
+                                    outcome = 1
+                                    break
+
+                            elif "SELL" in sig_type or "بيع" in sig_type:
+                                if high_val >= sl and low_val <= tp1:
+                                    outcome = 0 if abs(open_val - sl) < abs(open_val - tp1) else 1
+                                    break
+                                elif high_val >= sl:
+                                    outcome = 0
+                                    break
+                                elif low_val <= tp1:
+                                    outcome = 1
+                                    break
 
                 if outcome is not None:
                     cursor.execute(f"UPDATE trades SET outcome = {outcome} WHERE id = {ph}", (trade_id,))
