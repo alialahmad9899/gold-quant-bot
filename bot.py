@@ -439,7 +439,7 @@ def gemini_verify_signal(signal_data, market_summary):
     """
     try:
         response = gemini_client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-2.0-flash',
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json"
@@ -479,7 +479,7 @@ def gemini_reflect_on_failures():
         }}
         """
         response = gemini_client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-2.0-flash',
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json"
@@ -1143,7 +1143,7 @@ def analyze_institutional_engine():
             "last_price": last_price,
             "df_m15": df_gold_m15,
             "dxy_corr": dxy_corr,
-            "us10y_trend": "DOWN" if close_us10y_m15.iloc[-1] < close_us10y_m15.iloc[-5] else "UP",
+            "us10y_trend": "DOWN" if (len(close_us10y_m15) >= 5 and close_us10y_m15.iloc[-1] < close_us10y_m15.iloc[-5]) else "UP",
             "smc": smc
         }
 
