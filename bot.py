@@ -77,7 +77,8 @@ except ImportError:
 UTC = timezone.utc
 M15 = pd.Timedelta(minutes=15)
 
-GOLD_SYMBOL = os.getenv("GOLD_SYMBOL", "GC=F")
+# الاعتماد على XAUUSD=X كافتراضي لجلب سعر الذهب المباشر للسبوت (الفوركس) المطابق لمنصات التداول
+GOLD_SYMBOL = os.getenv("GOLD_SYMBOL", "XAUUSD=X")
 DXY_SYMBOL = os.getenv("DXY_SYMBOL", "DX-Y.NYB")
 US10Y_SYMBOL = os.getenv("US10Y_SYMBOL", "^TNX")
 
@@ -267,7 +268,7 @@ def fetch_latest_asset_quote(symbols, fallback_df=None):
             if not df.empty:
                 close = to_1d_series(df["Close"]).dropna()
                 if not close.empty:
-                    spot_price = float(close.iloc[-1])
+                    spot_price = round(float(close.iloc[-1]), 2)
                     ts = ensure_utc_timestamp(df.index[-1]).to_pydatetime()
                     half_spread = ESTIMATED_SPREAD_USD / 2.0
                     bid_price = round(spot_price - half_spread, 2)
@@ -277,7 +278,7 @@ def fetch_latest_asset_quote(symbols, fallback_df=None):
     if fallback_df is not None and not fallback_df.empty:
         close = to_1d_series(fallback_df["Close"]).dropna()
         if not close.empty:
-            spot_price = float(close.iloc[-1])
+            spot_price = round(float(close.iloc[-1]), 2)
             ts = ensure_utc_timestamp(fallback_df.index[-1]).to_pydatetime()
             half_spread = ESTIMATED_SPREAD_USD / 2.0
             bid_price = round(spot_price - half_spread, 2)
@@ -392,7 +393,8 @@ SNAPSHOT_CACHE = MarketSnapshotCache()
 def market_data_worker_loop(stop_event):
     logger.info("بدء خيط جلب بيانات السوق المباشرة.")
     first_run = True
-    gold_symbols = [GOLD_SYMBOL, "GC=F", "GLD", "IAU"]
+    # إعطاء الأولوية لسعر الذهب المباشر للسبوت/الفوركس (XAUUSD=X) لتطابق منصات التداول
+    gold_symbols = [GOLD_SYMBOL, "XAUUSD=X", "GC=F", "GLD", "IAU"]
     dxy_symbols = [DXY_SYMBOL, "DX-Y.NYB", "UUP"]
     us10y_symbols = [US10Y_SYMBOL, "^TNX"]
 
@@ -1304,7 +1306,7 @@ def wait_result(reason, quality_state, price=None):
         "status": "WAIT",
         "quality_state": quality_state,
         "reason": reason,
-        "price": price,
+        "price": round(price, 2) if price is not None else None,
     }
 
 
@@ -1493,10 +1495,10 @@ def generate_quant_signal():
             "candle_close_price": round(signal_candle_close, 2),
             "live_execution_price": round(exec_price, 2),
             "price": round(exec_price, 2),
-            "slippage": round(slippage, 4),
-            "sl": sl,
-            "tp1": tp1,
-            "tp2": tp2,
+            "slippage": round(slippage, 2),
+            "sl": round(sl, 2),
+            "tp1": round(tp1, 2),
+            "tp2": round(tp2, 2),
             "dxy": round(macro_data["dxy"], 2) if macro_data["dxy"] is not None else None,
             "us10y": round(macro_data["us10y"], 2) if macro_data["us10y"] is not None else None,
         }
@@ -1507,9 +1509,9 @@ def generate_quant_signal():
                 signal_type,
                 round(signal_candle_close, 2),
                 round(exec_price, 2),
-                sl,
-                tp1,
-                tp2,
+                round(sl, 2),
+                round(tp1, 2),
+                round(tp2, 2),
                 quality_state,
             )
             if not inserted:
@@ -1529,7 +1531,9 @@ def generate_quant_signal():
 
 def run_backtest_simulation(initial_balance=10000.0, risk_per_trade=0.01):
     logger.info("جاري تشغيل محاكاة الاختبار العكسي...")
-    df_m15 = download_yf("GC=F", "30d", "15m")
+    df_m15 = download_yf("XAUUSD=X", "30d", "15m")
+    if df_m15.empty:
+        df_m15 = download_yf("GC=F", "30d", "15m")
     if df_m15.empty:
         df_m15 = download_yf("GLD", "30d", "15m")
 
@@ -1724,10 +1728,10 @@ def get_active_trades_report():
 
         text += (
             f"🆔 <b>{candle_id}</b> ({sig_ar})\n"
-            f"💵 <b>الدخول:</b> <code>${entry}</code> | <b>الحالي:</b> <code>${live_price}</code>\n"
+            f"💵 <b>الدخول:</b> <code>${entry:.2f}</code> | <b>الحالي:</b> <code>${live_price:.2f}</code>\n"
             f"📊 <b>النتيجة اللحظية:</b> {emoji} <code>{pnl_pips:+.2f}$</code>\n"
-            f"🎯 <b>TP1:</b> <code>${tp1}</code> | <b>TP2:</b> <code>${tp2}</code>\n"
-            f"🛑 <b>SL:</b> <code>${sl}</code> | <b>الحالة:</b> <code>{status}</code>\n"
+            f"🎯 <b>TP1:</b> <code>${tp1:.2f}</code> | <b>TP2:</b> <code>${tp2:.2f}</code>\n"
+            f"🛑 <b>SL:</b> <code>${sl:.2f}</code> | <b>الحالة:</b> <code>{status}</code>\n"
             "───────────────────────\n"
         )
 
@@ -1746,6 +1750,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         f"👋 أهلاً بك يا <b>{safe_name}</b> في بوت التداول الكمي المتقدم XAUUSD Quant v3.0.\n\n"
         "<b>الميزات النشطة تلقائياً:</b>\n"
+        "• <b>أسعار التداول المباشرة:</b> ربط متطابق مع أسعار سبوت الذهب (XAUUSD) في منصات التداول.\n"
         "• <b>فلتر الأخبار الاقتصادية:</b> حظر التداول أثناء صدور بيانات USD الهامة وعطلات السوق.\n"
         "• <b>حساب الفارق السعري:</b> احتساب دقيق لأسعار العرض والطلب (Bid/Ask).\n"
         "• <b>التحليل المؤسسي (SMC):</b> تتبع مناطق الطلب والعرض والكشوف السعرية.\n"
@@ -1780,14 +1785,20 @@ async def analyze_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     quality_ar = translate_quality_state(res["quality_state"])
 
+    live_price_str = f"{res['live_execution_price']:.2f}" if res.get('live_execution_price') else "غير متاح"
+    close_price_str = f"{res['signal_candle_close']:.2f}" if res.get('signal_candle_close') else "غير متاح"
+    slippage_str = f"{res['slippage']:.2f}" if res.get('slippage') is not None else "0.00"
+    dxy_str = f"{res['dxy']:.2f}" if res.get('dxy') is not None else "غير متاح"
+    us10y_str = f"{res['us10y']:.2f}%" if res.get('us10y') is not None else "غير متاح"
+
     text = (
         "📊 <b>التحليل المؤسسي المتقدم (XAUUSD)</b>\n"
         "───────────────────────\n"
-        f"💵 <b>سعر التنفيذ المباشر:</b> <code>${res['live_execution_price']}</code>\n"
-        f"📉 <b>إغلاق شمعة الإشارة:</b> <code>${res['signal_candle_close']}</code>\n"
-        f"📐 <b>الانزلاق السعري المتوقع:</b> <code>{res['slippage']}</code>\n"
-        f"📊 <b>مؤشر الدولار (DXY):</b> <code>{res['dxy'] if res['dxy'] is not None else 'غير متاح'}</code>\n"
-        f"📈 <b>عائد السندات (US10Y):</b> <code>{res['us10y'] if res['us10y'] is not None else 'غير متاح'}%</code>\n"
+        f"💵 <b>سعر المنصة المباشر:</b> <code>${live_price_str}</code>\n"
+        f"📉 <b>إغلاق شمعة الإشارة:</b> <code>${close_price_str}</code>\n"
+        f"📐 <b>الانزلاق السعري المتوقع:</b> <code>${slippage_str}</code>\n"
+        f"📊 <b>مؤشر الدولار (DXY):</b> <code>{dxy_str}</code>\n"
+        f"📈 <b>عائد السندات (US10Y):</b> <code>{us10y_str}</code>\n"
         f"🛡️ <b>جودة البيانات:</b> <code>{quality_ar}</code>\n"
         "───────────────────────\n"
         f"🧭 <b>اتجاه فريم H4:</b> {trend_ar}\n"
@@ -1818,22 +1829,26 @@ async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sig_ar = "شراء 🟢" if sig == "BUY" else "بيع 🔴" if sig == "SELL" else "انتظار (لا توجد إشارة) 🟡"
     quality_ar = translate_quality_state(res["quality_state"])
 
+    live_price_str = f"{res['live_execution_price']:.2f}"
+    close_price_str = f"{res['signal_candle_close']:.2f}"
+    slippage_str = f"{res['slippage']:.2f}"
+
     text = (
         f"⚡ <b>الإشارة الكمية: {sig_ar}</b>\n"
         "───────────────────────\n"
         f"🆔 <b>معرف الشمعة:</b> <code>{res['candle_id']}</code>\n"
-        f"💵 <b>سعر التنفيذ:</b> <code>${res['live_execution_price']}</code>\n"
-        f"📉 <b>إغلاق الشمعة:</b> <code>${res['signal_candle_close']}</code>\n"
-        f"📐 <b>الانزلاق السعري:</b> <code>{res['slippage']}</code>\n"
+        f"💵 <b>سعر الدخول (منصة التداول):</b> <code>${live_price_str}</code>\n"
+        f"📉 <b>إغلاق الشمعة:</b> <code>${close_price_str}</code>\n"
+        f"📐 <b>الانزلاق السعري:</b> <code>${slippage_str}</code>\n"
         f"🛡️ <b>جودة البيانات:</b> <code>{quality_ar}</code>\n"
         "───────────────────────\n"
     )
 
     if sig in {"BUY", "SELL"}:
         text += (
-            f"🛑 <b>وقف الخسارة (SL):</b> <code>${res['sl']}</code>\n"
-            f"🎯 <b>الهدف الأول (TP1):</b> <code>${res['tp1']}</code>\n"
-            f"🎯 <b>الهدف الثاني (TP2):</b> <code>${res['tp2']}</code>\n"
+            f"🛑 <b>وقف الخسارة (SL):</b> <code>${res['sl']:.2f}</code>\n"
+            f"🎯 <b>الهدف الأول (TP1):</b> <code>${res['tp1']:.2f}</code>\n"
+            f"🎯 <b>الهدف الثاني (TP2):</b> <code>${res['tp2']:.2f}</code>\n"
             f"📊 <b>نقاط التقييم (شراء / بيع):</b> <code>{res['buy_score']} / {res['sell_score']}</code>\n"
             f"🧭 <b>اتجاه H4:</b> <code>{res['h4_trend']}</code>\n"
         )
@@ -1876,7 +1891,12 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     worker_status_ar = "نشط ويعمل ✅" if worker_alive else "متوقف ❌"
     error_ar = worker_error if worker_error else "لا يوجد أخطاء"
 
-    us10y_str = f"{macro.get('us10y')}%" if macro.get("us10y") is not None else "غير متاح"
+    # تنسيق وتقريب جميع الأرقام بعناية لمنع الأرقام العائمة الطويلة
+    gold_spot = f"{macro.get('gold_spot'):.2f}" if macro.get("gold_spot") is not None else "غير متاح"
+    gold_bid = f"{macro.get('gold_bid'):.2f}" if macro.get("gold_bid") is not None else "N/A"
+    gold_ask = f"{macro.get('gold_ask'):.2f}" if macro.get("gold_ask") is not None else "N/A"
+    dxy_val = f"{macro.get('dxy'):.2f}" if macro.get("dxy") is not None else "غير متاح"
+    us10y_str = f"{macro.get('us10y'):.2f}%" if macro.get("us10y") is not None else "غير متاح"
 
     text = (
         "🛡️ <b>حالة النظام والخدمة v3.0</b>\n"
@@ -1884,9 +1904,9 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⚙️ <b>العامل الخفي (Worker):</b> <code>{worker_status_ar}</code>\n"
         f"👥 <b>المشتركون في الإشارات:</b> <code>{len(subscribers)}</code>\n"
         f"🧠 <b>الشمعات المقيمة بالذاكرة:</b> <code>{len(df_m15)}</code>\n"
-        f"💵 <b>سعر الذهب المباشر:</b> <code>${macro.get('gold_spot') or 'غير متاح'}</code>\n"
-        f"💵 <b>أسعار الطلب/العرض:</b> <code>${macro.get('gold_bid') or 'N/A'} / ${macro.get('gold_ask') or 'N/A'}</code>\n"
-        f"📊 <b>مؤشر الدولار (DXY):</b> <code>{macro.get('dxy') or 'غير متاح'}</code>\n"
+        f"💵 <b>سعر الذهب المباشر (السبوت):</b> <code>${gold_spot}</code>\n"
+        f"💵 <b>أسعار الطلب/العرض:</b> <code>${gold_bid} / ${gold_ask}</code>\n"
+        f"📊 <b>مؤشر الدولار (DXY):</b> <code>{dxy_val}</code>\n"
         f"📈 <b>عائد السندات (US10Y):</b> <code>{us10y_str}</code>\n"
         f"⏱️ <b>عمر الذاكرة المؤقتة:</b> <code>{f'{cache_age:.1f} ثانية' if cache_age is not None else 'غير متاح'}</code>\n"
         f"🕯️ <b>آخر شمعة M15 مغلقة:</b> <code>{last_candle}</code>\n"
@@ -1966,12 +1986,12 @@ async def auto_signal_job(context: ContextTypes.DEFAULT_TYPE):
                 f"🚨 {emoji} <b>إشارة تلقائية جديدة: {sig_ar}</b>\n"
                 "───────────────────────\n"
                 f"🆔 <b>معرف الشمعة:</b> <code>{res['candle_id']}</code>\n"
-                f"💵 <b>سعر التنفيذ:</b> <code>${res['live_execution_price']}</code>\n"
-                f"📉 <b>إغلاق الشمعة:</b> <code>${res['signal_candle_close']}</code>\n"
-                f"📐 <b>الانزلاق السعري:</b> <code>{res['slippage']}</code>\n"
-                f"🛑 <b>وقف الخسارة (SL):</b> <code>${res['sl']}</code>\n"
-                f"🎯 <b>الهدف الأول (TP1):</b> <code>${res['tp1']}</code>\n"
-                f"🎯 <b>الهدف الثاني (TP2):</b> <code>${res['tp2']}</code>\n"
+                f"💵 <b>سعر الدخول (منصة التداول):</b> <code>${res['live_execution_price']:.2f}</code>\n"
+                f"📉 <b>إغلاق الشمعة:</b> <code>${res['signal_candle_close']:.2f}</code>\n"
+                f"📐 <b>الانزلاق السعري:</b> <code>${res['slippage']:.2f}</code>\n"
+                f"🛑 <b>وقف الخسارة (SL):</b> <code>${res['sl']:.2f}</code>\n"
+                f"🎯 <b>الهدف الأول (TP1):</b> <code>${res['tp1']:.2f}</code>\n"
+                f"🎯 <b>الهدف الثاني (TP2):</b> <code>${res['tp2']:.2f}</code>\n"
                 f"🧭 <b>اتجاه H4:</b> <code>{res['h4_trend']}</code>\n"
             )
 
@@ -2067,7 +2087,7 @@ def run_flask_server():
             "status": "healthy" if healthy else "unhealthy",
             "worker_alive": worker_alive,
             "database_ok": db_ok,
-            "cache_age_seconds": cache_age,
+            "cache_age_seconds": round(cache_age, 2) if cache_age is not None else None,
             "last_closed_m15": last_candle,
             "last_full_fetch": str(last_full) if last_full else None,
             "worker_last_attempt": str(worker_attempt) if worker_attempt else None,
