@@ -8,6 +8,7 @@ import requests
 import re
 import gc
 import json
+import time
 import threading
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
@@ -352,39 +353,72 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, message: str):
         except Exception as e:
             print(f"خطأ في إرسال الإشعار للآدمن: {e}")
 
-def log_trade(signal_type, entry, sl, tp1, tp2, rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, confidence):
+def has_active_open_trade(signal_type):
+    """التحقق من وجود صفقة نشطة قيد التتبع لمنع تكرار الإشارات المسببة للإزعاج"""
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
+        ph = "%s" if is_postgres() and isinstance(conn, psycopg2.extensions.connection) else "?"
+        cursor.execute(f"SELECT id FROM trades WHERE signal_type = {ph} AND outcome IS NULL", (signal_type,))
+        row = cursor.fetchone()
+        return row is not None
+    except Exception as e:
+        print(f"خطأ في فحص الصفقة النشطة: {e}")
+        return False
+    finally:
+        release_db_connection(conn)
+
+def log_trade(signal_type, entry, sl, tp1, tp2, rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, confidence):
+    """تسجيل الصفقة مع تحويل كافة القيم لـ float صريح لمنع خطأ psycopg2 numpy.float64"""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        
+        # تحويل محصن للأنواع القياسية لـ Python
+        f_entry = float(entry)
+        f_sl = float(sl)
+        f_tp1 = float(tp1)
+        f_tp2 = float(tp2)
+        f_rsi = float(rsi)
+        f_dxy = float(dxy_corr)
+        f_macd = float(macd_diff)
+        f_stoch = float(stoch_k)
+        f_vol = float(volatility_ratio)
+        f_conf = float(confidence)
+        
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
         if is_postgres() and isinstance(conn, psycopg2.extensions.connection):
             cursor.execute('''
                 SELECT id FROM trades 
                 WHERE signal_type = %s AND entry_price = %s AND timestamp >= NOW() - INTERVAL '15 minutes'
-            ''', (signal_type, entry))
+            ''', (signal_type, f_entry))
             if cursor.fetchone() is None:
                 cursor.execute('''
                     INSERT INTO trades (timestamp, signal_type, entry_price, sl, tp1, tp2, rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, outcome, confidence)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s)
-                ''', (datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), signal_type, entry, sl, tp1, tp2, rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, confidence))
+                ''', (now_str, signal_type, f_entry, f_sl, f_tp1, f_tp2, f_rsi, f_dxy, f_macd, f_stoch, f_vol, f_conf))
                 conn.commit()
+                print(f"✅ [PostgreSQL] تم تسجيل الصفقة ({signal_type} بسعر {f_entry}) بنجاح.")
         else:
             cursor.execute('''
                 SELECT id FROM trades 
                 WHERE signal_type = ? AND entry_price = ? AND datetime(timestamp) >= datetime('now', '-15 minutes')
-            ''', (signal_type, entry))
+            ''', (signal_type, f_entry))
             if cursor.fetchone() is None:
                 cursor.execute('''
                     INSERT INTO trades (timestamp, signal_type, entry_price, sl, tp1, tp2, rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, outcome, confidence)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
-                ''', (datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), signal_type, entry, sl, tp1, tp2, rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, confidence))
+                ''', (now_str, signal_type, f_entry, f_sl, f_tp1, f_tp2, f_rsi, f_dxy, f_macd, f_stoch, f_vol, f_conf))
                 conn.commit()
+                print(f"✅ [SQLite] تم تسجيل الصفقة ({signal_type} بسعر {f_entry}) بنجاح.")
     except Exception as e:
-        print(f"خطأ وتسجيل الصفقة: {e}")
+        print(f"❌ خطأ حرج في تسجيل الصفقة بالداتا بيز: {e}")
     finally:
         release_db_connection(conn)
 
 # ------------------------------------
-# 🧠 محرك ذكاء GEMINI لتفريغ أسباب الخسارة وتدقيق الفرص اللحظية (مع الربط بالذاكرة)
+# 🧠 محرك ذكاء GEMINI لتفريغ أسباب الخسارة وتدقيق الفرص اللحظية (مطور بـ Model Fallback و 10 RPM)
 # ------------------------------------
 def get_recent_gemini_insights():
     """جلب أحدث الدروس المستفادة المخزنة في قاعدة البيانات لربط ذاكرة الذكاء الاصطناعي"""
@@ -402,11 +436,10 @@ def get_recent_gemini_insights():
     return insights
 
 def gemini_verify_signal(signal_data, market_summary):
-    """تدقيق ودراسة المخاطرة منطقياً عبر Gemini API مع الالتزام بالدروس والتعلم السابق"""
+    """تدقيق المخاطرة عبر الموديل السريع gemini-2.5-flash-lite (10 RPM) مع نظام التنقل التلقائي"""
     if not gemini_client:
         return {"approved": True, "reason": "اعتماد كمي أوتوماتيكي (Gemini غير مفعل)"}
 
-    # استجماع ذاكرة الدروس السابقة لتعزيز التعلم الذاتي
     past_lessons = get_recent_gemini_insights()
     lessons_text = "\n".join([f"- {l}" for l in past_lessons]) if past_lessons else "لا توجد قواعد حظر سابقة مسجلة."
 
@@ -437,22 +470,34 @@ def gemini_verify_signal(signal_data, market_summary):
         "reason": "سبب واضح ومختصر باللغة العربية للقبول أو الفيتو"
     }}
     """
-    try:
-        response = gemini_client.models.generate_content(
-            model='gemini-2.0-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json"
-            )
-        )
-        data = json.loads(response.text)
-        return data
-    except Exception as e:
-        print(f"⚠️ خطأ استدعاء Gemini Verify: {e}")
-        return {"approved": True, "reason": "اعتماد كمي تلقائي (تعذر الاتصال بـ Gemini)"}
+    
+    # 🔄 قائمة الموديلات الترتيبية: يبدأ بالموديل الخفيف (10 RPM) ثم ينتقل للبقية عند الاكتظاظ
+    candidate_models = ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-2.0-flash']
+
+    for target_model in candidate_models:
+        for attempt in range(2):
+            try:
+                response = gemini_client.models.generate_content(
+                    model=target_model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json"
+                    )
+                )
+                data = json.loads(response.text)
+                return data
+            except Exception as e:
+                err_str = str(e)
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    time.sleep(2)
+                    continue
+                else:
+                    break
+
+    return {"approved": True, "reason": "اعتماد كمي تلقائي (تم تجاوز حدود استخدام Gemini)"}
 
 def gemini_reflect_on_failures():
-    """تحليل الصفقات الخاسرة بواسطة Gemini واستنباط دروس وقواعد حظر جديدة"""
+    """تحليل الصفقات الخاسرة بـ gemini-2.5-flash-lite واستنباط دروس جديدة"""
     if not gemini_client:
         return
     conn = get_db_connection()
@@ -478,26 +523,38 @@ def gemini_reflect_on_failures():
             "lesson": "الدرس المستفاد والقاعدة المستنبطة باللغة العربية"
         }}
         """
-        response = gemini_client.models.generate_content(
-            model='gemini-2.0-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json"
-            )
-        )
-        res = json.loads(response.text)
-        lesson = res.get("lesson", "")
-        if lesson:
-            timestamp_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-            ph = "%s" if is_postgres() and isinstance(conn, psycopg2.extensions.connection) else "?"
-            if is_postgres() and isinstance(conn, psycopg2.extensions.connection):
-                cursor.execute("INSERT INTO gemini_insights (created_at, lesson) VALUES (%s, %s)", (timestamp_str, lesson))
-            else:
-                cursor.execute("INSERT INTO gemini_insights (created_at, lesson) VALUES (?, ?)", (timestamp_str, lesson))
-            conn.commit()
-            print(f"🧠 درس جديد مستفاد من Gemini: {lesson}")
+
+        candidate_models = ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-2.0-flash']
+
+        for target_model in candidate_models:
+            try:
+                response = gemini_client.models.generate_content(
+                    model=target_model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json"
+                    )
+                )
+                res = json.loads(response.text)
+                lesson = res.get("lesson", "")
+                if lesson:
+                    timestamp_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                    ph = "%s" if is_postgres() and isinstance(conn, psycopg2.extensions.connection) else "?"
+                    if is_postgres() and isinstance(conn, psycopg2.extensions.connection):
+                        cursor.execute("INSERT INTO gemini_insights (created_at, lesson) VALUES (%s, %s)", (timestamp_str, lesson))
+                    else:
+                        cursor.execute("INSERT INTO gemini_insights (created_at, lesson) VALUES (?, ?)", (timestamp_str, lesson))
+                    conn.commit()
+                    print(f"🧠 درس جديد مستفاد من Gemini ({target_model}): {lesson}")
+                break
+            except Exception as e:
+                err_str = str(e)
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    time.sleep(2)
+                    continue
+                break
     except Exception as e:
-        print(f"⚠️ خطأ أثناء التحليل الذاتي لـ Gemini: {e}")
+        print(f"⚠️ خطأ قاعدة البيانات في التحليل الذاتي: {e}")
     finally:
         release_db_connection(conn)
 
@@ -582,6 +639,7 @@ def update_open_trades_outcome_historical(df_m15):
 
                 if outcome is not None:
                     cursor.execute(f"UPDATE trades SET outcome = {outcome} WHERE id = {ph}", (trade_id,))
+                    print(f"🎯 [تحديث الصفقة] الصفقة رقم {trade_id} تم حسمها بالنتيجة: {'ربح ✅' if outcome == 1 else 'خسارة ❌'}")
                     if outcome == 0:
                         has_new_loss = True
             except Exception as e:
@@ -1227,6 +1285,14 @@ def generate_quant_signal():
     if (h4_trend == "BULLISH" and state != "BEARISH" and ema_fast > ema_slow and 
         rsi < 72 and valid_dxy and smc_bull_confirm):
         
+        # 🔒 فحص حظر التكرار: إذا كانت هناك صفقة شراء مفتوحة مسبقاً ولم تصب الهدف بعد
+        if has_active_open_trade("BUY"):
+            return {
+                "status": "WAIT",
+                "reason": "توجد صفقة شراء نشطة قيد التتبع لم تصب الهدف بعد.",
+                "price": current_price
+            }
+
         sl = round(current_price - (atr * 1.2), 2)
         tp1 = round(current_price + (atr * 1.8), 2)
         tp2 = round(current_price + (atr * 3.2), 2)
@@ -1257,6 +1323,14 @@ def generate_quant_signal():
     elif (h4_trend == "BEARISH" and state != "BULLISH" and ema_fast < ema_slow and 
           rsi > 28 and valid_dxy and smc_bear_confirm):
         
+        # 🔒 فحص حظر التكرار: إذا كانت هناك صفقة بيع مفتوحة مسبقاً ولم تصب الهدف بعد
+        if has_active_open_trade("SELL"):
+            return {
+                "status": "WAIT",
+                "reason": "توجد صفقة بيع نشطة قيد التتبع لم تصب الهدف بعد.",
+                "price": current_price
+            }
+
         sl = round(current_price + (atr * 1.2), 2)
         tp1 = round(current_price - (atr * 1.8), 2)
         tp2 = round(current_price - (atr * 3.2), 2)
@@ -1684,11 +1758,16 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         is_pg = is_postgres() and isinstance(conn, psycopg2.extensions.connection)
         
+        # إحصائيات الصفقات المغلقة
         cursor.execute("SELECT COUNT(*), SUM(CASE WHEN outcome = 1 THEN 1 ELSE 0 END) FROM trades WHERE outcome IS NOT NULL")
         total_eval, total_wins = cursor.fetchone()
         total_eval = total_eval or 0
         total_wins = total_wins or 0
         overall_win_rate = round((total_wins / total_eval * 100), 1) if total_eval > 0 else 0
+
+        # إحصائيات الصفقات المفتوحة قيد التتبع حالياً
+        cursor.execute("SELECT COUNT(*) FROM trades WHERE outcome IS NULL")
+        pending_trades = cursor.fetchone()[0] or 0
 
         if is_pg:
             cursor.execute("SELECT COUNT(*), SUM(CASE WHEN outcome = 1 THEN 1 ELSE 0 END) FROM trades WHERE outcome IS NOT NULL AND timestamp >= NOW() - INTERVAL '7 days'")
@@ -1723,6 +1802,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📊 **تقرير أداء المحرك الكمي التفصيلي (Quant Analytics)**\n"
             f"───────────────────\n"
             f"🗄️ **قاعدة البيانات:** {db_type_str}\n"
+            f"⏳ **الصفقات المفتوحة قيد التتبع:** {pending_trades}\n"
             f"📈 **معدل النجاح الكلي:** {overall_win_rate}% ({total_wins}/{total_eval})\n"
             f"📅 **أداء آخر 7 أيام:** {weekly_win_rate}% ({week_wins}/{week_eval})\n"
             f"🗓️ **أداء آخر 30 يوماً:** {monthly_win_rate}% ({month_wins}/{month_eval})\n"
