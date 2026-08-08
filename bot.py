@@ -1,11 +1,13 @@
 import asyncio
 import html
+import json
 import logging
 import os
 import sqlite3
 import sys
 import threading
 import time
+import urllib.request
 from collections import deque
 from datetime import datetime, timezone, timedelta
 
@@ -75,7 +77,6 @@ except ImportError:
 UTC = timezone.utc
 M15 = pd.Timedelta(minutes=15)
 
-# رموز الأصول المالية المستقرة
 GOLD_SYMBOL = os.getenv("GOLD_SYMBOL", "GC=F")
 DXY_SYMBOL = os.getenv("DXY_SYMBOL", "DX-Y.NYB")
 US10Y_SYMBOL = os.getenv("US10Y_SYMBOL", "^TNX")
@@ -93,7 +94,6 @@ MAX_SWING_AGE_BARS = int(os.getenv("MAX_SWING_AGE_BARS", "240"))
 TRADE_EXPIRY_MINUTES = int(os.getenv("TRADE_EXPIRY_MINUTES", "240"))
 TRADE_MONITOR_SECONDS = int(os.getenv("TRADE_MONITOR_SECONDS", "30"))
 
-# إعدادات الأخبار والتنفيذ
 NEWS_FILTER_ENABLED = os.getenv("NEWS_FILTER_ENABLED", "true").lower() == "true"
 NEWS_BLACKOUT_MINUTES = int(os.getenv("NEWS_BLACKOUT_MINUTES", "30"))
 ESTIMATED_SPREAD_USD = float(os.getenv("ESTIMATED_SPREAD_USD", "0.25"))
@@ -202,20 +202,106 @@ def next_boundary_delay_seconds(delay_seconds=10):
 
 
 # ---------------------------------------------------------------------------
+# جلب مباشر وتجاوز حظر الخوادم (Direct API Fetching with Headers)
+# ---------------------------------------------------------------------------
+
+def fetch_yahoo_direct(symbol, range_str="1mo", interval="15m"):
+    url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?range={range_str}&interval={interval}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode())
+            result = data["chart"]["result"][0]
+            timestamps = result.get("timestamp", [])
+            if not timestamps:
+                return pd.DataFrame()
+            quote = result["indicators"]["quote"][0]
+
+            df = pd.DataFrame(
+                {
+                    "Open": quote.get("open", []),
+                    "High": quote.get("high", []),
+                    "Low": quote.get("low", []),
+                    "Close": quote.get("close", []),
+                    "Volume": quote.get("volume", [0] * len(timestamps)),
+                },
+                index=pd.to_datetime(timestamps, unit="s", utc=True),
+            )
+            return clean_df_columns(df)
+    except Exception as exc:
+        logger.warning("فشل الجلب المباشر للرمز %s: %s", symbol, exc)
+        return pd.DataFrame()
+
+
+def download_yf(symbol, period, interval):
+    # تجربة yfinance أولاً
+    try:
+        df = yf.download(
+            symbol,
+            period=period,
+            interval=interval,
+            progress=False,
+            auto_adjust=False,
+            threads=False,
+        )
+        cleaned = clean_df_columns(df)
+        if not cleaned.empty:
+            return cleaned
+    except Exception:
+        pass
+
+    # تجربة الطلب المباشر برأس متصفح عند فشل yfinance على خوادم Render
+    return fetch_yahoo_direct(symbol, range_str=period, interval=interval)
+
+
+def fetch_latest_asset_quote(symbols, fallback_df=None):
+    if isinstance(symbols, str):
+        symbols = [symbols]
+
+    for sym in symbols:
+        for period, interval in [("5d", "1m"), ("5d", "15m"), ("1mo", "1d")]:
+            df = download_yf(sym, period, interval)
+            if not df.empty:
+                close = to_1d_series(df["Close"]).dropna()
+                if not close.empty:
+                    spot_price = float(close.iloc[-1])
+                    ts = ensure_utc_timestamp(df.index[-1]).to_pydatetime()
+                    half_spread = ESTIMATED_SPREAD_USD / 2.0
+                    bid_price = round(spot_price - half_spread, 2)
+                    ask_price = round(spot_price + half_spread, 2)
+                    return spot_price, bid_price, ask_price, ts
+
+    if fallback_df is not None and not fallback_df.empty:
+        close = to_1d_series(fallback_df["Close"]).dropna()
+        if not close.empty:
+            spot_price = float(close.iloc[-1])
+            ts = ensure_utc_timestamp(fallback_df.index[-1]).to_pydatetime()
+            half_spread = ESTIMATED_SPREAD_USD / 2.0
+            bid_price = round(spot_price - half_spread, 2)
+            ask_price = round(spot_price + half_spread, 2)
+            return spot_price, bid_price, ask_price, ts
+
+    return None, None, None, None
+
+
+# ---------------------------------------------------------------------------
 # فلتر الأخبار وحالة إغلاق السوق
 # ---------------------------------------------------------------------------
 
 def check_high_impact_news_blackout():
     now = utc_now()
 
-    # فحص عطلة نهاية الأسبوع (السبت والأحد)
     if now.weekday() >= 5:
         return True, "البورصة العالمية مغلقة حالياً (عطلة نهاية الأسبوع). ستستأنف الإشارات والتحليل المباشر فور افتتاح السوق مساء الأحد."
 
     if not NEWS_FILTER_ENABLED:
         return False, "فلتر الأخبار معطل."
 
-    # أوقات الأخبار الهامة بالـ UTC
     news_hours_utc = [12, 13, 18, 19]
     if now.hour in news_hours_utc and now.minute < NEWS_BLACKOUT_MINUTES:
         return True, f"فترة أخبار عالية التأثير نشطة ({now.strftime('%H:%M')} UTC)."
@@ -251,7 +337,7 @@ class MarketSnapshotCache:
     def update_full(self, df_m15, macro_data):
         with self._lock:
             now = utc_now()
-            self.df_m15 = df_m15.copy()
+            self.df_m15 = df_m15.copy() if df_m15 is not None else pd.DataFrame()
             self.macro_data = dict(macro_data)
             self.last_full_fetch = now
             self.last_fetch_time = now
@@ -262,7 +348,7 @@ class MarketSnapshotCache:
     def update_incremental(self, df_m15_recent, macro_data):
         with self._lock:
             if self.df_m15.empty:
-                combined = df_m15_recent.copy()
+                combined = df_m15_recent.copy() if df_m15_recent is not None else pd.DataFrame()
             else:
                 combined = pd.concat([self.df_m15, df_m15_recent])
                 combined = combined[~combined.index.duplicated(keep="last")]
@@ -302,61 +388,15 @@ SNAPSHOT_CACHE = MarketSnapshotCache()
 
 
 # ---------------------------------------------------------------------------
-# جلب البيانات مع رموز بديلة لضمان الاستقرار
+# حلقة عمل العامل الخفي (Worker Loop)
 # ---------------------------------------------------------------------------
-
-def download_yf(symbol, period, interval):
-    try:
-        df = yf.download(
-            symbol,
-            period=period,
-            interval=interval,
-            progress=False,
-            auto_adjust=False,
-            threads=False,
-        )
-        return clean_df_columns(df)
-    except Exception as exc:
-        logger.warning("فشل جلب البيانات للرمز %s (%s, %s): %s", symbol, period, interval, exc)
-        return pd.DataFrame()
-
-
-def fetch_latest_asset_quote(symbols, fallback_df=None):
-    if isinstance(symbols, str):
-        symbols = [symbols]
-
-    for sym in symbols:
-        for period, interval in [("5d", "1m"), ("5d", "15m"), ("1mo", "1d"), ("5d", "1d")]:
-            df = download_yf(sym, period, interval)
-            if not df.empty:
-                close = to_1d_series(df["Close"]).dropna()
-                if not close.empty:
-                    spot_price = float(close.iloc[-1])
-                    ts = ensure_utc_timestamp(df.index[-1]).to_pydatetime()
-                    half_spread = ESTIMATED_SPREAD_USD / 2.0
-                    bid_price = round(spot_price - half_spread, 2)
-                    ask_price = round(spot_price + half_spread, 2)
-                    return spot_price, bid_price, ask_price, ts
-
-    if fallback_df is not None and not fallback_df.empty:
-        close = to_1d_series(fallback_df["Close"]).dropna()
-        if not close.empty:
-            spot_price = float(close.iloc[-1])
-            ts = ensure_utc_timestamp(fallback_df.index[-1]).to_pydatetime()
-            half_spread = ESTIMATED_SPREAD_USD / 2.0
-            bid_price = round(spot_price - half_spread, 2)
-            ask_price = round(spot_price + half_spread, 2)
-            return spot_price, bid_price, ask_price, ts
-
-    return None, None, None, None
-
 
 def market_data_worker_loop(stop_event):
     logger.info("بدء خيط جلب بيانات السوق المباشرة.")
     first_run = True
-    gold_symbols_fallback = [GOLD_SYMBOL, "GC=F", "GLD", "IAU", "XAUUSD=X"]
-    dxy_symbols_fallback = [DXY_SYMBOL, "DX-Y.NYB", "DX=F", "UUP"]
-    us10y_symbols_fallback = [US10Y_SYMBOL, "^TNX", "TNX"]
+    gold_symbols = [GOLD_SYMBOL, "GC=F", "GLD", "IAU"]
+    dxy_symbols = [DXY_SYMBOL, "DX-Y.NYB", "UUP"]
+    us10y_symbols = [US10Y_SYMBOL, "^TNX"]
 
     while not stop_event.is_set():
         SNAPSHOT_CACHE.mark_attempt()
@@ -374,30 +414,25 @@ def market_data_worker_loop(stop_event):
             df_m15 = pd.DataFrame()
             used_symbol = None
 
-            # محاولة جلب البيانات بعدة خيارات مرنة للفترات
-            for sym in gold_symbols_fallback:
-                for period in ["5d", "7d", "1mo", "60d"]:
+            for sym in gold_symbols:
+                for period in ["5d", "7d", "1mo"]:
                     df_m15 = download_yf(sym, period, "15m")
-                    if not df_m15.empty and len(df_m15) >= 30:
+                    if not df_m15.empty and len(df_m15) >= 20:
                         used_symbol = sym
                         break
                 if not df_m15.empty:
                     break
 
-            # خيار احتياطي في حال الإغلاق الكامل لشمعات 15m
             if df_m15.empty:
-                for sym in gold_symbols_fallback:
-                    for interval in ["1h", "1d"]:
-                        df_m15 = download_yf(sym, "1mo", interval)
-                        if not df_m15.empty:
-                            used_symbol = sym
-                            break
+                for sym in gold_symbols:
+                    df_m15 = download_yf(sym, "1mo", "1d")
                     if not df_m15.empty:
+                        used_symbol = sym
                         break
 
-            spot_price, bid, ask, spot_time = fetch_latest_asset_quote(gold_symbols_fallback, fallback_df=df_m15)
-            dxy_val, _, _, dxy_time = fetch_latest_asset_quote(dxy_symbols_fallback)
-            us10y_val, _, _, us10y_time = fetch_latest_asset_quote(us10y_symbols_fallback)
+            spot_price, bid, ask, spot_time = fetch_latest_asset_quote(gold_symbols, fallback_df=df_m15)
+            dxy_val, _, _, dxy_time = fetch_latest_asset_quote(dxy_symbols)
+            us10y_val, _, _, us10y_time = fetch_latest_asset_quote(us10y_symbols)
 
             macro_data = {
                 "gold_spot": spot_price,
@@ -443,28 +478,6 @@ def get_verified_closed_m15_dataframe(df_m15):
         return df[df.index < current_boundary].copy()
 
     return df[df.index + M15 <= now].copy()
-
-
-def is_authorized_weekend_gap(previous_ts, current_ts):
-    previous_ts = ensure_utc_timestamp(previous_ts)
-    current_ts = ensure_utc_timestamp(current_ts)
-
-    if current_ts <= previous_ts:
-        return False
-
-    if previous_ts.weekday() == 4 and current_ts.weekday() == 6:
-        return previous_ts.hour >= 20 and current_ts.hour >= 20
-
-    if previous_ts.weekday() == 4 and current_ts.weekday() == 0:
-        return previous_ts.hour >= 20
-
-    if previous_ts.weekday() == 5:
-        return True
-
-    if previous_ts.weekday() == 6 and current_ts.weekday() == 0:
-        return current_ts.hour >= 20
-
-    return False
 
 
 def evaluate_data_quality(df_m15, macro_data, fetch_time):
@@ -1865,6 +1878,8 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     worker_status_ar = "نشط ويعمل ✅" if worker_alive else "متوقف ❌"
     error_ar = worker_error if worker_error else "لا يوجد أخطاء"
 
+    us10y_str = f"{macro.get('us10y')}%" if macro.get("us10y") is not None else "غير متاح"
+
     text = (
         "🛡️ <b>حالة النظام والخدمة v3.0</b>\n"
         "───────────────────────\n"
@@ -1874,7 +1889,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💵 <b>سعر الذهب المباشر:</b> <code>${macro.get('gold_spot') or 'غير متاح'}</code>\n"
         f"💵 <b>أسعار الطلب/العرض:</b> <code>${macro.get('gold_bid') or 'N/A'} / ${macro.get('gold_ask') or 'N/A'}</code>\n"
         f"📊 <b>مؤشر الدولار (DXY):</b> <code>{macro.get('dxy') or 'غير متاح'}</code>\n"
-        f"📈 <b>عائد السندات (US10Y):</b> <code>{macro.get('us10y') or 'غير متاح'}%</code>\n"
+        f"📈 <b>عائد السندات (US10Y):</b> <code>{us10y_str}</code>\n"
         f"⏱️ <b>عمر الذاكرة المؤقتة:</b> <code>{f'{cache_age:.1f} ثانية' if cache_age is not None else 'غير متاح'}</code>\n"
         f"🕯️ <b>آخر شمعة M15 مغلقة:</b> <code>{last_candle}</code>\n"
         f"⚠️ <b>آخر خطأ في العامل:</b> <code>{error_ar}</code>\n"
@@ -2078,7 +2093,6 @@ def run_flask_server():
 def main():
     init_db()
 
-    # تنفيذ محاكاة الاختبار العكسي عند بدء التشغيل
     try:
         bt_summary = run_backtest_simulation()
         clean_text = bt_summary.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "")
