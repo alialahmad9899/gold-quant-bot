@@ -134,7 +134,7 @@ def translate_quality_state(state):
         DataQualityState.STALE: "بيانات قديمة ⚠️",
         DataQualityState.GAP: "فجوة سعرية ⚠️",
         DataQualityState.INVALID: "غير صالحة ❌",
-        DataQualityState.NEWS_BLACKOUT: "حظر الأخبار الاقتصادية 🚫",
+        DataQualityState.NEWS_BLACKOUT: "حظر الأخبار / عطلة السوق 🚫",
     }
     return translations.get(state, state)
 
@@ -210,7 +210,7 @@ def check_high_impact_news_blackout():
 
     # فحص عطلة نهاية الأسبوع (السبت والأحد)
     if now.weekday() >= 5:
-        return False, "السوق مغلق حالياً (عطلة نهاية الأسبوع)."
+        return True, "البورصة العالمية مغلقة حالياً (عطلة نهاية الأسبوع). ستستأنف الإشارات والتحليل المباشر فور افتتاح السوق مساء الأحد."
 
     if not NEWS_FILTER_ENABLED:
         return False, "فلتر الأخبار معطل."
@@ -331,8 +331,8 @@ def fetch_latest_asset_quote(symbol, fallback_df=None):
     if df.empty:
         return None, None, None, None
 
-    close = to_1d_series(df["Close"])
-    if close.empty or pd.isna(close.iloc[-1]):
+    close = to_1d_series(df["Close"]).dropna()
+    if close.empty:
         return None, None, None, None
 
     spot_price = float(close.iloc[-1])
@@ -366,10 +366,10 @@ def market_data_worker_loop(stop_event):
             df_m15 = pd.DataFrame()
             used_symbol = None
 
+            # جلب فترة 60d دائماً لضمان توفر شمعات تاريخية مغلقة حتى في العطلة
             for sym in gold_symbols_fallback:
-                period = "30d" if need_full else "3d"
-                df_m15 = download_yf(sym, period, "15m")
-                if not df_m15.empty:
+                df_m15 = download_yf(sym, "60d", "15m")
+                if not df_m15.empty and len(df_m15) >= 100:
                     used_symbol = sym
                     break
 
@@ -1304,7 +1304,7 @@ def generate_quant_signal():
             DataQualityState.NEWS_BLACKOUT,
         }:
             return wait_result(
-                f"بوابة الجودة منعت إرسال الإشارة: {quality_reason}",
+                quality_reason,
                 quality_state,
                 macro_data.get("gold_spot"),
             )
@@ -1716,7 +1716,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         f"👋 أهلاً بك يا <b>{safe_name}</b> في بوت التداول الكمي المتقدم XAUUSD Quant v3.0.\n\n"
         "<b>الميزات النشطة تلقائياً:</b>\n"
-        "• <b>فلتر الأخبار الاقتصادية:</b> حظر التداول أثناء صدور بيانات USD الهامة.\n"
+        "• <b>فلتر الأخبار الاقتصادية:</b> حظر التداول أثناء صدور بيانات USD الهامة وعطلات السوق.\n"
         "• <b>حساب الفارق السعري:</b> احتساب دقيق لأسعار العرض والطلب (Bid/Ask).\n"
         "• <b>التحليل المؤسسي (SMC):</b> تتبع مناطق الطلب والعرض والكشوف السعرية.\n"
         "• <b>محرك الاختبار العكسي:</b> تقييم استراتيجيات التداول باستمرار.\n"
@@ -1735,7 +1735,7 @@ async def analyze_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if res["status"] == "WAIT":
         await update.message.reply_text(
-            f"⚠️ <b>حالة الانتظار:</b> {html.escape(res['reason'])}",
+            f"⚠️ <b>حالة الانتظار:</b>\n{html.escape(res['reason'])}",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -1779,7 +1779,7 @@ async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if res["status"] == "WAIT":
         await update.message.reply_text(
-            f"⚠️ <b>حالة الانتظار:</b> {html.escape(res['reason'])}",
+            f"⚠️ <b>حالة الانتظار:</b>\n{html.escape(res['reason'])}",
             parse_mode=ParseMode.HTML,
         )
         return
