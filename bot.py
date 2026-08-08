@@ -325,6 +325,8 @@ def fetch_latest_asset_quote(symbol, fallback_df=None):
     df = download_yf(symbol, "1d", "1m")
     if df.empty:
         df = download_yf(symbol, "5d", "15m")
+    if df.empty:
+        df = download_yf(symbol, "1mo", "1d")
     if df.empty and fallback_df is not None and not fallback_df.empty:
         df = fallback_df
 
@@ -348,7 +350,7 @@ def fetch_latest_asset_quote(symbol, fallback_df=None):
 def market_data_worker_loop(stop_event):
     logger.info("بدء خيط جلب بيانات السوق المباشرة.")
     first_run = True
-    gold_symbols_fallback = [GOLD_SYMBOL, "GC=F", "GLD"]
+    gold_symbols_fallback = [GOLD_SYMBOL, "GC=F", "GLD", "IAU"]
 
     while not stop_event.is_set():
         SNAPSHOT_CACHE.mark_attempt()
@@ -366,12 +368,23 @@ def market_data_worker_loop(stop_event):
             df_m15 = pd.DataFrame()
             used_symbol = None
 
-            # جلب فترة 60d دائماً لضمان توفر شمعات تاريخية مغلقة حتى في العطلة
+            # محاولة جلب البيانات بعدة خيارات مرنة للفترات
             for sym in gold_symbols_fallback:
-                df_m15 = download_yf(sym, "60d", "15m")
-                if not df_m15.empty and len(df_m15) >= 100:
-                    used_symbol = sym
+                for period in ["1mo", "30d", "7d"]:
+                    df_m15 = download_yf(sym, period, "15m")
+                    if not df_m15.empty and len(df_m15) >= 30:
+                        used_symbol = sym
+                        break
+                if not df_m15.empty:
                     break
+
+            # خيار احتياطي في حال الإغلاق الكامل لشمعات 15m
+            if df_m15.empty:
+                for sym in gold_symbols_fallback:
+                    df_m15 = download_yf(sym, "1mo", "1h")
+                    if not df_m15.empty:
+                        used_symbol = sym
+                        break
 
             if df_m15.empty:
                 if now.weekday() >= 5:
@@ -453,8 +466,8 @@ def evaluate_data_quality(df_m15, macro_data, fetch_time):
     if is_blackout:
         return DataQualityState.NEWS_BLACKOUT, news_reason
 
-    if df_m15 is None or df_m15.empty or len(df_m15) < 100:
-        return DataQualityState.INVALID, "مجموعة بيانات M15 تقتضي وجود 100 صف على الأقل."
+    if df_m15 is None or df_m15.empty or len(df_m15) < 30:
+        return DataQualityState.INVALID, "مجموعة بيانات M15 تقتضي وجود 30 صف على الأقل."
 
     if fetch_time is None:
         return DataQualityState.INVALID, "لم يكتمل جلب الذاكرة المؤقتة للسوق بعد."
@@ -1503,23 +1516,23 @@ def run_backtest_simulation(initial_balance=10000.0, risk_per_trade=0.01):
     if df_m15.empty:
         df_m15 = download_yf("GLD", "30d", "15m")
 
-    if df_m15.empty or len(df_m15) < 100:
+    if df_m15.empty or len(df_m15) < 30:
         return "⚠️ البيانات غير كافية للاختبار العكسي حالياً (قد يكون السوق مغلقاً)."
 
     df_closed = clean_df_columns(df_m15)
     trades = []
 
-    for i in range(100, len(df_closed) - 20):
+    for i in range(30, len(df_closed) - 10):
         sub_df = df_closed.iloc[:i]
         smc = detect_institutional_smc(sub_df)
 
         df_h4 = resample_m15_to_h4(sub_df)
-        if len(df_h4) < 30:
+        if len(df_h4) < 15:
             continue
 
         close_h4 = to_1d_series(df_h4["Close"])
-        ema50 = ta.trend.EMAIndicator(close_h4, window=50).ema_indicator().iloc[-1]
-        ema200 = ta.trend.EMAIndicator(close_h4, window=200).ema_indicator().iloc[-1]
+        ema50 = ta.trend.EMAIndicator(close_h4, window=50).ema_indicator().iloc[-1] if len(close_h4) >= 50 else close_h4.mean()
+        ema200 = ta.trend.EMAIndicator(close_h4, window=200).ema_indicator().iloc[-1] if len(close_h4) >= 200 else close_h4.mean()
 
         h4_trend = "BULLISH" if ema50 > ema200 else "BEARISH" if ema50 < ema200 else "NEUTRAL"
 
@@ -1853,7 +1866,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💵 <b>أسعار الطلب/العرض:</b> <code>${macro.get('gold_bid') or 'N/A'} / ${macro.get('gold_ask') or 'N/A'}</code>\n"
         f"📊 <b>مؤشر الدولار (DXY):</b> <code>{macro.get('dxy') or 'غير متاح'}</code>\n"
         f"📈 <b>عائد السندات (US10Y):</b> <code>{macro.get('us10y') or 'غير متاح'}</code>\n"
-        f"⏱️ <b>عمر الذاكرة المؤقتة:</b> <code>{cache_age if cache_age is None else f'{cache_age:.1f} ثانية'}</code>\n"
+        f"⏱️ <b>عمر الذاكرة المؤقتة:</b> <code>{f'{cache_age:.1f} ثانية' if cache_age is not None else 'غير متاح'}</code>\n"
         f"🕯️ <b>آخر شمعة M15 مغلقة:</b> <code>{last_candle}</code>\n"
         f"⚠️ <b>آخر خطأ في العامل:</b> <code>{error_ar}</code>\n"
     )
