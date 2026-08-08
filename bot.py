@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 # ---------------------------------------------------------------------------
-# Logging Configuration
+# إعدادات تسجيل الأحداث (Logging)
 # ---------------------------------------------------------------------------
 
 logging.basicConfig(
@@ -23,7 +23,7 @@ logging.basicConfig(
 logger = logging.getLogger("XAUUSD_QuantBot")
 
 # ---------------------------------------------------------------------------
-# Strict Dependency Validation
+# التحقق الصارم من التبعيات (Dependencies)
 # ---------------------------------------------------------------------------
 
 try:
@@ -51,7 +51,7 @@ try:
 except ImportError:
     logger.critical(
         "المكتبة 'python-telegram-bot' غير مثبتة. "
-        "نفذ: pip install python-telegram-bot[job-queue]"
+        "نفذ: pip install \"python-telegram-bot[job-queue]\""
     )
     sys.exit(1)
 
@@ -69,13 +69,13 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Configuration & Environment Variables
+# الإعدادات والمتغيرات البيئية
 # ---------------------------------------------------------------------------
 
 UTC = timezone.utc
 M15 = pd.Timedelta(minutes=15)
 
-# Stable Financial Symbols for Yahoo Finance
+# رموز الأصول المالية المستقرة
 GOLD_SYMBOL = os.getenv("GOLD_SYMBOL", "GC=F")
 DXY_SYMBOL = os.getenv("DXY_SYMBOL", "DX-Y.NYB")
 US10Y_SYMBOL = os.getenv("US10Y_SYMBOL", "^TNX")
@@ -93,7 +93,7 @@ MAX_SWING_AGE_BARS = int(os.getenv("MAX_SWING_AGE_BARS", "240"))
 TRADE_EXPIRY_MINUTES = int(os.getenv("TRADE_EXPIRY_MINUTES", "240"))
 TRADE_MONITOR_SECONDS = int(os.getenv("TRADE_MONITOR_SECONDS", "30"))
 
-# News & Execution Config
+# إعدادات الأخبار والتنفيذ
 NEWS_FILTER_ENABLED = os.getenv("NEWS_FILTER_ENABLED", "true").lower() == "true"
 NEWS_BLACKOUT_MINUTES = int(os.getenv("NEWS_BLACKOUT_MINUTES", "30"))
 ESTIMATED_SPREAD_USD = float(os.getenv("ESTIMATED_SPREAD_USD", "0.25"))
@@ -108,14 +108,14 @@ if DATABASE_URL and psycopg2:
         PG_POOL = psycopg2.pool.ThreadedConnectionPool(
             1, 10, DATABASE_URL, sslmode="require"
         )
-        logger.info("PostgreSQL connection pool جاهز.")
+        logger.info("حوض اتصالات PostgreSQL جاهز.")
     except Exception as exc:
         logger.error("فشل إنشاء PostgreSQL pool: %s", exc)
         PG_POOL = None
 
 
 # ---------------------------------------------------------------------------
-# Data Quality States
+# حالات جودة البيانات (Data Quality States)
 # ---------------------------------------------------------------------------
 
 class DataQualityState:
@@ -127,8 +127,20 @@ class DataQualityState:
     NEWS_BLACKOUT = "NEWS_BLACKOUT"
 
 
+def translate_quality_state(state):
+    translations = {
+        DataQualityState.OK: "ممتازة ✅",
+        DataQualityState.MACRO_DEGRADED: "محدودة (غاب المؤشر الكلي) ⚠️",
+        DataQualityState.STALE: "بيانات قديمة ⚠️",
+        DataQualityState.GAP: "فجوة سعرية ⚠️",
+        DataQualityState.INVALID: "غير صالحة ❌",
+        DataQualityState.NEWS_BLACKOUT: "حظر الأخبار الاقتصادية 🚫",
+    }
+    return translations.get(state, state)
+
+
 # ---------------------------------------------------------------------------
-# Helper Functions
+# دلالات مساعدة (Helper Functions)
 # ---------------------------------------------------------------------------
 
 def utc_now():
@@ -190,33 +202,29 @@ def next_boundary_delay_seconds(delay_seconds=10):
 
 
 # ---------------------------------------------------------------------------
-# High-Impact News & Market Status Filter
+# فلتر الأخبار وحالة إغلاق السوق
 # ---------------------------------------------------------------------------
 
 def check_high_impact_news_blackout():
-    """
-    Checks if current UTC time falls within a high-impact news window
-    or during weekend market closure.
-    """
     now = utc_now()
 
-    # Check Weekend Closure
+    # فحص عطلة نهاية الأسبوع (السبت والأحد)
     if now.weekday() >= 5:
-        return False, "Weekend market closure active."
+        return False, "السوق مغلق حالياً (عطلة نهاية الأسبوع)."
 
     if not NEWS_FILTER_ENABLED:
-        return False, "News filter disabled."
+        return False, "فلتر الأخبار معطل."
 
-    # Major USD News standard times (12:30 UTC for NFP/CPI, 18:00/19:00 UTC for FOMC)
+    # أوقات الأخبار الهامة بالـ UTC
     news_hours_utc = [12, 13, 18, 19]
     if now.hour in news_hours_utc and now.minute < NEWS_BLACKOUT_MINUTES:
-        return True, f"High-impact USD news window active ({now.strftime('%H:%M')} UTC)."
+        return True, f"فترة أخبار عالية التأثير نشطة ({now.strftime('%H:%M')} UTC)."
 
-    return False, "No active news blackout."
+    return False, "لا توجد أخبار هامة حالياً."
 
 
 # ---------------------------------------------------------------------------
-# Market Snapshot Cache
+# الذاكرة المؤقتة لبيانات السوق (Market Snapshot Cache)
 # ---------------------------------------------------------------------------
 
 class MarketSnapshotCache:
@@ -275,7 +283,6 @@ class MarketSnapshotCache:
     def mark_error(self, error):
         with self._lock:
             self.worker_last_error = str(error)
-            # Worker stays alive unless error is persistent
 
     def get_snapshot(self):
         with self._lock:
@@ -295,7 +302,7 @@ SNAPSHOT_CACHE = MarketSnapshotCache()
 
 
 # ---------------------------------------------------------------------------
-# Data Fetcher with Symbol Fallbacks
+# جلب البيانات مع رموز بديلة لضمان الاستقرار
 # ---------------------------------------------------------------------------
 
 def download_yf(symbol, period, interval):
@@ -310,14 +317,11 @@ def download_yf(symbol, period, interval):
         )
         return clean_df_columns(df)
     except Exception as exc:
-        logger.warning("yfinance download failed for %s (%s, %s): %s", symbol, period, interval, exc)
+        logger.warning("فشل جلب البيانات للرمز %s (%s, %s): %s", symbol, period, interval, exc)
         return pd.DataFrame()
 
 
 def fetch_latest_asset_quote(symbol, fallback_df=None):
-    """
-    Fetches real-time price with robust fallbacks and computes Bid/Ask prices.
-    """
     df = download_yf(symbol, "1d", "1m")
     if df.empty:
         df = download_yf(symbol, "5d", "15m")
@@ -342,8 +346,9 @@ def fetch_latest_asset_quote(symbol, fallback_df=None):
 
 
 def market_data_worker_loop(stop_event):
-    logger.info("Market data worker started.")
+    logger.info("بدء خيط جلب بيانات السوق المباشرة.")
     first_run = True
+    gold_symbols_fallback = [GOLD_SYMBOL, "GC=F", "GLD"]
 
     while not stop_event.is_set():
         SNAPSHOT_CACHE.mark_attempt()
@@ -358,53 +363,53 @@ def market_data_worker_loop(stop_event):
                 or (now - last_full).total_seconds() > FULL_FETCH_SECONDS
             )
 
-            if need_full:
-                logger.info("Fetching full %s 60d M15 dataset...", GOLD_SYMBOL)
-                df_m15 = download_yf(GOLD_SYMBOL, "60d", "15m")
-                is_full = True
-            else:
-                df_m15 = download_yf(GOLD_SYMBOL, "3d", "15m")
-                is_full = False
+            df_m15 = pd.DataFrame()
+            used_symbol = None
+
+            for sym in gold_symbols_fallback:
+                period = "30d" if need_full else "3d"
+                df_m15 = download_yf(sym, period, "15m")
+                if not df_m15.empty:
+                    used_symbol = sym
+                    break
 
             if df_m15.empty:
-                # If primary symbol fails, try fetching backup dataset
-                logger.warning("Primary M15 download empty. Attempting backup fetch for %s...", GOLD_SYMBOL)
-                df_m15 = download_yf("GC=F", "30d", "15m")
-
-            if df_m15.empty:
-                raise RuntimeError(f"{GOLD_SYMBOL} M15 provider returned empty data.")
-
-            spot_price, bid, ask, spot_time = fetch_latest_asset_quote(GOLD_SYMBOL, fallback_df=df_m15)
-            dxy_val, _, _, dxy_time = fetch_latest_asset_quote(DXY_SYMBOL)
-            us10y_val, _, _, us10y_time = fetch_latest_asset_quote(US10Y_SYMBOL)
-
-            macro_data = {
-                "gold_spot": spot_price,
-                "gold_bid": bid,
-                "gold_ask": ask,
-                "gold_spot_time": spot_time,
-                "dxy": dxy_val,
-                "dxy_time": dxy_time,
-                "us10y": us10y_val,
-                "us10y_time": us10y_time,
-            }
-
-            if is_full:
-                SNAPSHOT_CACHE.update_full(df_m15, macro_data)
+                if now.weekday() >= 5:
+                    logger.info("السوق مغلق حالياً (عطلة نهاية الأسبوع).")
+                else:
+                    raise RuntimeError("جميع مزودات بيانات الذهب أعادت بيانات فارغة.")
             else:
-                SNAPSHOT_CACHE.update_incremental(df_m15, macro_data)
+                spot_price, bid, ask, spot_time = fetch_latest_asset_quote(used_symbol or GOLD_SYMBOL, fallback_df=df_m15)
+                dxy_val, _, _, dxy_time = fetch_latest_asset_quote(DXY_SYMBOL)
+                us10y_val, _, _, us10y_time = fetch_latest_asset_quote(US10Y_SYMBOL)
 
-            first_run = False
+                macro_data = {
+                    "gold_spot": spot_price,
+                    "gold_bid": bid,
+                    "gold_ask": ask,
+                    "gold_spot_time": spot_time,
+                    "dxy": dxy_val,
+                    "dxy_time": dxy_time,
+                    "us10y": us10y_val,
+                    "us10y_time": us10y_time,
+                }
+
+                if need_full:
+                    SNAPSHOT_CACHE.update_full(df_m15, macro_data)
+                else:
+                    SNAPSHOT_CACHE.update_incremental(df_m15, macro_data)
+
+                first_run = False
 
         except Exception as exc:
-            logger.error("Market worker error: %s", exc)
+            logger.error("خطأ في عامل جلب البيانات: %s", exc)
             SNAPSHOT_CACHE.mark_error(exc)
 
         stop_event.wait(MARKET_FETCH_SECONDS)
 
 
 # ---------------------------------------------------------------------------
-# Closed-Candle Semantics & Quality Verification
+# الشموع المغلقة والتحقق من جودة البيانات
 # ---------------------------------------------------------------------------
 
 def get_verified_closed_m15_dataframe(df_m15):
@@ -444,28 +449,27 @@ def is_authorized_weekend_gap(previous_ts, current_ts):
 
 
 def evaluate_data_quality(df_m15, macro_data, fetch_time):
-    # Check News Blackout first
     is_blackout, news_reason = check_high_impact_news_blackout()
     if is_blackout:
         return DataQualityState.NEWS_BLACKOUT, news_reason
 
     if df_m15 is None or df_m15.empty or len(df_m15) < 100:
-        return DataQualityState.INVALID, "M15 dataset requires at least 100 rows."
+        return DataQualityState.INVALID, "مجموعة بيانات M15 تقتضي وجود 100 صف على الأقل."
 
     if fetch_time is None:
-        return DataQualityState.INVALID, "Market cache has never completed a fetch."
+        return DataQualityState.INVALID, "لم يكتمل جلب الذاكرة المؤقتة للسوق بعد."
 
     cache_age = (utc_now() - ensure_utc_timestamp(fetch_time).to_pydatetime()).total_seconds()
     if cache_age > CACHE_STALE_SECONDS and utc_now().weekday() < 5:
-        return DataQualityState.STALE, f"Market cache is stale ({cache_age:.1f}s > {CACHE_STALE_SECONDS}s)."
+        return DataQualityState.STALE, f"بيانات السوق قديمة ({cache_age:.1f} ثانية)."
 
     recent = df_m15.tail(80)
 
     if recent[["Open", "High", "Low", "Close"]].isna().any().any():
-        return DataQualityState.GAP, "NaN detected in recent OHLC data."
+        return DataQualityState.GAP, "تم اكتشاف قيم مفقودة (NaN) في الأسعار."
 
     if recent.index.has_duplicates:
-        return DataQualityState.INVALID, "Duplicate timestamps detected."
+        return DataQualityState.INVALID, "تم اكتشاف طوابع زمنية مكررة."
 
     highs = recent["High"]
     lows = recent["Low"]
@@ -482,15 +486,15 @@ def evaluate_data_quality(df_m15, macro_data, fetch_time):
         | (opens <= 0)
     )
     if invalid_ohlc.any():
-        return DataQualityState.INVALID, "Invalid OHLC relationship detected."
+        return DataQualityState.INVALID, "علاقة غير منطقية في أسعار الشمعة (OHLC)."
 
     spot_price = macro_data.get("gold_spot")
     if spot_price is None or not np.isfinite(spot_price) or spot_price <= 0:
-        return DataQualityState.INVALID, "Live gold spot price is unavailable."
+        return DataQualityState.INVALID, "سعر الذهب المباشر غير متاح حالياً."
 
     closed = get_verified_closed_m15_dataframe(df_m15)
     if closed.empty:
-        return DataQualityState.INVALID, "No verified closed M15 candle exists."
+        return DataQualityState.INVALID, "لا توجد شمعة 15 دقيقة مغلقة ومؤكدة."
 
     recent_closed = closed.tail(50)
     atr_series = ta.volatility.AverageTrueRange(
@@ -502,20 +506,20 @@ def evaluate_data_quality(df_m15, macro_data, fetch_time):
 
     atr_val = atr_series.iloc[-1] if not atr_series.empty else np.nan
     if pd.isna(atr_val) or not np.isfinite(atr_val) or atr_val <= 0:
-        return DataQualityState.INVALID, "ATR could not be computed for integrity checks."
+        return DataQualityState.INVALID, "فشل حساب مؤشر ATR لفحص السلامة."
 
     last_close = float(recent_closed["Close"].iloc[-1])
     if abs(spot_price - last_close) > atr_val * 5.0 and utc_now().weekday() < 5:
         return (
             DataQualityState.INVALID,
-            f"Spot/close divergence exceeds 5.0 ATR: spot={spot_price:.2f}, close={last_close:.2f}.",
+            f"انحراف السعر اللحظي عن إغلاق الشمعة تجاوز 5.0 ATR: المباشر={spot_price:.2f}، الإغلاق={last_close:.2f}.",
         )
 
-    return DataQualityState.OK, "All structural and freshness checks passed."
+    return DataQualityState.OK, "جميع فحوصات السلامة والهيكلية مرت بنجاح."
 
 
 # ---------------------------------------------------------------------------
-# H4 Resampling
+# إعادة تجميع شمعات الأربع ساعات (H4)
 # ---------------------------------------------------------------------------
 
 def resample_m15_to_h4(df_m15_closed):
@@ -545,7 +549,7 @@ def resample_m15_to_h4(df_m15_closed):
 
 
 # ---------------------------------------------------------------------------
-# Advanced Institutional SMC Logic
+# التحليل المؤسسي المتقدم (Advanced Institutional SMC)
 # ---------------------------------------------------------------------------
 
 def detect_swings_strictly_past(highs, lows, current_eval_idx, right_bars=3, left_bars=3):
@@ -685,7 +689,6 @@ def detect_institutional_smc(df_m15_closed):
     last_swing_high = last_sh["price"] if last_sh else None
     last_swing_low = last_sl["price"] if last_sl else None
 
-    # Premium vs Discount Zone (50% Equilibrium)
     is_premium = False
     is_discount = False
     if last_swing_high is not None and last_swing_low is not None:
@@ -721,7 +724,6 @@ def detect_institutional_smc(df_m15_closed):
         and structure["low_label"] == "HL"
     )
 
-    # Order Block (OB) Detection & Retest
     ob_bullish = False
     ob_bearish = False
     if len(closes) >= 5:
@@ -772,7 +774,7 @@ def detect_institutional_smc(df_m15_closed):
 
 
 # ---------------------------------------------------------------------------
-# Database Management
+# إدارة قواعد البيانات (Database)
 # ---------------------------------------------------------------------------
 
 def get_db_connection():
@@ -847,7 +849,7 @@ def init_db():
         )
 
         conn.commit()
-        logger.info("Database initialized.")
+        logger.info("تم تهيئة قاعدة البيانات بنجاح.")
     finally:
         release_db_connection(conn)
 
@@ -884,7 +886,7 @@ def register_user(user_id, username, first_name):
 
         conn.commit()
     except Exception as exc:
-        logger.error("register_user failed: %s", exc)
+        logger.error("فشل تسجيل المستخدم: %s", exc)
     finally:
         release_db_connection(conn)
 
@@ -900,7 +902,7 @@ def get_subscribed_users():
             for row in rows
         ]
     except Exception as exc:
-        logger.error("get_subscribed_users failed: %s", exc)
+        logger.error("فشل جلب المستخدمين المشتركين: %s", exc)
         return []
     finally:
         release_db_connection(conn)
@@ -1006,14 +1008,14 @@ def log_signal_to_db(
         return inserted
     except Exception as exc:
         conn.rollback()
-        logger.error("log_signal_to_db failed: %s", exc)
+        logger.error("فشل تسجيل الإشارة في قاعدة البيانات: %s", exc)
         return False
     finally:
         release_db_connection(conn)
 
 
 # ---------------------------------------------------------------------------
-# Trade Lifecycle Monitoring
+# متابعة دورة حياة الصفقات (Trade Lifecycle)
 # ---------------------------------------------------------------------------
 
 VALID_TRANSITIONS = {
@@ -1152,7 +1154,7 @@ def update_trade_state(row, new_status, exit_price=None, realized_r=None):
         return changed
     except Exception as exc:
         conn.rollback()
-        logger.error("update_trade_state failed: %s", exc)
+        logger.error("فشل تحديث حالة الصفقة: %s", exc)
         return False
     finally:
         release_db_connection(conn)
@@ -1232,7 +1234,7 @@ def monitor_open_trades():
 
 
 # ---------------------------------------------------------------------------
-# Signal Generation Lock & Memory
+# الذاكرة وقفل توليد الإشارات
 # ---------------------------------------------------------------------------
 
 EVALUATED_CANDLES_SET = set()
@@ -1264,7 +1266,7 @@ def get_cached_candle_decision(candle_id):
 
 
 # ---------------------------------------------------------------------------
-# Quantitative Signal Engine
+# محرك توليد الإشارات الكمية (Quant Signal Engine)
 # ---------------------------------------------------------------------------
 
 def wait_result(reason, quality_state, price=None):
@@ -1302,7 +1304,7 @@ def generate_quant_signal():
             DataQualityState.NEWS_BLACKOUT,
         }:
             return wait_result(
-                f"Quality gate blocked signal: {quality_reason}",
+                f"بوابة الجودة منعت إرسال الإشارة: {quality_reason}",
                 quality_state,
                 macro_data.get("gold_spot"),
             )
@@ -1310,7 +1312,7 @@ def generate_quant_signal():
         df_closed = get_verified_closed_m15_dataframe(df_m15)
         if df_closed.empty:
             return wait_result(
-                "No verified closed M15 candle.",
+                "لا توجد شمعة 15 دقيقة مغلقة ومؤكدة.",
                 DataQualityState.INVALID,
                 macro_data.get("gold_spot"),
             )
@@ -1330,7 +1332,7 @@ def generate_quant_signal():
                 else quality_state
             )
             return wait_result(
-                f"Candle {candle_id} already persisted; no duplicate signal will be generated.",
+                f"الشمعة {candle_id} مسجلة سلفاً؛ لن يتم إنتاج إشارة مكررة.",
                 p_quality,
                 macro_data.get("gold_spot"),
             )
@@ -1342,7 +1344,7 @@ def generate_quant_signal():
         df_h4 = resample_m15_to_h4(df_closed)
         if len(df_h4) < 100:
             return wait_result(
-                f"Insufficient closed H4 candles ({len(df_h4)}/100).",
+                f"عدد شمعات H4 المغلقة غير كافٍ ({len(df_h4)}/100).",
                 quality_state,
                 macro_data.get("gold_spot"),
             )
@@ -1353,7 +1355,7 @@ def generate_quant_signal():
 
         if not all(np.isfinite(x) for x in (ema50, ema200)):
             return wait_result(
-                "H4 EMA computation failed.",
+                "فشل حساب المتوسطات الحسابية EMA لشمعات H4.",
                 DataQualityState.INVALID,
                 macro_data.get("gold_spot"),
             )
@@ -1376,7 +1378,7 @@ def generate_quant_signal():
             or live_execution_price <= 0
         ):
             return wait_result(
-                "Live execution price is unavailable.",
+                "سعر التنفيذ المباشر غير متاح حالياً.",
                 DataQualityState.INVALID,
                 signal_candle_close,
             )
@@ -1427,7 +1429,7 @@ def generate_quant_signal():
 
         if pd.isna(atr) or not np.isfinite(atr) or atr <= 0:
             return wait_result(
-                "ATR could not be computed.",
+                "تعذر حساب قيمة مؤشر ATR.",
                 DataQualityState.INVALID,
                 live_execution_price,
             )
@@ -1482,7 +1484,7 @@ def generate_quant_signal():
             )
             if not inserted:
                 return wait_result(
-                    f"Candle {candle_id} already persisted; no duplicate signal will be generated.",
+                    f"الشمعة {candle_id} مسجلة سلفاً؛ لن يتم إنتاج إشارة مكررة.",
                     quality_state,
                     exec_price,
                 )
@@ -1492,24 +1494,27 @@ def generate_quant_signal():
 
 
 # ---------------------------------------------------------------------------
-# Backtest Engine Simulation
+# محرك الاختبار العكسي (Backtest Engine)
 # ---------------------------------------------------------------------------
 
 def run_backtest_simulation(initial_balance=10000.0, risk_per_trade=0.01):
-    logger.info("Running realistic backtest simulation...")
-    df_m15 = download_yf(GOLD_SYMBOL, "60d", "15m")
-    if df_m15.empty or len(df_m15) < 300:
-        return "⚠️ Data insufficient for backtesting."
+    logger.info("جاري تشغيل محكاة الاختبار العكسي...")
+    df_m15 = download_yf("GC=F", "30d", "15m")
+    if df_m15.empty:
+        df_m15 = download_yf("GLD", "30d", "15m")
+
+    if df_m15.empty or len(df_m15) < 100:
+        return "⚠️ البيانات غير كافية للاختبار العكسي حالياً (قد يكون السوق مغلقاً)."
 
     df_closed = clean_df_columns(df_m15)
     trades = []
 
-    for i in range(200, len(df_closed) - 20):
+    for i in range(100, len(df_closed) - 20):
         sub_df = df_closed.iloc[:i]
         smc = detect_institutional_smc(sub_df)
 
         df_h4 = resample_m15_to_h4(sub_df)
-        if len(df_h4) < 50:
+        if len(df_h4) < 30:
             continue
 
         close_h4 = to_1d_series(df_h4["Close"])
@@ -1570,7 +1575,7 @@ def run_backtest_simulation(initial_balance=10000.0, risk_per_trade=0.01):
             trades.append({"signal": sig, "outcome": hit, "r": realized_r})
 
     if not trades:
-        return "📊 Backtest complete: No signals met criteria in dataset."
+        return "📊 اكتمل الاختبار العكسي: لا توجد إشارات استوفت الشروط."
 
     df_res = pd.DataFrame(trades)
     wins = df_res[df_res["r"] > 0]
@@ -1580,20 +1585,20 @@ def run_backtest_simulation(initial_balance=10000.0, risk_per_trade=0.01):
     total_r = df_res["r"].sum()
 
     summary = (
-        "📊 <b>نتائج الاختبار العكسي (Backtest 60 Days)</b>\n"
+        "📊 <b>نتائج الاختبار العكسي (Backtest 30 Days)</b>\n"
         "───────────────────────\n"
         f"🔢 <b>إجمالي الصفقات:</b> <code>{len(df_res)}</code>\n"
         f"✅ <b>الصفقات الرابحة:</b> <code>{len(wins)}</code>\n"
         f"❌ <b>الصفقات الخاسرة:</b> <code>{len(losses)}</code>\n"
         f"🎯 <b>نسبة النجاح (Win Rate):</b> <code>{win_rate:.1f}%</code>\n"
         f"📈 <b>إجمالي الـ R المحقق:</b> <code>+{total_r:.2f}R</code>\n"
-        f"💵 <b>الربح التقديري (1% risk/trade):</b> <code>+{total_r * risk_per_trade * 100:.1f}%</code>\n"
+        f"💵 <b>الربح التقديري (1% مخاطرة/صفقة):</b> <code>+{total_r * risk_per_trade * 100:.1f}%</code>\n"
     )
     return summary
 
 
 # ---------------------------------------------------------------------------
-# Telegram UI Layout & Report Generators
+# واجهة التليغرام والتقارير المُعرّبة
 # ---------------------------------------------------------------------------
 
 def main_keyboard():
@@ -1657,7 +1662,7 @@ def get_performance_stats_report():
         )
         return text
     except Exception as exc:
-        logger.error("get_performance_stats_report error: %s", exc)
+        logger.error("خطأ في تقرير الأداء: %s", exc)
         return "⚠️ حدث خطأ أثناء استخراج إحصائيات الأداء."
     finally:
         release_db_connection(conn)
@@ -1685,9 +1690,10 @@ def get_active_trades_report():
 
         pnl_pips = (live_price - entry) if sig_type == "BUY" else (entry - live_price)
         emoji = "🟢" if pnl_pips >= 0 else "🔴"
+        sig_ar = "شراء 🟢" if sig_type == "BUY" else "بيع 🔴"
 
         text += (
-            f"🆔 <b>{candle_id}</b> ({sig_type})\n"
+            f"🆔 <b>{candle_id}</b> ({sig_ar})\n"
             f"💵 <b>الدخول:</b> <code>${entry}</code> | <b>الحالي:</b> <code>${live_price}</code>\n"
             f"📊 <b>النتيجة اللحظية:</b> {emoji} <code>{pnl_pips:+.2f}$</code>\n"
             f"🎯 <b>TP1:</b> <code>${tp1}</code> | <b>TP2:</b> <code>${tp2}</code>\n"
@@ -1699,23 +1705,23 @@ def get_active_trades_report():
 
 
 # ---------------------------------------------------------------------------
-# Telegram Command Handlers
+# معالجات أوامر التليغرام (Telegram Handlers)
 # ---------------------------------------------------------------------------
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    safe_name = html.escape(user.first_name or "Trader")
+    safe_name = html.escape(user.first_name or "المتداول")
     register_user(user.id, user.username, user.first_name)
 
     text = (
-        f"👋 أهلاً بك يا <b>{safe_name}</b> في بوت XAUUSD Quant Production v3.0.\n\n"
-        "تم تفعيل جميع الميزات التلقائية:\n"
-        "• فلتر الأخبار الاقتصادية اللحظي (USD Blackout).\n"
-        "• حساب أسعار العرض والطلب (Bid/Ask & Spread).\n"
-        "• محرك SMC المتقدم (Order Blocks & Premium/Discount).\n"
-        "• محرك الاختبار العكسي (Backtest Engine).\n"
-        "• لوحة أزرار تفاعلية شمولية دون الحاجة لأوامر نصية.\n\n"
-        "اختر خياراً من القائمة أدناه:"
+        f"👋 أهلاً بك يا <b>{safe_name}</b> في بوت التداول الكمي المتقدم XAUUSD Quant v3.0.\n\n"
+        "<b>الميزات النشطة تلقائياً:</b>\n"
+        "• <b>فلتر الأخبار الاقتصادية:</b> حظر التداول أثناء صدور بيانات USD الهامة.\n"
+        "• <b>حساب الفارق السعري:</b> احتساب دقيق لأسعار العرض والطلب (Bid/Ask).\n"
+        "• <b>التحليل المؤسسي (SMC):</b> تتبع مناطق الطلب والعرض والكشوف السعرية.\n"
+        "• <b>محرك الاختبار العكسي:</b> تقييم استراتيجيات التداول باستمرار.\n"
+        "• <b>لوحة تحكم كاملة:</b> أزرار تفاعلية مريحة دون الحاجة لكتابة أوامر.\n\n"
+        "اختر خياراً من القائمة أدناه للبدء:"
     )
     await update.message.reply_text(
         text,
@@ -1729,37 +1735,40 @@ async def analyze_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if res["status"] == "WAIT":
         await update.message.reply_text(
-            html.escape(res["reason"]),
+            f"⚠️ <b>حالة الانتظار:</b> {html.escape(res['reason'])}",
             parse_mode=ParseMode.HTML,
         )
         return
 
     smc = res["smc"]
-    trend_emoji = (
-        "🟢" if res["h4_trend"] == "BULLISH"
-        else "🔴" if res["h4_trend"] == "BEARISH"
-        else "🟡"
+    h4_trend_raw = res["h4_trend"]
+    trend_ar = (
+        "صاعد 🟢" if h4_trend_raw == "BULLISH"
+        else "هابط 🔴" if h4_trend_raw == "BEARISH"
+        else "محايد 🟡"
     )
 
+    quality_ar = translate_quality_state(res["quality_state"])
+
     text = (
-        "📊 <b>التحليل المؤسسي المتقدم XAUUSD</b>\n"
+        "📊 <b>التحليل المؤسسي المتقدم (XAUUSD)</b>\n"
         "───────────────────────\n"
-        f"💵 <b>Live execution:</b> <code>${res['live_execution_price']}</code>\n"
-        f"📉 <b>Signal candle close:</b> <code>${res['signal_candle_close']}</code>\n"
-        f"📐 <b>Slippage:</b> <code>{res['slippage']}</code>\n"
-        f"📊 <b>DXY:</b> <code>{res['dxy'] if res['dxy'] is not None else 'N/A'}</code>\n"
-        f"📈 <b>US10Y:</b> <code>{res['us10y'] if res['us10y'] is not None else 'N/A'}%</code>\n"
-        f"🛡️ <b>Quality:</b> <code>{res['quality_state']}</code>\n"
+        f"💵 <b>سعر التنفيذ المباشر:</b> <code>${res['live_execution_price']}</code>\n"
+        f"📉 <b>إغلاق شمعة الإشارة:</b> <code>${res['signal_candle_close']}</code>\n"
+        f"📐 <b>الانزلاق السعري المتوقع:</b> <code>{res['slippage']}</code>\n"
+        f"📊 <b>مؤشر الدولار (DXY):</b> <code>{res['dxy'] if res['dxy'] is not None else 'غير متاح'}</code>\n"
+        f"📈 <b>عائد السندات (US10Y):</b> <code>{res['us10y'] if res['us10y'] is not None else 'غير متاح'}%</code>\n"
+        f"🛡️ <b>جودة البيانات:</b> <code>{quality_ar}</code>\n"
         "───────────────────────\n"
-        f"🧭 <b>H4 Trend:</b> {trend_emoji} <code>{res['h4_trend']}</code>\n"
-        f"📦 <b>Order Block Bullish:</b> <code>{smc['ob_bullish']}</code>\n"
-        f"📦 <b>Order Block Bearish:</b> <code>{smc['ob_bearish']}</code>\n"
-        f"⚖️ <b>Discount Zone:</b> <code>{smc['is_discount']}</code>\n"
-        f"⚖️ <b>Premium Zone:</b> <code>{smc['is_premium']}</code>\n"
-        f"🟢 <b>BOS Bullish:</b> <code>{smc['bos_bullish']}</code>\n"
-        f"🔴 <b>BOS Bearish:</b> <code>{smc['bos_bearish']}</code>\n"
-        f"🔄 <b>CHoCH Bullish:</b> <code>{smc['choch_bullish']}</code>\n"
-        f"🔄 <b>CHoCH Bearish:</b> <code>{smc['choch_bearish']}</code>\n"
+        f"🧭 <b>اتجاه فريم H4:</b> {trend_ar}\n"
+        f"📦 <b>منطقة طلب (Order Block شرائي):</b> <code>{'نعم ✅' if smc['ob_bullish'] else 'لا ❌'}</code>\n"
+        f"📦 <b>منطقة عرض (Order Block بيعي):</b> <code>{'نعم ✅' if smc['ob_bearish'] else 'لا ❌'}</code>\n"
+        f"⚖️ <b>منطقة خصم (Discount):</b> <code>{'نعم ✅' if smc['is_discount'] else 'لا ❌'}</code>\n"
+        f"⚖️ <b>منطقة علاوة (Premium):</b> <code>{'نعم ✅' if smc['is_premium'] else 'لا ❌'}</code>\n"
+        f"🟢 <b>كسر هيكل صاعد (BOS):</b> <code>{'نعم ✅' if smc['bos_bullish'] else 'لا ❌'}</code>\n"
+        f"🔴 <b>كسر هيكل هابط (BOS):</b> <code>{'نعم ✅' if smc['bos_bearish'] else 'لا ❌'}</code>\n"
+        f"🔄 <b>تغير اتجاه صاعد (CHoCH):</b> <code>{'نعم ✅' if smc['choch_bullish'] else 'لا ❌'}</code>\n"
+        f"🔄 <b>تغير اتجاه هابط (CHoCH):</b> <code>{'نعم ✅' if smc['choch_bearish'] else 'لا ❌'}</code>\n"
     )
 
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
@@ -1770,35 +1779,36 @@ async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if res["status"] == "WAIT":
         await update.message.reply_text(
-            html.escape(res["reason"]),
+            f"⚠️ <b>حالة الانتظار:</b> {html.escape(res['reason'])}",
             parse_mode=ParseMode.HTML,
         )
         return
 
     sig = res["signal"]
-    emoji = "🟢" if sig == "BUY" else "🔴" if sig == "SELL" else "🟡"
+    sig_ar = "شراء 🟢" if sig == "BUY" else "بيع 🔴" if sig == "SELL" else "انتظار (لا توجد إشارة) 🟡"
+    quality_ar = translate_quality_state(res["quality_state"])
 
     text = (
-        f"{emoji} <b>Quant Signal: {sig}</b> {emoji}\n"
+        f"⚡ <b>الإشارة الكمية: {sig_ar}</b>\n"
         "───────────────────────\n"
-        f"🆔 <b>Candle:</b> <code>{res['candle_id']}</code>\n"
-        f"💵 <b>Execution:</b> <code>${res['live_execution_price']}</code>\n"
-        f"📉 <b>Candle close:</b> <code>${res['signal_candle_close']}</code>\n"
-        f"📐 <b>Slippage:</b> <code>{res['slippage']}</code>\n"
-        f"🛡️ <b>Quality:</b> <code>{res['quality_state']}</code>\n"
+        f"🆔 <b>معرف الشمعة:</b> <code>{res['candle_id']}</code>\n"
+        f"💵 <b>سعر التنفيذ:</b> <code>${res['live_execution_price']}</code>\n"
+        f"📉 <b>إغلاق الشمعة:</b> <code>${res['signal_candle_close']}</code>\n"
+        f"📐 <b>الانزلاق السعري:</b> <code>{res['slippage']}</code>\n"
+        f"🛡️ <b>جودة البيانات:</b> <code>{quality_ar}</code>\n"
         "───────────────────────\n"
     )
 
     if sig in {"BUY", "SELL"}:
         text += (
-            f"🛑 <b>SL:</b> <code>${res['sl']}</code>\n"
-            f"🎯 <b>TP1:</b> <code>${res['tp1']}</code>\n"
-            f"🎯 <b>TP2:</b> <code>${res['tp2']}</code>\n"
-            f"📊 <b>Buy/Sell score:</b> <code>{res['buy_score']} / {res['sell_score']}</code>\n"
-            f"🧭 <b>H4:</b> <code>{res['h4_trend']}</code>\n"
+            f"🛑 <b>وقف الخسارة (SL):</b> <code>${res['sl']}</code>\n"
+            f"🎯 <b>الهدف الأول (TP1):</b> <code>${res['tp1']}</code>\n"
+            f"🎯 <b>الهدف الثاني (TP2):</b> <code>${res['tp2']}</code>\n"
+            f"📊 <b>نقاط التقييم (شراء / بيع):</b> <code>{res['buy_score']} / {res['sell_score']}</code>\n"
+            f"🧭 <b>اتجاه H4:</b> <code>{res['h4_trend']}</code>\n"
         )
     else:
-        text += "⚠️ <b>Decision:</b> <code>HOLD</code>\n"
+        text += "⚠️ <b>القرار:</b> <code>انتظار فرصة أعدل (HOLD)</code>\n"
 
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -1827,22 +1837,25 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_candle = (
         closed_df.index[-1].isoformat()
         if not closed_df.empty
-        else "N/A"
+        else "غير متاح"
     )
 
+    worker_status_ar = "نشط ويعمل ✅" if worker_alive else "متوقف ❌"
+    error_ar = worker_error if worker_error else "لا يوجد أخطاء"
+
     text = (
-        "🛡️ <b>System Health v3.0</b>\n"
+        "🛡️ <b>حالة النظام والخدمة v3.0</b>\n"
         "───────────────────────\n"
-        f"⚙️ <b>Worker:</b> <code>{'ALIVE' if worker_alive else 'DEAD'}</code>\n"
-        f"👥 <b>Subscribers:</b> <code>{len(subscribers)}</code>\n"
-        f"🧠 <b>Memory evaluations:</b> <code>{len(EVALUATED_CANDLES_SET)}</code>\n"
-        f"💵 <b>Gold Spot:</b> <code>${macro.get('gold_spot')}</code>\n"
-        f"💵 <b>Gold Bid/Ask:</b> <code>${macro.get('gold_bid')} / ${macro.get('gold_ask')}</code>\n"
-        f"📊 <b>DXY:</b> <code>{macro.get('dxy')}</code>\n"
-        f"📈 <b>US10Y:</b> <code>{macro.get('us10y')}</code>\n"
-        f"⏱️ <b>Cache age:</b> <code>{cache_age if cache_age is None else f'{cache_age:.1f}s'}</code>\n"
-        f"🕯️ <b>Last closed M15:</b> <code>{last_candle}</code>\n"
-        f"⚠️ <b>Last worker error:</b> <code>{worker_error or 'None'}</code>\n"
+        f"⚙️ <b>العامل الخفي (Worker):</b> <code>{worker_status_ar}</code>\n"
+        f"👥 <b>المشتركون في الإشارات:</b> <code>{len(subscribers)}</code>\n"
+        f"🧠 <b>الشمعات المقيمة بالذاكرة:</b> <code>{len(EVALUATED_CANDLES_SET)}</code>\n"
+        f"💵 <b>سعر الذهب المباشر:</b> <code>${macro.get('gold_spot') or 'غير متاح'}</code>\n"
+        f"💵 <b>أسعار الطلب/العرض:</b> <code>${macro.get('gold_bid') or 'N/A'} / ${macro.get('gold_ask') or 'N/A'}</code>\n"
+        f"📊 <b>مؤشر الدولار (DXY):</b> <code>{macro.get('dxy') or 'غير متاح'}</code>\n"
+        f"📈 <b>عائد السندات (US10Y):</b> <code>{macro.get('us10y') or 'غير متاح'}</code>\n"
+        f"⏱️ <b>عمر الذاكرة المؤقتة:</b> <code>{cache_age if cache_age is None else f'{cache_age:.1f} ثانية'}</code>\n"
+        f"🕯️ <b>آخر شمعة M15 مغلقة:</b> <code>{last_candle}</code>\n"
+        f"⚠️ <b>آخر خطأ في العامل:</b> <code>{error_ar}</code>\n"
     )
 
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
@@ -1874,9 +1887,9 @@ async def toggle_sub_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         release_db_connection(conn)
 
     msg = (
-        "✅ تم تفعيل الاشتراك في الإشارات التلقائية."
+        "✅ تم تفعيل اشتراكك بنجاح. ستصلك الإشارات التلقائية فور توليدها."
         if new_value == 1
-        else "🛑 تم إيقاف الاشتراك."
+        else "🛑 تم إيقاف الاشتراك بنجاح. لن تصلك الإشارات التلقائية بعد الآن."
     )
     await update.message.reply_text(msg)
 
@@ -1901,7 +1914,7 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ---------------------------------------------------------------------------
-# Background Boundary Schedulers
+# المجدول الزمني للوظائف الخفية (Background Boundary Schedulers)
 # ---------------------------------------------------------------------------
 
 async def auto_signal_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1912,18 +1925,19 @@ async def auto_signal_job(context: ContextTypes.DEFAULT_TYPE):
             users = get_subscribed_users()
             sig = res["signal"]
             emoji = "🟢" if sig == "BUY" else "🔴"
+            sig_ar = "شراء" if sig == "BUY" else "بيع"
 
             message = (
-                f"🚨 {emoji} <b>Automatic {sig} Signal</b>\n"
+                f"🚨 {emoji} <b>إشارة تلقائية جديدة: {sig_ar}</b>\n"
                 "───────────────────────\n"
-                f"🆔 <b>Candle:</b> <code>{res['candle_id']}</code>\n"
-                f"💵 <b>Execution:</b> <code>${res['live_execution_price']}</code>\n"
-                f"📉 <b>Candle close:</b> <code>${res['signal_candle_close']}</code>\n"
-                f"📐 <b>Slippage:</b> <code>{res['slippage']}</code>\n"
-                f"🛑 <b>SL:</b> <code>${res['sl']}</code>\n"
-                f"🎯 <b>TP1:</b> <code>${res['tp1']}</code>\n"
-                f"🎯 <b>TP2:</b> <code>${res['tp2']}</code>\n"
-                f"🧭 <b>H4:</b> <code>{res['h4_trend']}</code>\n"
+                f"🆔 <b>معرف الشمعة:</b> <code>{res['candle_id']}</code>\n"
+                f"💵 <b>سعر التنفيذ:</b> <code>${res['live_execution_price']}</code>\n"
+                f"📉 <b>إغلاق الشمعة:</b> <code>${res['signal_candle_close']}</code>\n"
+                f"📐 <b>الانزلاق السعري:</b> <code>{res['slippage']}</code>\n"
+                f"🛑 <b>وقف الخسارة (SL):</b> <code>${res['sl']}</code>\n"
+                f"🎯 <b>الهدف الأول (TP1):</b> <code>${res['tp1']}</code>\n"
+                f"🎯 <b>الهدف الثاني (TP2):</b> <code>${res['tp2']}</code>\n"
+                f"🧭 <b>اتجاه H4:</b> <code>{res['h4_trend']}</code>\n"
             )
 
             for uid in users:
@@ -1934,17 +1948,17 @@ async def auto_signal_job(context: ContextTypes.DEFAULT_TYPE):
                         parse_mode=ParseMode.HTML,
                     )
                 except Exception as exc:
-                    logger.warning("Broadcast failed for %s: %s", uid, exc)
+                    logger.warning("فشل البث للمستخدم %s: %s", uid, exc)
 
     except Exception as exc:
-        logger.exception("Auto signal job failed: %s", exc)
+        logger.exception("فشلت وظيفة البث التلقائي للإشارات: %s", exc)
 
 
 async def trade_lifecycle_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         await asyncio.to_thread(monitor_open_trades)
     except Exception as exc:
-        logger.exception("Trade lifecycle job failed: %s", exc)
+        logger.exception("فشلت وظيفة متابعة دورة حياة الصفقات: %s", exc)
 
 
 async def schedule_boundary_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1957,12 +1971,12 @@ async def schedule_boundary_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# Flask Health Diagnostics Web Server
+# خادم الفحص التشخيصي (Flask Health Server)
 # ---------------------------------------------------------------------------
 
 def run_flask_server():
     if Flask is None:
-        logger.warning("Flask unavailable; health endpoint disabled.")
+        logger.warning("Flask غير متاح؛ تم تعطيل نقطة فحص الصحة.")
         return
 
     app = Flask(__name__)
@@ -2036,19 +2050,19 @@ def run_flask_server():
 
 
 # ---------------------------------------------------------------------------
-# Main Application Entry Point
+# نقطة التشغيل الرئيسية (Main Entrypoint)
 # ---------------------------------------------------------------------------
 
 def main():
     init_db()
 
-    # Backtest Execution on Startup
+    # تنفيذ محاكاة الاختبار العكسي عند بدء التشغيل
     try:
         bt_summary = run_backtest_simulation()
         clean_text = bt_summary.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "")
         logger.info("\n" + clean_text)
     except Exception as exc:
-        logger.warning("Initial backtest run skipped: %s", exc)
+        logger.warning("تم تخطي الاختبار العكسي الأولي: %s", exc)
 
     stop_event = threading.Event()
 
@@ -2070,7 +2084,7 @@ def main():
 
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
-        logger.critical("TELEGRAM_BOT_TOKEN is missing.")
+        logger.critical("رمز TELEGRAM_BOT_TOKEN مفقود.")
         sys.exit(1)
 
     application = ApplicationBuilder().token(token).build()
@@ -2093,12 +2107,12 @@ def main():
         MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text_buttons)
     )
 
-    logger.info("XAUUSD Quant Bot v3.0 Production Engine Started.")
+    logger.info("تم تشغيل محرك XAUUSD Quant Bot v3.0 بنجاح.")
 
     try:
         application.run_polling(drop_pending_updates=True)
     finally:
-        logger.info("Stopping service...")
+        logger.info("جاري إيقاف الخدمة...")
         stop_event.set()
 
 
