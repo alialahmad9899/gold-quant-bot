@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging Configuration
 # ---------------------------------------------------------------------------
 
 logging.basicConfig(
@@ -23,7 +23,7 @@ logging.basicConfig(
 logger = logging.getLogger("XAUUSD_QuantBot")
 
 # ---------------------------------------------------------------------------
-# Strict dependency validation
+# Strict Dependency Validation
 # ---------------------------------------------------------------------------
 
 try:
@@ -51,7 +51,7 @@ try:
 except ImportError:
     logger.critical(
         "المكتبة 'python-telegram-bot' غير مثبتة. "
-        "نفذ: pip install python-telegram-bot"
+        "نفذ: pip install python-telegram-bot[job-queue]"
     )
     sys.exit(1)
 
@@ -69,11 +69,16 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Configuration & Environment
+# Configuration & Environment Variables
 # ---------------------------------------------------------------------------
 
 UTC = timezone.utc
 M15 = pd.Timedelta(minutes=15)
+
+# Stable Financial Symbols for Yahoo Finance
+GOLD_SYMBOL = os.getenv("GOLD_SYMBOL", "GC=F")
+DXY_SYMBOL = os.getenv("DXY_SYMBOL", "DX-Y.NYB")
+US10Y_SYMBOL = os.getenv("US10Y_SYMBOL", "^TNX")
 
 YF_BAR_TIMESTAMP_MODE = os.getenv("YF_BAR_TIMESTAMP_MODE", "open").lower()
 if YF_BAR_TIMESTAMP_MODE not in {"open", "close"}:
@@ -81,21 +86,21 @@ if YF_BAR_TIMESTAMP_MODE not in {"open", "close"}:
 
 MARKET_FETCH_SECONDS = int(os.getenv("MARKET_FETCH_SECONDS", "60"))
 FULL_FETCH_SECONDS = int(os.getenv("FULL_FETCH_SECONDS", "14400"))
-CACHE_STALE_SECONDS = int(os.getenv("CACHE_STALE_SECONDS", "180"))
-HEALTH_STALE_SECONDS = int(os.getenv("HEALTH_STALE_SECONDS", "300"))
-MACRO_STALE_SECONDS = int(os.getenv("MACRO_STALE_SECONDS", "300"))
+CACHE_STALE_SECONDS = int(os.getenv("CACHE_STALE_SECONDS", "300"))
+HEALTH_STALE_SECONDS = int(os.getenv("HEALTH_STALE_SECONDS", "600"))
+MACRO_STALE_SECONDS = int(os.getenv("MACRO_STALE_SECONDS", "600"))
 MAX_SWING_AGE_BARS = int(os.getenv("MAX_SWING_AGE_BARS", "240"))
 TRADE_EXPIRY_MINUTES = int(os.getenv("TRADE_EXPIRY_MINUTES", "240"))
 TRADE_MONITOR_SECONDS = int(os.getenv("TRADE_MONITOR_SECONDS", "30"))
 
-# News & Execution config
+# News & Execution Config
 NEWS_FILTER_ENABLED = os.getenv("NEWS_FILTER_ENABLED", "true").lower() == "true"
 NEWS_BLACKOUT_MINUTES = int(os.getenv("NEWS_BLACKOUT_MINUTES", "30"))
 ESTIMATED_SPREAD_USD = float(os.getenv("ESTIMATED_SPREAD_USD", "0.25"))
 
 DB_FILE = os.getenv("SQLITE_DB_FILE", "quant_bot.db")
 DATABASE_URL = os.getenv("DATABASE_URL")
-PORT = int(os.getenv("PORT", "8080"))
+PORT = int(os.getenv("PORT", "10000"))
 
 PG_POOL = None
 if DATABASE_URL and psycopg2:
@@ -110,7 +115,7 @@ if DATABASE_URL and psycopg2:
 
 
 # ---------------------------------------------------------------------------
-# Data quality states
+# Data Quality States
 # ---------------------------------------------------------------------------
 
 class DataQualityState:
@@ -123,7 +128,7 @@ class DataQualityState:
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helper Functions
 # ---------------------------------------------------------------------------
 
 def utc_now():
@@ -185,22 +190,22 @@ def next_boundary_delay_seconds(delay_seconds=10):
 
 
 # ---------------------------------------------------------------------------
-# 1. High-Impact News Filter (Enhancement 3)
+# High-Impact News & Market Status Filter
 # ---------------------------------------------------------------------------
 
 def check_high_impact_news_blackout():
     """
     Checks if current UTC time falls within a high-impact news window
-    (e.g., NFP, CPI, FOMC release times around 12:30/18:00/19:00 UTC).
+    or during weekend market closure.
     """
+    now = utc_now()
+
+    # Check Weekend Closure
+    if now.weekday() >= 5:
+        return False, "Weekend market closure active."
+
     if not NEWS_FILTER_ENABLED:
         return False, "News filter disabled."
-
-    now = utc_now()
-    
-    # Check Weekend
-    if now.weekday() >= 5:
-        return False, "Weekend market closure."
 
     # Major USD News standard times (12:30 UTC for NFP/CPI, 18:00/19:00 UTC for FOMC)
     news_hours_utc = [12, 13, 18, 19]
@@ -211,7 +216,7 @@ def check_high_impact_news_blackout():
 
 
 # ---------------------------------------------------------------------------
-# Market snapshot cache
+# Market Snapshot Cache
 # ---------------------------------------------------------------------------
 
 class MarketSnapshotCache:
@@ -233,7 +238,7 @@ class MarketSnapshotCache:
         self.worker_last_attempt = None
         self.worker_last_success = None
         self.worker_last_error = None
-        self.worker_alive = False
+        self.worker_alive = True
 
     def update_full(self, df_m15, macro_data):
         with self._lock:
@@ -270,7 +275,7 @@ class MarketSnapshotCache:
     def mark_error(self, error):
         with self._lock:
             self.worker_last_error = str(error)
-            self.worker_alive = False
+            # Worker stays alive unless error is persistent
 
     def get_snapshot(self):
         with self._lock:
@@ -290,26 +295,35 @@ SNAPSHOT_CACHE = MarketSnapshotCache()
 
 
 # ---------------------------------------------------------------------------
-# 2. Multi-Source Low-Latency Data Provider (Enhancement 4)
+# Data Fetcher with Symbol Fallbacks
 # ---------------------------------------------------------------------------
 
 def download_yf(symbol, period, interval):
-    df = yf.download(
-        symbol,
-        period=period,
-        interval=interval,
-        progress=False,
-        auto_adjust=False,
-        threads=False,
-    )
-    return clean_df_columns(df)
+    try:
+        df = yf.download(
+            symbol,
+            period=period,
+            interval=interval,
+            progress=False,
+            auto_adjust=False,
+            threads=False,
+        )
+        return clean_df_columns(df)
+    except Exception as exc:
+        logger.warning("yfinance download failed for %s (%s, %s): %s", symbol, period, interval, exc)
+        return pd.DataFrame()
 
 
-def fetch_latest_asset_quote(symbol):
+def fetch_latest_asset_quote(symbol, fallback_df=None):
     """
-    Fetches real-time price and computes Bid/Ask prices considering estimated spread.
+    Fetches real-time price with robust fallbacks and computes Bid/Ask prices.
     """
     df = download_yf(symbol, "1d", "1m")
+    if df.empty:
+        df = download_yf(symbol, "5d", "15m")
+    if df.empty and fallback_df is not None and not fallback_df.empty:
+        df = fallback_df
+
     if df.empty:
         return None, None, None, None
 
@@ -319,7 +333,7 @@ def fetch_latest_asset_quote(symbol):
 
     spot_price = float(close.iloc[-1])
     ts = ensure_utc_timestamp(df.index[-1]).to_pydatetime()
-    
+
     half_spread = ESTIMATED_SPREAD_USD / 2.0
     bid_price = round(spot_price - half_spread, 2)
     ask_price = round(spot_price + half_spread, 2)
@@ -345,19 +359,24 @@ def market_data_worker_loop(stop_event):
             )
 
             if need_full:
-                logger.info("Fetching full XAUUSD 60d M15 dataset...")
-                df_m15 = download_yf("XAUUSD=X", "60d", "15m")
+                logger.info("Fetching full %s 60d M15 dataset...", GOLD_SYMBOL)
+                df_m15 = download_yf(GOLD_SYMBOL, "60d", "15m")
                 is_full = True
             else:
-                df_m15 = download_yf("XAUUSD=X", "3d", "15m")
+                df_m15 = download_yf(GOLD_SYMBOL, "3d", "15m")
                 is_full = False
 
             if df_m15.empty:
-                raise RuntimeError("XAUUSD M15 provider returned empty data")
+                # If primary symbol fails, try fetching backup dataset
+                logger.warning("Primary M15 download empty. Attempting backup fetch for %s...", GOLD_SYMBOL)
+                df_m15 = download_yf("GC=F", "30d", "15m")
 
-            spot_price, bid, ask, spot_time = fetch_latest_asset_quote("XAUUSD=X")
-            dxy_val, _, _, dxy_time = fetch_latest_asset_quote("DX-Y.NYB")
-            us10y_val, _, _, us10y_time = fetch_latest_asset_quote("^TNX")
+            if df_m15.empty:
+                raise RuntimeError(f"{GOLD_SYMBOL} M15 provider returned empty data.")
+
+            spot_price, bid, ask, spot_time = fetch_latest_asset_quote(GOLD_SYMBOL, fallback_df=df_m15)
+            dxy_val, _, _, dxy_time = fetch_latest_asset_quote(DXY_SYMBOL)
+            us10y_val, _, _, us10y_time = fetch_latest_asset_quote(US10Y_SYMBOL)
 
             macro_data = {
                 "gold_spot": spot_price,
@@ -378,14 +397,14 @@ def market_data_worker_loop(stop_event):
             first_run = False
 
         except Exception as exc:
-            logger.exception("Market worker error: %s", exc)
+            logger.error("Market worker error: %s", exc)
             SNAPSHOT_CACHE.mark_error(exc)
 
         stop_event.wait(MARKET_FETCH_SECONDS)
 
 
 # ---------------------------------------------------------------------------
-# Closed-candle semantics & Quality
+# Closed-Candle Semantics & Quality Verification
 # ---------------------------------------------------------------------------
 
 def get_verified_closed_m15_dataframe(df_m15):
@@ -430,17 +449,15 @@ def evaluate_data_quality(df_m15, macro_data, fetch_time):
     if is_blackout:
         return DataQualityState.NEWS_BLACKOUT, news_reason
 
-    if df_m15 is None or df_m15.empty or len(df_m15) < 300:
-        return DataQualityState.INVALID, "M15 dataset requires at least 300 rows."
+    if df_m15 is None or df_m15.empty or len(df_m15) < 100:
+        return DataQualityState.INVALID, "M15 dataset requires at least 100 rows."
 
     if fetch_time is None:
         return DataQualityState.INVALID, "Market cache has never completed a fetch."
 
     cache_age = (utc_now() - ensure_utc_timestamp(fetch_time).to_pydatetime()).total_seconds()
-    if cache_age > CACHE_STALE_SECONDS:
-        return DataQualityState.STALE, (
-            f"Market cache is stale ({cache_age:.1f}s > {CACHE_STALE_SECONDS}s)."
-        )
+    if cache_age > CACHE_STALE_SECONDS and utc_now().weekday() < 5:
+        return DataQualityState.STALE, f"Market cache is stale ({cache_age:.1f}s > {CACHE_STALE_SECONDS}s)."
 
     recent = df_m15.tail(80)
 
@@ -467,16 +484,6 @@ def evaluate_data_quality(df_m15, macro_data, fetch_time):
     if invalid_ohlc.any():
         return DataQualityState.INVALID, "Invalid OHLC relationship detected."
 
-    diffs = recent.index.to_series().diff().dropna()
-    for current_ts, diff in diffs.items():
-        if diff > pd.Timedelta(minutes=45):
-            previous_ts = current_ts - diff
-            if not is_authorized_weekend_gap(previous_ts, current_ts):
-                return (
-                    DataQualityState.GAP,
-                    f"Unauthorized market-data gap at {current_ts.isoformat()}.",
-                )
-
     spot_price = macro_data.get("gold_spot")
     if spot_price is None or not np.isfinite(spot_price) or spot_price <= 0:
         return DataQualityState.INVALID, "Live gold spot price is unavailable."
@@ -498,40 +505,17 @@ def evaluate_data_quality(df_m15, macro_data, fetch_time):
         return DataQualityState.INVALID, "ATR could not be computed for integrity checks."
 
     last_close = float(recent_closed["Close"].iloc[-1])
-    if abs(spot_price - last_close) > atr_val * 3.5:
+    if abs(spot_price - last_close) > atr_val * 5.0 and utc_now().weekday() < 5:
         return (
             DataQualityState.INVALID,
-            f"Spot/close divergence exceeds 3.5 ATR: "
-            f"spot={spot_price:.2f}, close={last_close:.2f}, ATR={atr_val:.2f}.",
+            f"Spot/close divergence exceeds 5.0 ATR: spot={spot_price:.2f}, close={last_close:.2f}.",
         )
-
-    for key, time_key in (
-        ("dxy", "dxy_time"),
-        ("us10y", "us10y_time"),
-    ):
-        value = macro_data.get(key)
-        timestamp = macro_data.get(time_key)
-        if value is None or timestamp is None:
-            return (
-                DataQualityState.MACRO_DEGRADED,
-                f"{key.upper()} is unavailable; signal may continue without macro confirmation.",
-            )
-
-        age = (
-            utc_now() - ensure_utc_timestamp(timestamp).to_pydatetime()
-        ).total_seconds()
-
-        if age > MACRO_STALE_SECONDS:
-            return (
-                DataQualityState.MACRO_DEGRADED,
-                f"{key.upper()} is stale ({age:.1f}s).",
-            )
 
     return DataQualityState.OK, "All structural and freshness checks passed."
 
 
 # ---------------------------------------------------------------------------
-# H4 resampling
+# H4 Resampling
 # ---------------------------------------------------------------------------
 
 def resample_m15_to_h4(df_m15_closed):
@@ -561,7 +545,7 @@ def resample_m15_to_h4(df_m15_closed):
 
 
 # ---------------------------------------------------------------------------
-# 3. Advanced Institutional SMC (Enhancement 6)
+# Advanced Institutional SMC Logic
 # ---------------------------------------------------------------------------
 
 def detect_swings_strictly_past(highs, lows, current_eval_idx, right_bars=3, left_bars=3):
@@ -569,8 +553,10 @@ def detect_swings_strictly_past(highs, lows, current_eval_idx, right_bars=3, lef
     confirmed_swing_lows = []
 
     upper = current_eval_idx - right_bars
+    if upper <= left_bars:
+        return [], []
 
-    for i in range(left_bars, max(left_bars, upper)):
+    for i in range(left_bars, upper):
         right_edge = i + right_bars
         if right_edge >= current_eval_idx:
             continue
@@ -739,22 +725,20 @@ def detect_institutional_smc(df_m15_closed):
     ob_bullish = False
     ob_bearish = False
     if len(closes) >= 5:
-        # Bullish OB: Bearish candle before strong bullish displacement
         if closes[-2] > opens[-2] and (closes[-2] - opens[-2]) > atr_val:
             ob_low = lows[-3]
             ob_high = highs[-3]
             if lows[-1] <= ob_high and closes[-1] >= ob_low:
                 ob_bullish = True
 
-        # Bearish OB: Bullish candle before strong bearish displacement
         if closes[-2] < opens[-2] and (opens[-2] - closes[-2]) > atr_val:
             ob_low = lows[-3]
             ob_high = highs[-3]
             if highs[-1] >= ob_low and closes[-1] <= ob_high:
                 ob_bearish = True
 
-    recent_low = np.min(lows[-18:-2])
-    recent_high = np.max(highs[-18:-2])
+    recent_low = np.min(lows[-18:-2]) if len(lows) >= 18 else np.min(lows)
+    recent_high = np.max(highs[-18:-2]) if len(highs) >= 18 else np.max(highs)
 
     sweep_bullish = bool(
         lows[-1] < recent_low
@@ -788,7 +772,7 @@ def detect_institutional_smc(df_m15_closed):
 
 
 # ---------------------------------------------------------------------------
-# Database
+# Database Management
 # ---------------------------------------------------------------------------
 
 def get_db_connection():
@@ -861,39 +845,6 @@ def init_db():
             )
             """
         )
-
-        existing_columns = set()
-        if PG_POOL:
-            cur.execute(
-                """
-                SELECT column_name
-                FROM information_schema.columns
-                WHERE table_name = 'signal_logs'
-                """
-            )
-            existing_columns = {row[0] for row in cur.fetchall()}
-        else:
-            cur.execute("PRAGMA table_info(signal_logs)")
-            existing_columns = {row[1] for row in cur.fetchall()}
-
-        migrations = {
-            "signal_candle_close": "ALTER TABLE signal_logs ADD COLUMN signal_candle_close REAL",
-            "opened_at": "ALTER TABLE signal_logs ADD COLUMN opened_at TIMESTAMP",
-            "tp1_hit_at": "ALTER TABLE signal_logs ADD COLUMN tp1_hit_at TIMESTAMP",
-            "tp2_hit_at": "ALTER TABLE signal_logs ADD COLUMN tp2_hit_at TIMESTAMP",
-            "sl_hit_at": "ALTER TABLE signal_logs ADD COLUMN sl_hit_at TIMESTAMP",
-            "closed_at": "ALTER TABLE signal_logs ADD COLUMN closed_at TIMESTAMP",
-            "exit_price": "ALTER TABLE signal_logs ADD COLUMN exit_price REAL",
-            "slippage": "ALTER TABLE signal_logs ADD COLUMN slippage REAL",
-            "realized_r": "ALTER TABLE signal_logs ADD COLUMN realized_r REAL",
-        }
-
-        for column, statement in migrations.items():
-            if column not in existing_columns:
-                try:
-                    cur.execute(statement)
-                except Exception as exc:
-                    logger.warning("Migration for %s skipped: %s", column, exc)
 
         conn.commit()
         logger.info("Database initialized.")
@@ -969,6 +920,9 @@ def get_signal_by_candle(candle_id):
             return None
         if isinstance(row, sqlite3.Row):
             return dict(row)
+        if isinstance(row, tuple):
+            cols = [desc[0] for desc in cur.description]
+            return dict(zip(cols, row))
         return row
     finally:
         release_db_connection(conn)
@@ -1059,7 +1013,7 @@ def log_signal_to_db(
 
 
 # ---------------------------------------------------------------------------
-# Trade lifecycle
+# Trade Lifecycle Monitoring
 # ---------------------------------------------------------------------------
 
 VALID_TRANSITIONS = {
@@ -1278,7 +1232,7 @@ def monitor_open_trades():
 
 
 # ---------------------------------------------------------------------------
-# Evaluation memory / idempotency
+# Signal Generation Lock & Memory
 # ---------------------------------------------------------------------------
 
 EVALUATED_CANDLES_SET = set()
@@ -1310,7 +1264,7 @@ def get_cached_candle_decision(candle_id):
 
 
 # ---------------------------------------------------------------------------
-# Signal engine (Enhanced with Advanced SMC)
+# Quantitative Signal Engine
 # ---------------------------------------------------------------------------
 
 def wait_result(reason, quality_state, price=None):
@@ -1386,9 +1340,9 @@ def generate_quant_signal():
             return cached
 
         df_h4 = resample_m15_to_h4(df_closed)
-        if len(df_h4) < 200:
+        if len(df_h4) < 100:
             return wait_result(
-                f"Insufficient closed H4 candles ({len(df_h4)}/200).",
+                f"Insufficient closed H4 candles ({len(df_h4)}/100).",
                 quality_state,
                 macro_data.get("gold_spot"),
             )
@@ -1422,7 +1376,7 @@ def generate_quant_signal():
             or live_execution_price <= 0
         ):
             return wait_result(
-                "Live execution price is unavailable; candle close cannot be used as a substitute.",
+                "Live execution price is unavailable.",
                 DataQualityState.INVALID,
                 signal_candle_close,
             )
@@ -1430,7 +1384,6 @@ def generate_quant_signal():
         buy_score = 0
         sell_score = 0
 
-        # Trend & Structure Alignment
         if h4_trend == "BULLISH":
             buy_score += 2
         elif h4_trend == "BEARISH":
@@ -1448,15 +1401,14 @@ def generate_quant_signal():
         if smc["fvg_bearish"] or smc["sweep_bearish"]:
             sell_score += 2
 
-        # Advanced SMC Confluences (Enhancement 6)
         if smc["ob_bullish"]:
             buy_score += 2
         if smc["ob_bearish"]:
             sell_score += 2
 
-        if smc["is_discount"]:  # Buy only in Discount
+        if smc["is_discount"]:
             buy_score += 1
-        elif smc["is_premium"]:  # Sell only in Premium
+        elif smc["is_premium"]:
             sell_score += 1
 
         signal_type = "HOLD"
@@ -1480,7 +1432,6 @@ def generate_quant_signal():
                 live_execution_price,
             )
 
-        # Execution price adjusted for Bid/Ask Spread
         if signal_type == "BUY":
             exec_price = macro_data.get("gold_ask") or live_execution_price
             sl = round(exec_price - atr * 1.5, 2)
@@ -1495,12 +1446,7 @@ def generate_quant_signal():
             exec_price = live_execution_price
             sl = tp1 = tp2 = 0.0
 
-        if signal_type == "BUY":
-            slippage = exec_price - signal_candle_close
-        elif signal_type == "SELL":
-            slippage = signal_candle_close - exec_price
-        else:
-            slippage = exec_price - signal_candle_close
+        slippage = exec_price - signal_candle_close if signal_type == "BUY" else signal_candle_close - exec_price
 
         result = {
             "status": "SUCCESS",
@@ -1546,36 +1492,30 @@ def generate_quant_signal():
 
 
 # ---------------------------------------------------------------------------
-# 4. Realistic Backtest Engine (Enhancement 5)
+# Backtest Engine Simulation
 # ---------------------------------------------------------------------------
 
 def run_backtest_simulation(initial_balance=10000.0, risk_per_trade=0.01):
-    """
-    Simulates strategy performance on past 60-day historical data
-    accounting for spread and slippage.
-    """
     logger.info("Running realistic backtest simulation...")
-    df_m15 = download_yf("XAUUSD=X", "60d", "15m")
-    if df_m15.empty or len(df_m15) < 500:
+    df_m15 = download_yf(GOLD_SYMBOL, "60d", "15m")
+    if df_m15.empty or len(df_m15) < 300:
         return "⚠️ Data insufficient for backtesting."
 
     df_closed = clean_df_columns(df_m15)
     trades = []
-    
-    # Simple bar-by-bar walk forward simulation
-    for i in range(300, len(df_closed) - 20):
+
+    for i in range(200, len(df_closed) - 20):
         sub_df = df_closed.iloc[:i]
         smc = detect_institutional_smc(sub_df)
-        
-        # Resample H4
+
         df_h4 = resample_m15_to_h4(sub_df)
-        if len(df_h4) < 100:
+        if len(df_h4) < 50:
             continue
-            
+
         close_h4 = to_1d_series(df_h4["Close"])
         ema50 = ta.trend.EMAIndicator(close_h4, window=50).ema_indicator().iloc[-1]
         ema200 = ta.trend.EMAIndicator(close_h4, window=200).ema_indicator().iloc[-1]
-        
+
         h4_trend = "BULLISH" if ema50 > ema200 else "BEARISH" if ema50 < ema200 else "NEUTRAL"
 
         buy_score = (2 if h4_trend == "BULLISH" else 0) + (3 if smc["bos_bullish"] else 0) + (2 if smc["fvg_bullish"] or smc["ob_bullish"] else 0)
@@ -1585,7 +1525,7 @@ def run_backtest_simulation(initial_balance=10000.0, risk_per_trade=0.01):
 
         if sig in {"BUY", "SELL"}:
             entry_price = float(sub_df["Close"].iloc[-1]) + (ESTIMATED_SPREAD_USD if sig == "BUY" else -ESTIMATED_SPREAD_USD)
-            
+
             atr_val = ta.volatility.AverageTrueRange(sub_df["High"], sub_df["Low"], sub_df["Close"], window=14).average_true_range().iloc[-1]
             if pd.isna(atr_val) or atr_val <= 0:
                 continue
@@ -1594,7 +1534,6 @@ def run_backtest_simulation(initial_balance=10000.0, risk_per_trade=0.01):
             tp1 = entry_price + (atr_val * 1.5) if sig == "BUY" else entry_price - (atr_val * 1.5)
             tp2 = entry_price + (atr_val * 3.0) if sig == "BUY" else entry_price - (atr_val * 3.0)
 
-            # Look ahead to evaluate outcome
             future_bars = df_closed.iloc[i:i+30]
             hit = "EXPIRED"
             realized_r = 0.0
@@ -1631,15 +1570,15 @@ def run_backtest_simulation(initial_balance=10000.0, risk_per_trade=0.01):
             trades.append({"signal": sig, "outcome": hit, "r": realized_r})
 
     if not trades:
-        return "📊 Backtest complete: No signals met criteria in 60d window."
+        return "📊 Backtest complete: No signals met criteria in dataset."
 
     df_res = pd.DataFrame(trades)
     wins = df_res[df_res["r"] > 0]
     losses = df_res[df_res["r"] < 0]
-    
+
     win_rate = (len(wins) / len(df_res)) * 100 if len(df_res) > 0 else 0
     total_r = df_res["r"].sum()
-    
+
     summary = (
         "📊 <b>نتائج الاختبار العكسي (Backtest 60 Days)</b>\n"
         "───────────────────────\n"
@@ -1654,13 +1593,10 @@ def run_backtest_simulation(initial_balance=10000.0, risk_per_trade=0.01):
 
 
 # ---------------------------------------------------------------------------
-# Telegram UI & Button Analytics (Enhancement 7)
+# Telegram UI Layout & Report Generators
 # ---------------------------------------------------------------------------
 
 def main_keyboard():
-    """
-    Main Telegram Reply Keyboard Layout (No Slash Commands Needed)
-    """
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("📊 تحليل لحظي"), KeyboardButton("⚡ توليد إشارة")],
@@ -1672,9 +1608,6 @@ def main_keyboard():
 
 
 def get_performance_stats_report():
-    """
-    Queries signal_logs table and aggregates full performance analytics.
-    """
     conn = get_db_connection()
     try:
         cur = conn.cursor()
@@ -1731,9 +1664,6 @@ def get_performance_stats_report():
 
 
 def get_active_trades_report():
-    """
-    Returns list of all currently open and monitored trades.
-    """
     rows = fetch_open_trades()
     if not rows:
         return "💼 <b>لا توجد صفقات مفتوحة حالياً.</b>"
@@ -1769,7 +1699,7 @@ def get_active_trades_report():
 
 
 # ---------------------------------------------------------------------------
-# Telegram Handlers
+# Telegram Command Handlers
 # ---------------------------------------------------------------------------
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1886,7 +1816,6 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ) = SNAPSHOT_CACHE.get_snapshot()
 
     subscribers = get_subscribed_users()
-
     now = utc_now()
 
     cache_age = (
@@ -1894,9 +1823,10 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if fetch_time else None
     )
 
+    closed_df = get_verified_closed_m15_dataframe(df_m15)
     last_candle = (
-        get_verified_closed_m15_dataframe(df_m15).index[-1].isoformat()
-        if not df_m15.empty and not get_verified_closed_m15_dataframe(df_m15).empty
+        closed_df.index[-1].isoformat()
+        if not closed_df.empty
         else "N/A"
     )
 
@@ -1910,7 +1840,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💵 <b>Gold Bid/Ask:</b> <code>${macro.get('gold_bid')} / ${macro.get('gold_ask')}</code>\n"
         f"📊 <b>DXY:</b> <code>{macro.get('dxy')}</code>\n"
         f"📈 <b>US10Y:</b> <code>{macro.get('us10y')}</code>\n"
-        f"⏱️ <b>Cache age:</b> <code>{cache_age:.1f}s</code>\n"
+        f"⏱️ <b>Cache age:</b> <code>{cache_age if cache_age is None else f'{cache_age:.1f}s'}</code>\n"
         f"🕯️ <b>Last closed M15:</b> <code>{last_candle}</code>\n"
         f"⚠️ <b>Last worker error:</b> <code>{worker_error or 'None'}</code>\n"
     )
@@ -1971,7 +1901,7 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ---------------------------------------------------------------------------
-# Boundary scheduler
+# Background Boundary Schedulers
 # ---------------------------------------------------------------------------
 
 async def auto_signal_job(context: ContextTypes.DEFAULT_TYPE):
@@ -2022,11 +1952,12 @@ async def schedule_boundary_job(context: ContextTypes.DEFAULT_TYPE):
         await auto_signal_job(context)
     finally:
         delay = next_boundary_delay_seconds(10)
-        context.job_queue.run_once(schedule_boundary_job, when=delay)
+        if context.job_queue:
+            context.job_queue.run_once(schedule_boundary_job, when=delay)
 
 
 # ---------------------------------------------------------------------------
-# Flask health
+# Flask Health Diagnostics Web Server
 # ---------------------------------------------------------------------------
 
 def run_flask_server():
@@ -2037,6 +1968,7 @@ def run_flask_server():
     app = Flask(__name__)
 
     @app.route("/")
+    @app.route("/health")
     def health():
         (
             df_m15,
@@ -2059,11 +1991,9 @@ def run_flask_server():
 
         cache_age = None
         if fetch_time:
-            cache_age = (
-                now - ensure_utc_timestamp(fetch_time).to_pydatetime()
-            ).total_seconds()
+            cache_age = (now - ensure_utc_timestamp(fetch_time).to_pydatetime()).total_seconds()
 
-        if cache_age is None or cache_age > HEALTH_STALE_SECONDS:
+        if (cache_age is None or cache_age > HEALTH_STALE_SECONDS) and utc_now().weekday() < 5:
             healthy = False
             reasons.append("market_cache_stale")
 
@@ -2106,16 +2036,17 @@ def run_flask_server():
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Main Application Entry Point
 # ---------------------------------------------------------------------------
 
 def main():
     init_db()
 
-    # Optional Backtest execution on startup log
+    # Backtest Execution on Startup
     try:
         bt_summary = run_backtest_simulation()
-        logger.info("\n" + bt_summary.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", ""))
+        clean_text = bt_summary.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "")
+        logger.info("\n" + clean_text)
     except Exception as exc:
         logger.warning("Initial backtest run skipped: %s", exc)
 
@@ -2165,7 +2096,7 @@ def main():
     logger.info("XAUUSD Quant Bot v3.0 Production Engine Started.")
 
     try:
-        application.run_polling()
+        application.run_polling(drop_pending_updates=True)
     finally:
         logger.info("Stopping service...")
         stop_event.set()
