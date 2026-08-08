@@ -239,7 +239,6 @@ def fetch_yahoo_direct(symbol, range_str="1mo", interval="15m"):
 
 
 def download_yf(symbol, period, interval):
-    # تجربة yfinance أولاً
     try:
         df = yf.download(
             symbol,
@@ -255,7 +254,6 @@ def download_yf(symbol, period, interval):
     except Exception:
         pass
 
-    # تجربة الطلب المباشر برأس متصفح عند فشل yfinance على خوادم Render
     return fetch_yahoo_direct(symbol, range_str=period, interval=interval)
 
 
@@ -1530,7 +1528,7 @@ def generate_quant_signal():
 # ---------------------------------------------------------------------------
 
 def run_backtest_simulation(initial_balance=10000.0, risk_per_trade=0.01):
-    logger.info("جاري تشغيل محكاة الاختبار العكسي...")
+    logger.info("جاري تشغيل محاكاة الاختبار العكسي...")
     df_m15 = download_yf("GC=F", "30d", "15m")
     if df_m15.empty:
         df_m15 = download_yf("GLD", "30d", "15m")
@@ -2093,15 +2091,18 @@ def run_flask_server():
 def main():
     init_db()
 
-    try:
-        bt_summary = run_backtest_simulation()
-        clean_text = bt_summary.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "")
-        logger.info("\n" + clean_text)
-    except Exception as exc:
-        logger.warning("تم تخطي الاختبار العكسي الأولي: %s", exc)
-
     stop_event = threading.Event()
 
+    # 1. تشغيل سيرفر Flask فوراً للربط مع المنفذ (Port Binding) بدون أي تأخير
+    if Flask is not None:
+        flask_thread = threading.Thread(
+            target=run_flask_server,
+            daemon=True,
+            name="health-server",
+        )
+        flask_thread.start()
+
+    # 2. تشغيل خيط جلب بيانات السوق المباشرة
     market_thread = threading.Thread(
         target=market_data_worker_loop,
         args=(stop_event,),
@@ -2110,13 +2111,21 @@ def main():
     )
     market_thread.start()
 
-    if Flask is not None:
-        flask_thread = threading.Thread(
-            target=run_flask_server,
-            daemon=True,
-            name="health-server",
-        )
-        flask_thread.start()
+    # 3. تشغيل محاكاة الاختبار العكسي في خيط خلفي غير معطل لعملية البداية
+    def async_backtest():
+        try:
+            bt_summary = run_backtest_simulation()
+            clean_text = bt_summary.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "")
+            logger.info("\n" + clean_text)
+        except Exception as exc:
+            logger.warning("تم تخطي الاختبار العكسي الأولي: %s", exc)
+
+    bt_thread = threading.Thread(
+        target=async_backtest,
+        daemon=True,
+        name="backtest-worker",
+    )
+    bt_thread.start()
 
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
