@@ -180,6 +180,10 @@ def clean_df_columns(df):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    # معالجة وحذف أي قيم NaN لمنع توقف المحرك
+    df = df.ffill().bfill()
+    df = df.dropna(subset=["Open", "High", "Low", "Close"]).copy()
+
     return df
 
 
@@ -212,7 +216,7 @@ def fetch_real_forex_spot_gold():
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         },
     )
     try:
@@ -236,7 +240,7 @@ def fetch_yahoo_direct(symbol, range_str="1mo", interval="15m"):
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         },
     )
     try:
@@ -280,6 +284,7 @@ def download_yf(symbol, period, interval):
     except Exception:
         pass
 
+    time.sleep(0.5)
     return fetch_yahoo_direct(symbol, range_str=period, interval=interval)
 
 
@@ -418,7 +423,6 @@ SNAPSHOT_CACHE = MarketSnapshotCache()
 def market_data_worker_loop(stop_event):
     logger.info("بدء خيط جلب بيانات السوق المباشرة.")
     first_run = True
-    # الاعتماد على الرموز الرسمية المستقرة دون إدخال الرموز غير المدعومة لمنع أخطاء 404
     gold_symbols = [GOLD_SYMBOL, "GC=F", "GLD", "IAU"]
     dxy_symbols = [DXY_SYMBOL, "DX-Y.NYB", "UUP"]
     us10y_symbols = [US10Y_SYMBOL, "^TNX"]
@@ -1925,7 +1929,6 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     worker_status_ar = "نشط ويعمل ✅" if worker_alive else "متوقف ❌"
     error_ar = worker_error if worker_error else "لا يوجد أخطاء"
 
-    # تقريب متناسق لكافة الأسعار والمؤشرات
     gold_spot = f"{macro.get('gold_spot'):.2f}" if macro.get("gold_spot") is not None else "غير متاح"
     gold_bid = f"{macro.get('gold_bid'):.2f}" if macro.get("gold_bid") is not None else "N/A"
     gold_ask = f"{macro.get('gold_ask'):.2f}" if macro.get("gold_ask") is not None else "N/A"
