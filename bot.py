@@ -1414,16 +1414,23 @@ def generate_quant_signal():
             return cached
 
         df_h4 = resample_m15_to_h4(df_closed)
-        if len(df_h4) < 100:
+        if len(df_h4) < 15:
             return wait_result(
-                f"عدد شمعات H4 المغلقة غير كافٍ ({len(df_h4)}/100).",
+                f"عدد شمعات H4 المغلقة غير كافٍ ({len(df_h4)}/15).",
                 quality_state,
                 macro_data.get("gold_spot"),
             )
 
         close_h4 = to_1d_series(df_h4["Close"])
-        ema50 = ta.trend.EMAIndicator(close_h4, window=50).ema_indicator().iloc[-1]
-        ema200 = ta.trend.EMAIndicator(close_h4, window=200).ema_indicator().iloc[-1]
+        if len(close_h4) >= 200:
+            ema50 = ta.trend.EMAIndicator(close_h4, window=50).ema_indicator().iloc[-1]
+            ema200 = ta.trend.EMAIndicator(close_h4, window=200).ema_indicator().iloc[-1]
+        elif len(close_h4) >= 50:
+            ema50 = ta.trend.EMAIndicator(close_h4, window=50).ema_indicator().iloc[-1]
+            ema200 = float(close_h4.mean())
+        else:
+            ema50 = float(close_h4.tail(10).mean())
+            ema200 = float(close_h4.mean())
 
         if not all(np.isfinite(x) for x in (ema50, ema200)):
             return wait_result(
