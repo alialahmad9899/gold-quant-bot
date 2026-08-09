@@ -320,7 +320,7 @@ def fetch_latest_asset_quote(symbols, fallback_df=None):
 def check_high_impact_news_blackout():
     now = utc_now()
 
-    if now.weekday() >= 5:
+    if now.weekday() == 5 or (now.weekday() == 6 and now.hour < 22):
         return True, "البورصة العالمية مغلقة حالياً (عطلة نهاية الأسبوع). ستستأنف الإشارات والتحليل المباشر فور افتتاح السوق مساء الأحد."
 
     if not NEWS_FILTER_ENABLED:
@@ -488,7 +488,7 @@ def market_data_worker_loop(stop_event):
 
             first_run = False
 
-            if now.weekday() >= 5:
+            if now.weekday() == 5 or (now.weekday() == 6 and now.hour < 22):
                 logger.info("السوق مغلق حالياً (عطلة نهاية الأسبوع)، تم تعبئة الذاكرة بأحدث أسعار الإغلاق المتاحة.")
 
         except Exception as exc:
