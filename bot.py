@@ -208,7 +208,7 @@ def next_boundary_delay_seconds(delay_seconds=10):
 
 
 # ---------------------------------------------------------------------------
-# دالة جلب السعر المباشر من Investing.com (عرض شكلي وتحديد النقاط فقط)
+# دالة جلب السعر المباشر لسبوت الذهب XAU/USD الشكلي المباشر
 # ---------------------------------------------------------------------------
 
 def fetch_real_forex_spot_gold():
@@ -233,27 +233,55 @@ def fetch_real_forex_spot_gold():
 
 
 def fetch_investing_com_price():
-    """جلب سعر الذهب اللحظي المباشر من منصة Investing.com لاستخدامه شكلياً وتحديد النقاط."""
-    url = "https://sa.investing.com/currencies/xau-usd"
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
-        },
-    )
+    """جلب سعر الذهب اللحظي المباشر لسبوت الذهب (XAU/USD) المطابق لـ Investing.com."""
+    # المحاولة الأولى: الجلب المباشر من Investing.com
     try:
+        url = "https://sa.investing.com/currencies/xau-usd"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
+                "Referer": "https://sa.investing.com/",
+            },
+        )
         with urllib.request.urlopen(req, timeout=5) as response:
-            html_content = response.read().decode("utf-8")
-            # استخراج السعر باستخدام النمط الخاص بالموقع
-            match = re.search(r'data-test="instrument-price-last"[^>]*>([\d,\.]+)<', html_content)
-            if match:
-                price_str = match.group(1).replace(",", "")
-                return round(float(price_str), 2)
+            html_content = response.read().decode("utf-8", errors="ignore")
+            patterns = [
+                r'data-test="instrument-price-last"[^>]*>([\d,\.]+)<',
+                r'class="text-2xl[^"]*"[^>]*>([\d,\.]+)<',
+                r'"last_price":([\d\.]+)',
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, html_content)
+                if match:
+                    price_str = match.group(1).replace(",", "")
+                    price_val = float(price_str)
+                    if price_val > 0:
+                        return round(price_val, 2)
     except Exception as exc:
-        logger.debug("فشل جلب السعر من Investing.com: %s", exc)
+        logger.debug("فشل الجلب المباشر من Investing.com: %s", exc)
 
-    # في حال استجابة الملقم بحظر أو تأخير، يتم الاعتماد على السعر المباشر الاحتياطي لضمان دقة التنفيذ
+    # المحاولة الثانية: جلب سعر Spot Gold (XAUUSD=X) المباشر من Yahoo Finance
+    try:
+        url = "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?range=1d&interval=1m"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            },
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode())
+            meta = data["chart"]["result"][0]["meta"]
+            regular_price = meta.get("regularMarketPrice")
+            if regular_price and float(regular_price) > 0:
+                return round(float(regular_price), 2)
+    except Exception as exc:
+        logger.debug("فشل جلب سعر XAUUSD=X من المصدر الثاني: %s", exc)
+
+    # المحاولة الثالثة: المصدر الاحتياطي العام لسبوت الذهب
     return fetch_real_forex_spot_gold()
 
 
@@ -485,7 +513,7 @@ def market_data_worker_loop(stop_event):
                         used_symbol = sym
                         break
 
-            # 1. جلب سعر سبوت الذهب المباشر من Investing.com للعرض الشكلي وتعيين النقاط
+            # 1. جلب سعر سبوت الذهب المباشر لـ XAU/USD لعرضه شكلياً وتعيين النقاط منه
             investing_price = fetch_investing_com_price()
             spot_price, bid, ask, spot_time = fetch_latest_asset_quote(gold_symbols, fallback_df=df_m15)
 
