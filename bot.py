@@ -203,21 +203,8 @@ def next_m15_boundary_plus_delay(delay_seconds=10):
     return boundary.to_pydatetime() + timedelta(seconds=delay_seconds)
 
 
-def next_m5_boundary_plus_delay(delay_seconds=5):
-    now = pd.Timestamp.now(tz="UTC")
-    boundary = now.floor("5min")
-    if now >= boundary:
-        boundary += pd.Timedelta(minutes=5)
-    return boundary.to_pydatetime() + timedelta(seconds=delay_seconds)
-
-
 def next_boundary_delay_seconds(delay_seconds=10):
     target = next_m15_boundary_plus_delay(delay_seconds)
-    return max(0.1, (target - utc_now()).total_seconds())
-
-
-def next_m5_boundary_delay_seconds(delay_seconds=5):
-    target = next_m5_boundary_plus_delay(delay_seconds)
     return max(0.1, (target - utc_now()).total_seconds())
 
 
@@ -435,7 +422,6 @@ class MarketSnapshotCache:
     def __init__(self):
         self._lock = threading.RLock()
         self.df_m15 = pd.DataFrame()
-        self.df_m5 = pd.DataFrame()
         self.macro_data = {
             "gold_spot": None,
             "gold_bid": None,
@@ -453,11 +439,10 @@ class MarketSnapshotCache:
         self.worker_last_error = None
         self.worker_alive = True
 
-    def update_full(self, df_m15, df_m5, macro_data):
+    def update_full(self, df_m15, macro_data):
         with self._lock:
             now = utc_now()
             self.df_m15 = df_m15.copy() if df_m15 is not None else pd.DataFrame()
-            self.df_m5 = df_m5.copy() if df_m5 is not None else pd.DataFrame()
             self.macro_data = dict(macro_data)
             self.last_full_fetch = now
             self.last_fetch_time = now
@@ -465,22 +450,16 @@ class MarketSnapshotCache:
             self.worker_last_error = None
             self.worker_alive = True
 
-    def update_incremental(self, df_m15_recent, df_m5_recent, macro_data):
+    def update_incremental(self, df_m15_recent, macro_data):
         with self._lock:
             if self.df_m15.empty:
-                combined_15 = df_m15_recent.copy() if df_m15_recent is not None else pd.DataFrame()
+                combined = df_m15_recent.copy() if df_m15_recent is not None else pd.DataFrame()
             else:
-                combined_15 = pd.concat([self.df_m15, df_m15_recent])
-                combined_15 = combined_15[~combined_15.index.duplicated(keep="last")].sort_index()
+                combined = pd.concat([self.df_m15, df_m15_recent])
+                combined = combined[~combined.index.duplicated(keep="last")]
+                combined = combined.sort_index()
 
-            if self.df_m5.empty:
-                combined_5 = df_m5_recent.copy() if df_m5_recent is not None else pd.DataFrame()
-            else:
-                combined_5 = pd.concat([self.df_m5, df_m5_recent])
-                combined_5 = combined_5[~combined_5.index.duplicated(keep="last")].sort_index()
-
-            self.df_m15 = combined_15.tail(4000)
-            self.df_m5 = combined_5.tail(4000)
+            self.df_m15 = combined.tail(4000)
             self.macro_data = dict(macro_data)
             now = utc_now()
             self.last_fetch_time = now
@@ -500,7 +479,6 @@ class MarketSnapshotCache:
         with self._lock:
             return (
                 self.df_m15.copy(),
-                self.df_m5.copy(),
                 dict(self.macro_data),
                 self.last_fetch_time,
                 self.last_full_fetch,
@@ -519,7 +497,7 @@ SNAPSHOT_CACHE = MarketSnapshotCache()
 # ---------------------------------------------------------------------------
 
 def market_data_worker_loop(stop_event):
-    logger.info("بدء خيط جلب بيانات السوق المباشرة (M15 & M5).")
+    logger.info("بدء خيط جلب بيانات السوق المباشرة.")
     first_run = True
     gold_symbols = [GOLD_SYMBOL, "GC=F", "GLD", "IAU"]
     dxy_symbols = [DXY_SYMBOL, "DX-Y.NYB", "UUP"]
@@ -529,7 +507,7 @@ def market_data_worker_loop(stop_event):
         SNAPSHOT_CACHE.mark_attempt()
 
         try:
-            _, _, _, last_full, _, _, _, _, _ = SNAPSHOT_CACHE.get_snapshot()
+            _, _, _, last_full, _, _, _, _ = SNAPSHOT_CACHE.get_snapshot()
             now = utc_now()
 
             need_full = (
@@ -539,23 +517,22 @@ def market_data_worker_loop(stop_event):
             )
 
             df_m15 = pd.DataFrame()
-            df_m5 = pd.DataFrame()
+            used_symbol = None
 
             for sym in gold_symbols:
                 for period in ["5d", "7d", "1mo"]:
-                    if df_m15.empty:
-                        df_m15 = download_yf(sym, period, "15m")
-                    if df_m5.empty:
-                        df_m5 = download_yf(sym, period, "5m")
-                    if not df_m15.empty and not df_m5.empty:
+                    df_m15 = download_yf(sym, period, "15m")
+                    if not df_m15.empty and len(df_m15) >= 20:
+                        used_symbol = sym
                         break
-                if not df_m15.empty and not df_m5.empty:
+                if not df_m15.empty:
                     break
 
             if df_m15.empty:
                 for sym in gold_symbols:
                     df_m15 = download_yf(sym, "1mo", "1d")
                     if not df_m15.empty:
+                        used_symbol = sym
                         break
 
             primexbt_price = fetch_primexbt_price()
@@ -583,9 +560,9 @@ def market_data_worker_loop(stop_event):
             }
 
             if need_full or SNAPSHOT_CACHE.df_m15.empty:
-                SNAPSHOT_CACHE.update_full(df_m15, df_m5, macro_data)
+                SNAPSHOT_CACHE.update_full(df_m15, macro_data)
             else:
-                SNAPSHOT_CACHE.update_incremental(df_m15, df_m5, macro_data)
+                SNAPSHOT_CACHE.update_incremental(df_m15, macro_data)
 
             first_run = False
 
@@ -615,20 +592,6 @@ def get_verified_closed_m15_dataframe(df_m15):
         return df[df.index < current_boundary].copy()
 
     return df[df.index + M15 <= now].copy()
-
-
-def get_verified_closed_m5_dataframe(df_m5):
-    if df_m5 is None or df_m5.empty:
-        return pd.DataFrame()
-
-    df = clean_df_columns(df_m5.copy())
-    now = pd.Timestamp.now(tz="UTC")
-
-    if YF_BAR_TIMESTAMP_MODE == "open":
-        current_boundary = now.floor("5min")
-        return df[df.index < current_boundary].copy()
-
-    return df[df.index + M5 <= now].copy()
 
 
 def evaluate_data_quality(df_m15, macro_data, fetch_time):
@@ -786,7 +749,7 @@ def build_structure(swing_highs, swing_lows):
     return structure
 
 
-def detect_institutional_smc(df_closed):
+def detect_institutional_smc(df_m15_closed):
     empty = {
         "fvg_bullish": False,
         "fvg_bearish": False,
@@ -808,10 +771,10 @@ def detect_institutional_smc(df_closed):
         "structure_low": None,
     }
 
-    if df_closed is None or len(df_closed) < 15:
+    if df_m15_closed is None or len(df_m15_closed) < 30:
         return empty
 
-    df = clean_df_columns(df_closed.copy())
+    df = clean_df_columns(df_m15_closed.copy())
     highs = df["High"].to_numpy(dtype=float)
     lows = df["Low"].to_numpy(dtype=float)
     closes = df["Close"].to_numpy(dtype=float)
@@ -848,8 +811,8 @@ def detect_institutional_smc(df_closed):
         highs,
         lows,
         eval_idx,
-        right_bars=2 if len(df) < 30 else 3,
-        left_bars=2 if len(df) < 30 else 3,
+        right_bars=3,
+        left_bars=3,
     )
 
     last_sh = swing_highs[-1] if swing_highs else None
@@ -903,20 +866,20 @@ def detect_institutional_smc(df_closed):
     ob_bullish = False
     ob_bearish = False
     if len(closes) >= 5:
-        if closes[-2] > opens[-2] and (closes[-2] - opens[-2]) > (atr_val * 0.7):
+        if closes[-2] > opens[-2] and (closes[-2] - opens[-2]) > atr_val:
             ob_low = lows[-3]
             ob_high = highs[-3]
             if lows[-1] <= ob_high and closes[-1] >= ob_low:
                 ob_bullish = True
 
-        if closes[-2] < opens[-2] and (opens[-2] - closes[-2]) > (atr_val * 0.7):
+        if closes[-2] < opens[-2] and (opens[-2] - closes[-2]) > atr_val:
             ob_low = lows[-3]
             ob_high = highs[-3]
             if highs[-1] >= ob_low and closes[-1] <= ob_high:
                 ob_bearish = True
 
-    recent_low = np.min(lows[-12:-2]) if len(lows) >= 12 else np.min(lows)
-    recent_high = np.max(highs[-12:-2]) if len(highs) >= 12 else np.max(highs)
+    recent_low = np.min(lows[-18:-2]) if len(lows) >= 18 else np.min(lows)
+    recent_high = np.max(highs[-18:-2]) if len(highs) >= 18 else np.max(highs)
 
     sweep_bullish = bool(
         lows[-1] < recent_low
@@ -999,12 +962,12 @@ def init_db():
 
         auto_inc = "SERIAL PRIMARY KEY" if PG_POOL else "INTEGER PRIMARY KEY AUTOINCREMENT"
 
+        # جدول الصفقات الرئيسية (M15 / H4)
         cur.execute(
             f"""
             CREATE TABLE IF NOT EXISTS signal_logs (
                 id {auto_inc},
                 candle_id TEXT UNIQUE,
-                timeframe TEXT DEFAULT 'M15',
                 signal_type TEXT,
                 signal_candle_close REAL,
                 live_execution_price REAL,
@@ -1025,14 +988,34 @@ def init_db():
             """
         )
 
-        # تحسين ترقية الهيكل لتشمل العمود الجديد منفصلاً لحفظ التوافق
-        try:
-            cur.execute("ALTER TABLE signal_logs ADD COLUMN timeframe TEXT DEFAULT 'M15';")
-        except Exception:
-            pass
+        # جدول الصفقات السريعة المنفصل (M5 Scalping)
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS scalp_signal_logs (
+                id {auto_inc},
+                candle_id TEXT UNIQUE,
+                signal_type TEXT,
+                signal_candle_close REAL,
+                live_execution_price REAL,
+                sl REAL,
+                tp1 REAL,
+                tp2 REAL,
+                quality_state TEXT,
+                trade_status TEXT DEFAULT 'OPEN',
+                opened_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                tp1_hit_at TIMESTAMP,
+                tp2_hit_at TIMESTAMP,
+                sl_hit_at TIMESTAMP,
+                closed_at TIMESTAMP,
+                exit_price REAL,
+                slippage REAL,
+                realized_r REAL
+            )
+            """
+        )
 
         conn.commit()
-        logger.info("تم تهيئة قاعدة البيانات ونظام المحاسبة المستقل بنجاح.")
+        logger.info("تم تهيئة قاعدة البيانات بنجاح لجميع الجداول.")
     finally:
         release_db_connection(conn)
 
@@ -1091,13 +1074,13 @@ def get_subscribed_users():
         release_db_connection(conn)
 
 
-def get_signal_by_candle(candle_id):
+def get_signal_by_candle(candle_id, table="signal_logs"):
     conn = get_db_connection()
     try:
         cur = conn.cursor()
         ph = db_placeholder()
         cur.execute(
-            f"SELECT * FROM signal_logs WHERE candle_id = {ph}",
+            f"SELECT * FROM {table} WHERE candle_id = {ph}",
             (candle_id,),
         )
         row = cur.fetchone()
@@ -1122,7 +1105,7 @@ def log_signal_to_db(
     tp1,
     tp2,
     quality_state,
-    timeframe="M15",
+    table="signal_logs"
 ):
     conn = get_db_connection()
     try:
@@ -1132,9 +1115,8 @@ def log_signal_to_db(
         if PG_POOL:
             cur.execute(
                 f"""
-                INSERT INTO signal_logs (
+                INSERT INTO {table} (
                     candle_id,
-                    timeframe,
                     signal_type,
                     signal_candle_close,
                     live_execution_price,
@@ -1145,12 +1127,11 @@ def log_signal_to_db(
                     trade_status,
                     opened_at
                 )
-                VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, 'OPEN', CURRENT_TIMESTAMP)
+                VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, 'OPEN', CURRENT_TIMESTAMP)
                 ON CONFLICT(candle_id) DO NOTHING
                 """,
                 (
                     candle_id,
-                    timeframe,
                     signal_type,
                     signal_candle_close,
                     live_execution_price,
@@ -1163,9 +1144,8 @@ def log_signal_to_db(
         else:
             cur.execute(
                 f"""
-                INSERT OR IGNORE INTO signal_logs (
+                INSERT OR IGNORE INTO {table} (
                     candle_id,
-                    timeframe,
                     signal_type,
                     signal_candle_close,
                     live_execution_price,
@@ -1176,11 +1156,10 @@ def log_signal_to_db(
                     trade_status,
                     opened_at
                 )
-                VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, 'OPEN', CURRENT_TIMESTAMP)
+                VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, 'OPEN', CURRENT_TIMESTAMP)
                 """,
                 (
                     candle_id,
-                    timeframe,
                     signal_type,
                     signal_candle_close,
                     live_execution_price,
@@ -1196,7 +1175,7 @@ def log_signal_to_db(
         return inserted
     except Exception as exc:
         conn.rollback()
-        logger.error("فشل تسجيل الإشارة في قاعدة البيانات: %s", exc)
+        logger.error("فشل تسجيل الإشارة في جدول %s: %s", table, exc)
         return False
     finally:
         release_db_connection(conn)
@@ -1216,17 +1195,17 @@ VALID_TRANSITIONS = {
 }
 
 
-def fetch_open_trades():
+def fetch_open_trades(table="signal_logs"):
     conn = get_db_connection()
     try:
         cur = conn.cursor()
         cur.execute(
-            """
+            f"""
             SELECT
                 id, candle_id, signal_type,
                 signal_candle_close, live_execution_price,
-                sl, tp1, tp2, trade_status, opened_at, timeframe
-            FROM signal_logs
+                sl, tp1, tp2, trade_status, opened_at
+            FROM {table}
             WHERE trade_status IN ('OPEN', 'TP1_HIT')
             ORDER BY id ASC
             """
@@ -1245,7 +1224,7 @@ def _row_value(row, key, index):
         return None
 
 
-def update_trade_state(row, new_status, exit_price=None, realized_r=None):
+def update_trade_state(row, new_status, exit_price=None, realized_r=None, table="signal_logs"):
     current_status = _row_value(row, "trade_status", 8)
     if current_status not in VALID_TRANSITIONS:
         return False
@@ -1264,7 +1243,7 @@ def update_trade_state(row, new_status, exit_price=None, realized_r=None):
         if new_status == "TP1_HIT":
             cur.execute(
                 f"""
-                UPDATE signal_logs
+                UPDATE {table}
                 SET trade_status = {ph},
                     tp1_hit_at = {ph}
                 WHERE id = {ph}
@@ -1275,7 +1254,7 @@ def update_trade_state(row, new_status, exit_price=None, realized_r=None):
         elif new_status == "TP2_HIT":
             cur.execute(
                 f"""
-                UPDATE signal_logs
+                UPDATE {table}
                 SET trade_status = {ph},
                     tp2_hit_at = {ph},
                     closed_at = {ph},
@@ -1297,7 +1276,7 @@ def update_trade_state(row, new_status, exit_price=None, realized_r=None):
         elif new_status == "SL_HIT":
             cur.execute(
                 f"""
-                UPDATE signal_logs
+                UPDATE {table}
                 SET trade_status = {ph},
                     closed_at = {ph},
                     exit_price = {ph},
@@ -1319,7 +1298,7 @@ def update_trade_state(row, new_status, exit_price=None, realized_r=None):
         else:
             cur.execute(
                 f"""
-                UPDATE signal_logs
+                UPDATE {table}
                 SET trade_status = {ph},
                     closed_at = {ph},
                     exit_price = {ph},
@@ -1342,7 +1321,7 @@ def update_trade_state(row, new_status, exit_price=None, realized_r=None):
         return changed
     except Exception as exc:
         conn.rollback()
-        logger.error("فشل تحديث حالة الصفقة: %s", exc)
+        logger.error("فشل تحديث حالة الصفقة في %s: %s", table, exc)
         return False
     finally:
         release_db_connection(conn)
@@ -1363,62 +1342,65 @@ def calculate_trade_r(signal_type, entry, exit_price, sl):
 
 
 def monitor_open_trades():
-    _, _, macro_data, _, _, _, _, _, _ = SNAPSHOT_CACHE.get_snapshot()
+    _, macro_data, _, _, _, _, _, _ = SNAPSHOT_CACHE.get_snapshot()
     live_price = macro_data.get("gold_spot")
 
     if live_price is None or not np.isfinite(live_price):
         return
 
-    rows = fetch_open_trades()
     now = utc_now()
 
-    for row in rows:
-        signal_type = _row_value(row, "signal_type", 2)
-        entry = _row_value(row, "live_execution_price", 4)
-        sl = _row_value(row, "sl", 5)
-        tp1 = _row_value(row, "tp1", 6)
-        tp2 = _row_value(row, "tp2", 7)
-        status = _row_value(row, "trade_status", 8)
-        opened_at = _row_value(row, "opened_at", 9)
+    # 1. مراقبة صفقات M15 / H4
+    for table in ["signal_logs", "scalp_signal_logs"]:
+        rows = fetch_open_trades(table=table)
+        for row in rows:
+            signal_type = _row_value(row, "signal_type", 2)
+            entry = _row_value(row, "live_execution_price", 4)
+            sl = _row_value(row, "sl", 5)
+            tp1 = _row_value(row, "tp1", 6)
+            tp2 = _row_value(row, "tp2", 7)
+            status = _row_value(row, "trade_status", 8)
+            opened_at = _row_value(row, "opened_at", 9)
 
-        if opened_at:
-            try:
-                opened = ensure_utc_timestamp(opened_at).to_pydatetime()
-                if now - opened > timedelta(minutes=TRADE_EXPIRY_MINUTES):
-                    update_trade_state(row, "EXPIRED")
+            if opened_at:
+                try:
+                    opened = ensure_utc_timestamp(opened_at).to_pydatetime()
+                    exp_mins = 60 if table == "scalp_signal_logs" else TRADE_EXPIRY_MINUTES
+                    if now - opened > timedelta(minutes=exp_mins):
+                        update_trade_state(row, "EXPIRED", table=table)
+                        continue
+                except Exception:
+                    pass
+
+            if signal_type == "BUY":
+                if live_price >= tp2:
+                    r = calculate_trade_r(signal_type, entry, tp2, sl)
+                    update_trade_state(row, "TP2_HIT", tp2, r, table=table)
                     continue
-            except Exception:
-                pass
 
-        if signal_type == "BUY":
-            if live_price >= tp2:
-                r = calculate_trade_r(signal_type, entry, tp2, sl)
-                update_trade_state(row, "TP2_HIT", tp2, r)
-                continue
+                if live_price <= sl:
+                    r = calculate_trade_r(signal_type, entry, sl, sl)
+                    update_trade_state(row, "SL_HIT", sl, r, table=table)
+                    continue
 
-            if live_price <= sl:
-                r = calculate_trade_r(signal_type, entry, sl, sl)
-                update_trade_state(row, "SL_HIT", sl, r)
-                continue
+                if status == "OPEN" and live_price >= tp1:
+                    r = calculate_trade_r(signal_type, entry, tp1, sl)
+                    update_trade_state(row, "TP1_HIT", tp1, r, table=table)
 
-            if status == "OPEN" and live_price >= tp1:
-                r = calculate_trade_r(signal_type, entry, tp1, sl)
-                update_trade_state(row, "TP1_HIT", tp1, r)
+            elif signal_type == "SELL":
+                if live_price <= tp2:
+                    r = calculate_trade_r(signal_type, entry, tp2, sl)
+                    update_trade_state(row, "TP2_HIT", tp2, r, table=table)
+                    continue
 
-        elif signal_type == "SELL":
-            if live_price <= tp2:
-                r = calculate_trade_r(signal_type, entry, tp2, sl)
-                update_trade_state(row, "TP2_HIT", tp2, r)
-                continue
+                if live_price >= sl:
+                    r = calculate_trade_r(signal_type, entry, sl, sl)
+                    update_trade_state(row, "SL_HIT", sl, r, table=table)
+                    continue
 
-            if live_price >= sl:
-                r = calculate_trade_r(signal_type, entry, sl, sl)
-                update_trade_state(row, "SL_HIT", sl, r)
-                continue
-
-            if status == "OPEN" and live_price <= tp1:
-                r = calculate_trade_r(signal_type, entry, tp1, sl)
-                update_trade_state(row, "TP1_HIT", tp1, r)
+                if status == "OPEN" and live_price <= tp1:
+                    r = calculate_trade_r(signal_type, entry, tp1, sl)
+                    update_trade_state(row, "TP1_HIT", tp1, r, table=table)
 
 
 # ---------------------------------------------------------------------------
@@ -1454,7 +1436,7 @@ def get_cached_candle_decision(candle_id):
 
 
 # ---------------------------------------------------------------------------
-# محرك توليد الإشارات الكمية الرئيسية (M15 Quant Engine)
+# محرك توليد الإشارات الكمية الرئيسية (M15 / H4 Engine)
 # ---------------------------------------------------------------------------
 
 def wait_result(reason, quality_state, price=None):
@@ -1470,7 +1452,6 @@ def generate_quant_signal():
     with SIGNAL_GENERATION_LOCK:
         (
             df_m15,
-            _,
             macro_data,
             fetch_time,
             _,
@@ -1509,7 +1490,7 @@ def generate_quant_signal():
         closed_time = ensure_utc_timestamp(df_closed.index[-1])
         candle_id = f"XAUUSD_{closed_time.strftime('%Y%m%d_%H%M')}"
 
-        persisted = get_signal_by_candle(candle_id)
+        persisted = get_signal_by_candle(candle_id, table="signal_logs")
         if persisted:
             cached = get_cached_candle_decision(candle_id)
             if cached:
@@ -1588,11 +1569,13 @@ def generate_quant_signal():
 
         if smc["bos_bullish"] or smc["choch_bullish"]:
             buy_score += 3
+
         if smc["bos_bearish"] or smc["choch_bearish"]:
             sell_score += 3
 
         if smc["fvg_bullish"] or smc["sweep_bullish"]:
             buy_score += 2
+
         if smc["fvg_bearish"] or smc["sweep_bearish"]:
             sell_score += 2
 
@@ -1652,7 +1635,6 @@ def generate_quant_signal():
 
         result = {
             "status": "SUCCESS",
-            "timeframe": "M15",
             "quality_state": quality_state,
             "candle_id": candle_id,
             "signal": signal_type,
@@ -1682,7 +1664,7 @@ def generate_quant_signal():
                 round(tp1, 2),
                 round(tp2, 2),
                 quality_state,
-                timeframe="M15",
+                table="signal_logs"
             )
             if not inserted:
                 return wait_result(
@@ -1696,155 +1678,122 @@ def generate_quant_signal():
 
 
 # ---------------------------------------------------------------------------
-# محرك صفقات الخمس دقائق السريعة (M5 Scalping Engine)
+# محرك صفقات السكالبينج السريعة المطور (M5 Instant Scalping Engine)
 # ---------------------------------------------------------------------------
 
 def generate_m5_scalp_signal():
-    with SIGNAL_GENERATION_LOCK:
-        (
-            df_m15,
-            df_m5,
-            macro_data,
-            fetch_time,
-            _,
-            _,
-            _,
-            _,
-            _,
-        ) = SNAPSHOT_CACHE.get_snapshot()
+    """محرك خاص بإنتاج صفقات دخول فوري (Scalping) على فريم 5 دقائق مع تحليل شامل للسوق"""
+    (
+        df_m15,
+        macro_data,
+        fetch_time,
+        _,
+        _,
+        _,
+        _,
+        _,
+    ) = SNAPSHOT_CACHE.get_snapshot()
 
-        quality_state, quality_reason = evaluate_data_quality(
-            df_m15,
-            macro_data,
-            fetch_time,
+    quality_state, quality_reason = evaluate_data_quality(df_m15, macro_data, fetch_time)
+    if quality_state in {DataQualityState.INVALID, DataQualityState.STALE, DataQualityState.NEWS_BLACKOUT}:
+        return wait_result(quality_reason, quality_state, macro_data.get("gold_spot"))
+
+    # جلب بيانات فريم 5 دقائق M5 مباشرة من أسرع مصدر
+    df_m5 = download_yf(GOLD_SYMBOL, "3d", "5m")
+    if df_m5.empty or len(df_m5) < 30:
+        df_m5 = download_yf("GLD", "3d", "5m")
+
+    if df_m5.empty or len(df_m5) < 30:
+        return wait_result("تعذر جلب شمعات M5 للسكالبينج السريع.", DataQualityState.INVALID, macro_data.get("gold_spot"))
+
+    df_m5_closed = clean_df_columns(df_m5)
+    closed_time = ensure_utc_timestamp(df_m5_closed.index[-1])
+    candle_id = f"XAUUSD_M5_{closed_time.strftime('%Y%m%d_%H%M')}"
+
+    # تحليل SMC على فريم 5 دقائق
+    smc_m5 = detect_institutional_smc(df_m5_closed)
+
+    # تحليل اتجاه H4 لربطه بالسكالبينج
+    df_h4 = resample_m15_to_h4(df_m15)
+    h4_trend = "NEUTRAL"
+    if len(df_h4) >= 15:
+        close_h4 = to_1d_series(df_h4["Close"])
+        ema50 = ta.trend.EMAIndicator(close_h4, window=50).ema_indicator().iloc[-1] if len(close_h4) >= 50 else close_h4.mean()
+        ema200 = ta.trend.EMAIndicator(close_h4, window=200).ema_indicator().iloc[-1] if len(close_h4) >= 200 else close_h4.mean()
+        h4_trend = "BULLISH" if ema50 > ema200 else "BEARISH" if ema50 < ema200 else "NEUTRAL"
+
+    live_execution_price = macro_data.get("gold_spot")
+    if live_execution_price is None or live_execution_price <= 0:
+        return wait_result("سعر التداول المباشر غير متاح حالياً.", DataQualityState.INVALID)
+
+    # حساب مؤشر ATR المخصص بفريم 5 دقائق لحساب ستوب وتارغت خاطف
+    atr_m5 = ta.volatility.AverageTrueRange(
+        df_m5_closed["High"], df_m5_closed["Low"], df_m5_closed["Close"], window=14
+    ).average_true_range().iloc[-1]
+
+    if pd.isna(atr_m5) or atr_m5 <= 0:
+        atr_m5 = 2.0  # القيمة الافتراضية للسكالبينج إذا متعذر الحساب
+
+    # معايير دخول السكالبينج المرنة والدقيقة
+    scalp_buy_score = (2 if h4_trend == "BULLISH" else 0) + (3 if smc_m5["bos_bullish"] or smc_m5["choch_bullish"] else 0) + (2 if smc_m5["ob_bullish"] or smc_m5["fvg_bullish"] or smc_m5["sweep_bullish"] else 0) + (1 if smc_m5["is_discount"] else 0)
+    scalp_sell_score = (2 if h4_trend == "BEARISH" else 0) + (3 if smc_m5["bos_bearish"] or smc_m5["choch_bearish"] else 0) + (2 if smc_m5["ob_bearish"] or smc_m5["fvg_bearish"] or smc_m5["sweep_bearish"] else 0) + (1 if smc_m5["is_premium"] else 0)
+
+    signal_type = "HOLD"
+
+    if h4_trend == "BULLISH" and scalp_buy_score >= 4:
+        signal_type = "BUY"
+    elif h4_trend == "BEARISH" and scalp_sell_score >= 4:
+        signal_type = "SELL"
+    elif scalp_buy_score >= 5 and scalp_sell_score < 3:
+        signal_type = "BUY"
+    elif scalp_sell_score >= 5 and scalp_buy_score < 3:
+        signal_type = "SELL"
+
+    if signal_type == "BUY":
+        exec_price = macro_data.get("gold_ask") or live_execution_price
+        sl = round(exec_price - max(1.8, atr_m5 * 1.0), 2)
+        tp1 = round(exec_price + max(2.0, atr_m5 * 1.2), 2)
+        tp2 = round(exec_price + max(4.0, atr_m5 * 2.2), 2)
+    elif signal_type == "SELL":
+        exec_price = macro_data.get("gold_bid") or live_execution_price
+        sl = round(exec_price + max(1.8, atr_m5 * 1.0), 2)
+        tp1 = round(exec_price - max(2.0, atr_m5 * 1.2), 2)
+        tp2 = round(exec_price - max(4.0, atr_m5 * 2.2), 2)
+    else:
+        exec_price = live_execution_price
+        sl = tp1 = tp2 = 0.0
+
+    result = {
+        "status": "SUCCESS",
+        "quality_state": quality_state,
+        "candle_id": candle_id,
+        "signal": signal_type,
+        "h4_trend": h4_trend,
+        "buy_score": scalp_buy_score,
+        "sell_score": scalp_sell_score,
+        "smc": smc_m5,
+        "live_execution_price": round(exec_price, 2),
+        "sl": round(sl, 2),
+        "tp1": round(tp1, 2),
+        "tp2": round(tp2, 2),
+        "dxy": round(macro_data["dxy"], 2) if macro_data["dxy"] is not None else None,
+        "us10y": round(macro_data["us10y"], 2) if macro_data["us10y"] is not None else None,
+    }
+
+    if signal_type in {"BUY", "SELL"}:
+        log_signal_to_db(
+            candle_id,
+            signal_type,
+            round(float(df_m5_closed["Close"].iloc[-1]), 2),
+            round(exec_price, 2),
+            round(sl, 2),
+            round(tp1, 2),
+            round(tp2, 2),
+            quality_state,
+            table="scalp_signal_logs"
         )
 
-        if quality_state in {
-            DataQualityState.INVALID,
-            DataQualityState.STALE,
-            DataQualityState.GAP,
-            DataQualityState.NEWS_BLACKOUT,
-        }:
-            return wait_result(
-                quality_reason,
-                quality_state,
-                macro_data.get("gold_spot"),
-            )
-
-        df_closed_m5 = get_verified_closed_m5_dataframe(df_m5)
-        df_closed_m15 = get_verified_closed_m15_dataframe(df_m15)
-
-        if df_closed_m5.empty or len(df_closed_m5) < 20:
-            return wait_result(
-                "بيانات فريم M5 غير كافية حالياً.",
-                DataQualityState.INVALID,
-                macro_data.get("gold_spot"),
-            )
-
-        closed_time = ensure_utc_timestamp(df_closed_m5.index[-1])
-        candle_id = f"XAUUSD_M5_{closed_time.strftime('%Y%m%d_%H%M')}"
-
-        persisted = get_signal_by_candle(candle_id)
-        if persisted:
-            cached = get_cached_candle_decision(candle_id)
-            if cached:
-                return cached
-            return wait_result(
-                f"شمعة M5 رقم {candle_id} قيمت سلفاً.",
-                quality_state,
-                macro_data.get("gold_spot"),
-            )
-
-        df_h4 = resample_m15_to_h4(df_closed_m15)
-        if len(df_h4) >= 15:
-            close_h4 = to_1d_series(df_h4["Close"])
-            ema50 = ta.trend.EMAIndicator(close_h4, window=50).ema_indicator().iloc[-1] if len(close_h4) >= 50 else float(close_h4.mean())
-            ema200 = ta.trend.EMAIndicator(close_h4, window=200).ema_indicator().iloc[-1] if len(close_h4) >= 200 else float(close_h4.mean())
-            h4_trend = "BULLISH" if ema50 > ema200 else "BEARISH" if ema50 < ema200 else "NEUTRAL"
-        else:
-            h4_trend = "NEUTRAL"
-
-        smc_m5 = detect_institutional_smc(df_closed_m5)
-        live_price = macro_data.get("gold_spot")
-
-        if live_price is None or not np.isfinite(live_price) or live_price <= 0:
-            return wait_result(
-                "سعر التنفيذ المباشر غير متاح حالياً.",
-                DataQualityState.INVALID,
-                None,
-            )
-
-        # شروط السكالبينج السريعة المبتكرة بناء على M5
-        scalp_signal = "HOLD"
-
-        if h4_trend in {"BULLISH", "NEUTRAL"}:
-            if smc_m5["ob_bullish"] or smc_m5["fvg_bullish"] or smc_m5["sweep_bullish"] or smc_m5["choch_bullish"]:
-                if not smc_m5["is_premium"]:
-                    scalp_signal = "BUY"
-
-        if scalp_signal == "HOLD" and h4_trend in {"BEARISH", "NEUTRAL"}:
-            if smc_m5["ob_bearish"] or smc_m5["fvg_bearish"] or smc_m5["sweep_bearish"] or smc_m5["choch_bearish"]:
-                if not smc_m5["is_discount"]:
-                    scalp_signal = "SELL"
-
-        atr_m5 = ta.volatility.AverageTrueRange(
-            df_closed_m5["High"], df_closed_m5["Low"], df_closed_m5["Close"], window=14
-        ).average_true_range().iloc[-1]
-
-        if pd.isna(atr_m5) or atr_m5 <= 0:
-            atr_m5 = 2.0
-
-        if scalp_signal == "BUY":
-            exec_price = macro_data.get("gold_ask") or live_price
-            sl = round(exec_price - (atr_m5 * 1.0), 2)
-            tp1 = round(exec_price + (atr_m5 * 1.2), 2)
-            tp2 = round(exec_price + (atr_m5 * 2.5), 2)
-        elif scalp_signal == "SELL":
-            exec_price = macro_data.get("gold_bid") or live_price
-            sl = round(exec_price + (atr_m5 * 1.0), 2)
-            tp1 = round(exec_price - (atr_m5 * 1.2), 2)
-            tp2 = round(exec_price - (atr_m5 * 2.5), 2)
-        else:
-            exec_price = live_price
-            sl = tp1 = tp2 = 0.0
-
-        result = {
-            "status": "SUCCESS",
-            "timeframe": "M5",
-            "quality_state": quality_state,
-            "candle_id": candle_id,
-            "signal": scalp_signal,
-            "h4_trend": h4_trend,
-            "smc": smc_m5,
-            "live_execution_price": round(exec_price, 2),
-            "price": round(exec_price, 2),
-            "sl": round(sl, 2),
-            "tp1": round(tp1, 2),
-            "tp2": round(tp2, 2),
-        }
-
-        if scalp_signal in {"BUY", "SELL"}:
-            signal_candle_close = float(df_closed_m5["Close"].iloc[-1])
-            inserted = log_signal_to_db(
-                candle_id,
-                scalp_signal,
-                round(signal_candle_close, 2),
-                round(exec_price, 2),
-                round(sl, 2),
-                round(tp1, 2),
-                round(tp2, 2),
-                quality_state,
-                timeframe="M5",
-            )
-            if not inserted:
-                return wait_result(
-                    f"شمعة M5 رقم {candle_id} مسجلة سلفاً.",
-                    quality_state,
-                    exec_price,
-                )
-
-        mark_candle_evaluated(candle_id, result)
-        return result
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1968,100 +1917,80 @@ def run_backtest_simulation(initial_balance=10000.0, risk_per_trade=0.01):
 def main_keyboard():
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("📊 تحليل لحظي"), KeyboardButton("⚡ توليد إشارة M15")],
-            [KeyboardButton("🔥 سكالبينج M5 فوري"), KeyboardButton("💼 الصفقات المفتوحة")],
-            [KeyboardButton("📈 إحصائيات الأداء"), KeyboardButton("🛡️ حالة النظام")],
-            [KeyboardButton("🔔 اشتراك/إلغاء")],
+            [KeyboardButton("📊 تحليل لحظي"), KeyboardButton("⚡ توليد إشارة")],
+            [KeyboardButton("⚡ صفقة سريعة (M5)"), KeyboardButton("📊 إحصائيات السكالبينج")],
+            [KeyboardButton("📈 إحصائيات الأداء"), KeyboardButton("💼 الصفقات المفتوحة")],
+            [KeyboardButton("🛡️ حالة النظام"), KeyboardButton("🔔 اشتراك/إلغاء")],
         ],
         resize_keyboard=True,
     )
 
 
-def get_performance_stats_report():
+def get_performance_stats_report(table="signal_logs", title="تقرير الأداء وإحصائيات البوت (M15/H4)"):
     conn = get_db_connection()
     try:
         cur = conn.cursor()
-        
-        # 1. جلب إحصائيات M15
         cur.execute(
-            """
+            f"""
             SELECT trade_status, realized_r, count(*) 
-            FROM signal_logs 
-            WHERE trade_status != 'OPEN' AND (timeframe = 'M15' OR timeframe IS NULL)
+            FROM {table} 
+            WHERE trade_status != 'OPEN'
             GROUP BY trade_status, realized_r
             """
         )
-        rows_m15 = cur.fetchall()
+        rows = cur.fetchall()
 
-        # 2. جلب إحصائيات M5 منفصلة
-        cur.execute(
-            """
-            SELECT trade_status, realized_r, count(*) 
-            FROM signal_logs 
-            WHERE trade_status != 'OPEN' AND timeframe = 'M5'
-            GROUP BY trade_status, realized_r
-            """
-        )
-        rows_m5 = cur.fetchall()
+        total_trades = 0
+        tp1_hits = 0
+        tp2_hits = 0
+        sl_hits = 0
+        total_r = 0.0
 
-        def compute_metrics(rows):
-            total_trades = 0
-            tp1_hits = 0
-            tp2_hits = 0
-            sl_hits = 0
-            total_r = 0.0
+        for row in rows:
+            status = _row_value(row, "trade_status", 0)
+            r_val = _row_value(row, "realized_r", 1) or 0.0
+            count = _row_value(row, "count(*)", 2) or 0
 
-            for row in rows:
-                status = _row_value(row, "trade_status", 0)
-                r_val = _row_value(row, "realized_r", 1) or 0.0
-                count = _row_value(row, "count(*)", 2) or 0
+            total_trades += count
+            if status == "TP1_HIT":
+                tp1_hits += count
+            elif status == "TP2_HIT":
+                tp2_hits += count
+            elif status == "SL_HIT":
+                sl_hits += count
 
-                total_trades += count
-                if status == "TP1_HIT":
-                    tp1_hits += count
-                elif status == "TP2_HIT":
-                    tp2_hits += count
-                elif status == "SL_HIT":
-                    sl_hits += count
+            total_r += (r_val * count)
 
-                total_r += (r_val * count)
-
-            wins = tp1_hits + tp2_hits
-            win_rate = (wins / total_trades * 100) if total_trades > 0 else 0.0
-            return total_trades, tp1_hits, tp2_hits, sl_hits, win_rate, total_r
-
-        m15_tot, m15_tp1, m15_tp2, m15_sl, m15_wr, m15_r = compute_metrics(rows_m15)
-        m5_tot, m5_tp1, m5_tp2, m5_sl, m5_wr, m5_r = compute_metrics(rows_m5)
+        wins = tp1_hits + tp2_hits
+        win_rate = (wins / total_trades * 100) if total_trades > 0 else 0.0
 
         text = (
-            "📈 <b>نظام التقارير والإحصائيات المستقل v3.5</b>\n"
+            f"📈 <b>{title}</b>\n"
             "───────────────────────\n"
-            "🏆 <b>1. صفقات M15/H4 الرئيسية:</b>\n"
-            f"• إجمالي الصفقات المغلقة: <code>{m15_tot}</code>\n"
-            f"• أهداف محققة (TP1 / TP2): <code>{m15_tp1} / {m15_tp2}</code>\n"
-            f"• ضرب وقف الخسارة (SL): <code>{m15_sl}</code>\n"
-            f"• نسبة النجاح: <code>{m15_wr:.1f}%</code> | العائد: <code>+{m15_r:.2f}R</code>\n"
-            "───────────────────────\n"
-            "⚡ <b>2. صفقات السكالبينج M5 السريعة:</b>\n"
-            f"• إجمالي الصفقات المغلقة: <code>{m5_tot}</code>\n"
-            f"• أهداف محققة (TP1 / TP2): <code>{m5_tp1} / {m5_tp2}</code>\n"
-            f"• ضرب وقف الخسارة (SL): <code>{m5_sl}</code>\n"
-            f"• نسبة النجاح: <code>{m5_wr:.1f}%</code> | العائد: <code>+{m5_r:.2f}R</code>\n"
+            f"🔢 <b>إجمالي الصفقات المغلقة:</b> <code>{total_trades}</code>\n"
+            f"🎯 <b>أهداف TP1 محققة:</b> <code>{tp1_hits}</code>\n"
+            f"🚀 <b>أهداف TP2 محققة:</b> <code>{tp2_hits}</code>\n"
+            f"🛑 <b>ضرب وقف الخسارة SL:</b> <code>{sl_hits}</code>\n"
+            f"📊 <b>نسبة النجاح العامة:</b> <code>{win_rate:.1f}%</code>\n"
+            f"🏆 <b>إجمالي العائد المحقق (Total R):</b> <code>+{total_r:.2f}R</code>\n"
         )
         return text
     except Exception as exc:
-        logger.error("خطأ في تقرير الأداء: %s", exc)
+        logger.error("خطأ في تقرير الأداء لجدول %s: %s", table, exc)
         return "⚠️ حدث خطأ أثناء استخراج إحصائيات الأداء."
     finally:
         release_db_connection(conn)
 
 
 def get_active_trades_report():
-    rows = fetch_open_trades()
+    rows_m15 = fetch_open_trades(table="signal_logs")
+    rows_m5 = fetch_open_trades(table="scalp_signal_logs")
+    rows = rows_m15 + rows_m5
+
     if not rows:
         return "💼 <b>لا توجد صفقات مفتوحة حالياً.</b>"
 
-    _, _, macro_data, _, _, _, _, _, _ = SNAPSHOT_CACHE.get_snapshot()
+    _, macro_data, _, _, _, _, _, _ = SNAPSHOT_CACHE.get_snapshot()
     live_price = macro_data.get("gold_spot") or 0.0
 
     text = f"💼 <b>الصَّفَقَات المَفْتُوحَة حَالِيّاً ({len(rows)})</b>\n"
@@ -2075,14 +2004,13 @@ def get_active_trades_report():
         tp1 = _row_value(row, "tp1", 6)
         tp2 = _row_value(row, "tp2", 7)
         status = _row_value(row, "trade_status", 8)
-        tf = _row_value(row, "timeframe", 10) or "M15"
 
         pnl_pips = (live_price - entry) if sig_type == "BUY" else (entry - live_price)
         emoji = "🟢" if pnl_pips >= 0 else "🔴"
         sig_ar = "شراء 🟢" if sig_type == "BUY" else "بيع 🔴"
 
         text += (
-            f"🆔 <b>[{tf}] {candle_id}</b> ({sig_ar})\n"
+            f"🆔 <b>{candle_id}</b> ({sig_ar})\n"
             f"💵 <b>الدخول:</b> <code>${entry:.2f}</code> | <b>الحالي:</b> <code>${live_price:.2f}</code>\n"
             f"📊 <b>النتيجة اللحظية:</b> {emoji} <code>{pnl_pips:+.2f}$</code>\n"
             f"🎯 <b>TP1:</b> <code>${tp1:.2f}</code> | <b>TP2:</b> <code>${tp2:.2f}</code>\n"
@@ -2103,12 +2031,15 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(user.id, user.username, user.first_name)
 
     text = (
-        f"👋 أهلاً بك يا <b>{safe_name}</b> في بوت التداول الكمي المتقدم XAUUSD Quant v3.5.\n\n"
-        "<b>الميزات المحدثة والمستقلة:</b>\n"
-        "• <b>صفقات M15 الرئيسية:</b> صفقات اتجاهية ذات أهداف كبيرة بفلترة صارمة.\n"
-        "• <b>صفقات M5 السكالبينج:</b> إشارات دخول فورية (NOW) لاقتناص الحركة السريعة.\n"
-        "• <b>نظام حسابات مستقل:</b> فصل إحصائيات M5 عن M15 تماماً في قواعد البيانات.\n"
-        "• <b>تطبيق أسعار المنصة Mkt Price:</b> تنفيذ مباشر بدون انتظار سعر محدد.\n\n"
+        f"👋 أهلاً بك يا <b>{safe_name}</b> في بوت التداول الكمي المتقدم XAUUSD Quant v3.0.\n\n"
+        "<b>الميزات النشطة تلقائياً:</b>\n"
+        "• <b>أسعار التداول المباشرة:</b> ربط متطابق مع أسعار سبوت الذهب (XAUUSD) في منصات التداول.\n"
+        "• <b>صفقات دخول فوري M5:</b> زر مخصص لاقتناص الصفقات الخاطفة بالسعر اللحظي.\n"
+        "• <b>إحصائيات منفصلة:</b> تقارير أداء مستقلة للسكالبينج والصفقات الرئيسية.\n"
+        "• <b>فلتر الأخبار الاقتصادية:</b> حظر التداول أثناء صدور بيانات USD الهامة وعطلات السوق.\n"
+        "• <b>حساب الفارق السعري:</b> احتساب دقيق لأسعار العرض والطلب (Bid/Ask).\n"
+        "• <b>التحليل المؤسسي (SMC):</b> تتبع مناطق الطلب والعرض والكشوف السعرية.\n"
+        "• <b>محرك الاختبار العكسي:</b> تقييم استراتيجيات التداول باستمرار.\n\n"
         "اختر خياراً من القائمة أدناه للبدء:"
     )
     await update.message.reply_text(
@@ -2187,12 +2118,12 @@ async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     slippage_str = f"{res['slippage']:.2f}"
 
     text = (
-        f"⚡ <b>الإشارة الكمية الرئيسية [M15]: {sig_ar}</b>\n"
+        f"⚡ <b>الإشارة الكمية الرئيسية: {sig_ar}</b>\n"
         "───────────────────────\n"
         f"🆔 <b>معرف الشمعة:</b> <code>{res['candle_id']}</code>\n"
-        f"🔥 <b>نوع الدخول:</b> <code>ادخل فوراً بالسعر الحالي (Market NOW)</code>\n"
-        f"💵 <b>سعر المنصة المباشر الآن:</b> <code>${live_price_str}</code>\n"
+        f"💵 <b>سعر الدخول (منصة التداول):</b> <code>${live_price_str}</code>\n"
         f"📉 <b>إغلاق الشمعة:</b> <code>${close_price_str}</code>\n"
+        f"📐 <b>الانزلاق السعري:</b> <code>${slippage_str}</code>\n"
         f"🛡️ <b>جودة البيانات:</b> <code>{quality_ar}</code>\n"
         "───────────────────────\n"
     )
@@ -2212,36 +2143,45 @@ async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def m5_scalp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالج طلب صفقة سكالبينج دخول فوري على فريم 5 دقائق"""
     res = await asyncio.to_thread(generate_m5_scalp_signal)
 
     if res["status"] == "WAIT":
         await update.message.reply_text(
-            f"⚠️ <b>حالة السكالبينج (M5):</b>\n{html.escape(res['reason'])}",
+            f"⚠️ <b>حالة السكالبينج (انتظار):</b>\n{html.escape(res['reason'])}",
             parse_mode=ParseMode.HTML,
         )
         return
 
     sig = res["signal"]
-    sig_ar = "شراء سريع 🟢" if sig == "BUY" else "بيع سريع 🔴" if sig == "SELL" else "انتظار (لا توجد فرصة M5) 🟡"
+    sig_ar = "شراء فوري 🟢" if sig == "BUY" else "بيع فوري 🔴" if sig == "SELL" else "انتظار (HOLD) 🟡"
+    smc = res["smc"]
 
     text = (
-        f"🔥 <b>إشارة السكالبينج السريعة [M5]: {sig_ar}</b>\n"
+        f"🚀 <b>توصية دخول فوري (M5 Scalp): {sig_ar}</b>\n"
         "───────────────────────\n"
-        f"🆔 <b>معرف الشمعة:</b> <code>{res['candle_id']}</code>\n"
-        f"🚨 <b>التعليمات:</b> <code>ادخل فوراً بالسعر الحالي بدون تأخير (NOW)!</code>\n"
-        f"💵 <b>سعر التنفيذ المباشر الآن:</b> <code>${res['live_execution_price']:.2f}</code>\n"
+        f"🆔 <b>معرف الصفقة:</b> <code>{res['candle_id']}</code>\n"
+        f"⚡ <b>التوجيه المباشر:</b> <code>ادخل فوراً بالسعر الحالي دون انتظار!</code>\n"
+        f"💵 <b>سعر التنفيذ اللحظي:</b> <code>${res['live_execution_price']:.2f}</code>\n"
         "───────────────────────\n"
     )
 
     if sig in {"BUY", "SELL"}:
         text += (
             f"🛑 <b>وقف الخسارة (SL):</b> <code>${res['sl']:.2f}</code>\n"
-            f"🎯 <b>الهدف الأول (TP1):</b> <code>${res['tp1']:.2f}</code>\n"
+            f"🎯 <b>الهدف الأول الخاطف (TP1):</b> <code>${res['tp1']:.2f}</code>\n"
             f"🎯 <b>الهدف الثاني (TP2):</b> <code>${res['tp2']:.2f}</code>\n"
-            f"🧭 <b>اتجاه H4 العام:</b> <code>{res['h4_trend']}</code>\n"
+            "───────────────────────\n"
+            "📊 <b>التحليل الشامل للسوق (M5/H4):</b>\n"
+            f"• <b>اتجاه H4 العام:</b> <code>{res['h4_trend']}</code>\n"
+            f"• <b>منطقة طلب (Order Block):</b> <code>{'نعم ✅' if smc['ob_bullish'] else 'لا ❌'}</code>\n"
+            f"• <b>منطقة عرض (Order Block):</b> <code>{'نعم ✅' if smc['ob_bearish'] else 'لا ❌'}</code>\n"
+            f"• <b>نطاق الخصم (Discount):</b> <code>{'نعم ✅' if smc['is_discount'] else 'لا ❌'}</code>\n"
+            f"• <b>نطاق العلاوة (Premium):</b> <code>{'نعم ✅' if smc['is_premium'] else 'لا ❌'}</code>\n"
+            f"• <b>كسر هيكل (BOS/CHoCH):</b> <code>{'صاعد ✅' if smc['bos_bullish'] or smc['choch_bullish'] else 'هابط 🔻' if smc['bos_bearish'] or smc['choch_bearish'] else 'لا يوجد ❌'}</code>\n"
         )
     else:
-        text += "⚠️ <b>القرار:</b> <code>لا توجد فرصة سكالبينج متكاملة الآن (HOLD)</code>\n"
+        text += "⚠️ <b>حالة السوق السريع:</b> <code>لا توجد فرصة سكالبينج مكتملة الشروط الآن.</code>\n"
 
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -2249,7 +2189,6 @@ async def m5_scalp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     (
         df_m15,
-        df_m5,
         macro,
         fetch_time,
         last_full,
@@ -2268,6 +2207,9 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     closed_df = get_verified_closed_m15_dataframe(df_m15)
+    if closed_df.empty and not df_m15.empty:
+        closed_df = df_m15
+
     last_candle = (
         closed_df.index[-1].isoformat()
         if not closed_df.empty
@@ -2284,11 +2226,11 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     us10y_str = f"{macro.get('us10y'):.2f}%" if macro.get("us10y") is not None else "غير متاح"
 
     text = (
-        "🛡️ <b>حالة النظام والخدمة v3.5</b>\n"
+        "🛡️ <b>حالة النظام والخدمة v3.0</b>\n"
         "───────────────────────\n"
         f"⚙️ <b>العامل الخفي (Worker):</b> <code>{worker_status_ar}</code>\n"
         f"👥 <b>المشتركون في الإشارات:</b> <code>{len(subscribers)}</code>\n"
-        f"🧠 <b>شمعات M15 / M5 بالذاكرة:</b> <code>{len(df_m15)} / {len(df_m5)}</code>\n"
+        f"🧠 <b>الشمعات المقيمة بالذاكرة:</b> <code>{len(df_m15)}</code>\n"
         f"💵 <b>سعر الذهب المباشر (منصة التداول):</b> <code>${gold_spot}</code>\n"
         f"💵 <b>أسعار الطلب/العرض:</b> <code>${gold_bid} / ${gold_ask}</code>\n"
         f"📊 <b>مؤشر الدولار (DXY):</b> <code>{dxy_val}</code>\n"
@@ -2339,12 +2281,15 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if text == "📊 تحليل لحظي":
         await analyze_cmd(update, context)
-    elif text == "⚡ توليد إشارة M15":
+    elif text == "⚡ توليد إشارة":
         await signal_cmd(update, context)
-    elif text == "🔥 سكالبينج M5 فوري":
+    elif text == "⚡ صفقة سريعة (M5)":
         await m5_scalp_cmd(update, context)
+    elif text == "📊 إحصائيات السكالبينج":
+        report = get_performance_stats_report(table="scalp_signal_logs", title="تقرير إحصائيات صفقات السكالبينج السريعة (M5)")
+        await update.message.reply_text(report, parse_mode=ParseMode.HTML)
     elif text == "📈 إحصائيات الأداء":
-        report = get_performance_stats_report()
+        report = get_performance_stats_report(table="signal_logs", title="تقرير الأداء وإحصائيات البوت (M15/H4)")
         await update.message.reply_text(report, parse_mode=ParseMode.HTML)
     elif text == "💼 الصفقات المفتوحة":
         report = get_active_trades_report()
@@ -2367,14 +2312,15 @@ async def auto_signal_job(context: ContextTypes.DEFAULT_TYPE):
             users = get_subscribed_users()
             sig = res["signal"]
             emoji = "🟢" if sig == "BUY" else "🔴"
-            sig_ar = "شراء رئيسي" if sig == "BUY" else "بيع رئيسي"
+            sig_ar = "شراء" if sig == "BUY" else "بيع"
 
             message = (
-                f"🚨 {emoji} <b>إشارة M15 تلقائية جديدة: {sig_ar}</b>\n"
+                f"🚨 {emoji} <b>إشارة تلقائية جديدة: {sig_ar}</b>\n"
                 "───────────────────────\n"
                 f"🆔 <b>معرف الشمعة:</b> <code>{res['candle_id']}</code>\n"
-                f"🔥 <b>التنفيذ:</b> <code>ادخل فوراً بالسعر الحالي (NOW)!</code>\n"
-                f"💵 <b>سعر الدخول المباشر:</b> <code>${res['live_execution_price']:.2f}</code>\n"
+                f"💵 <b>سعر الدخول (منصة التداول):</b> <code>${res['live_execution_price']:.2f}</code>\n"
+                f"📉 <b>إغلاق الشمعة:</b> <code>${res['signal_candle_close']:.2f}</code>\n"
+                f"📐 <b>الانزلاق السعري:</b> <code>${res['slippage']:.2f}</code>\n"
                 f"🛑 <b>وقف الخسارة (SL):</b> <code>${res['sl']:.2f}</code>\n"
                 f"🎯 <b>الهدف الأول (TP1):</b> <code>${res['tp1']:.2f}</code>\n"
                 f"🎯 <b>الهدف الثاني (TP2):</b> <code>${res['tp2']:.2f}</code>\n"
@@ -2392,42 +2338,7 @@ async def auto_signal_job(context: ContextTypes.DEFAULT_TYPE):
                     logger.warning("فشل البث للمستخدم %s: %s", uid, exc)
 
     except Exception as exc:
-        logger.exception("فشلت وظيفة البث التلقائي للإشارات الرئيسية: %s", exc)
-
-
-async def auto_m5_scalp_job(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        res = await asyncio.to_thread(generate_m5_scalp_signal)
-
-        if res["status"] == "SUCCESS" and res["signal"] in {"BUY", "SELL"}:
-            users = get_subscribed_users()
-            sig = res["signal"]
-            emoji = "🟢" if sig == "BUY" else "🔴"
-            sig_ar = "شراء سكالبينج" if sig == "BUY" else "بيع سكالبينج"
-
-            message = (
-                f"🔥 {emoji} <b>إشارة سكالبينج M5 سريعة: {sig_ar}</b>\n"
-                "───────────────────────\n"
-                f"🆔 <b>معرف الشمعة:</b> <code>{res['candle_id']}</code>\n"
-                f"🚨 <b>التعليمات:</b> <code>ادخل فوراً بالسعر الحالي دون تأخير (NOW)!</code>\n"
-                f"💵 <b>سعر المنصة المباشر الآن:</b> <code>${res['live_execution_price']:.2f}</code>\n"
-                f"🛑 <b>وقف الخسارة (SL):</b> <code>${res['sl']:.2f}</code>\n"
-                f"🎯 <b>الهدف الأول (TP1):</b> <code>${res['tp1']:.2f}</code>\n"
-                f"🎯 <b>الهدف الثاني (TP2):</b> <code>${res['tp2']:.2f}</code>\n"
-            )
-
-            for uid in users:
-                try:
-                    await context.bot.send_message(
-                        chat_id=uid,
-                        text=message,
-                        parse_mode=ParseMode.HTML,
-                    )
-                except Exception as exc:
-                    logger.warning("فشل البث للمستخدم %s: %s", uid, exc)
-
-    except Exception as exc:
-        logger.exception("فشلت وظيفة البث التلقائي لسكالبينج M5: %s", exc)
+        logger.exception("فشلت وظيفة البث التلقائي للإشارات: %s", exc)
 
 
 async def trade_lifecycle_job(context: ContextTypes.DEFAULT_TYPE):
@@ -2446,15 +2357,6 @@ async def schedule_boundary_job(context: ContextTypes.DEFAULT_TYPE):
             context.job_queue.run_once(schedule_boundary_job, when=delay)
 
 
-async def schedule_m5_boundary_job(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await auto_m5_scalp_job(context)
-    finally:
-        delay = next_m5_boundary_delay_seconds(5)
-        if context.job_queue:
-            context.job_queue.run_once(schedule_m5_boundary_job, when=delay)
-
-
 # ---------------------------------------------------------------------------
 # خادم الفحص التشخيصي (Flask Health Server)
 # ---------------------------------------------------------------------------
@@ -2471,7 +2373,6 @@ def run_flask_server():
     def health():
         (
             df_m15,
-            _,
             macro,
             fetch_time,
             last_full,
@@ -2544,6 +2445,7 @@ def main():
 
     stop_event = threading.Event()
 
+    # 1. تشغيل سيرفر Flask فوراً للربط مع المنفذ (Port Binding) بدون أي تأخير
     if Flask is not None:
         flask_thread = threading.Thread(
             target=run_flask_server,
@@ -2552,6 +2454,7 @@ def main():
         )
         flask_thread.start()
 
+    # 2. تشغيل خيط جلب بيانات السوق المباشرة
     market_thread = threading.Thread(
         target=market_data_worker_loop,
         args=(stop_event,),
@@ -2560,6 +2463,7 @@ def main():
     )
     market_thread.start()
 
+    # 3. تشغيل محاكاة الاختبار العكسي في خيط خلفي غير معطل لعملية البداية
     def async_backtest():
         try:
             bt_summary = run_backtest_simulation()
@@ -2589,16 +2493,10 @@ def main():
             first=5,
         )
 
-        first_delay_m15 = next_boundary_delay_seconds(10)
+        first_delay = next_boundary_delay_seconds(10)
         application.job_queue.run_once(
             schedule_boundary_job,
-            when=first_delay_m15,
-        )
-
-        first_delay_m5 = next_m5_boundary_delay_seconds(5)
-        application.job_queue.run_once(
-            schedule_m5_boundary_job,
-            when=first_delay_m5,
+            when=first_delay,
         )
 
     application.add_handler(CommandHandler("start", start_cmd))
@@ -2606,7 +2504,7 @@ def main():
         MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text_buttons)
     )
 
-    logger.info("تم تشغيل محرك XAUUSD Quant Bot v3.5 بصفقات السكالبينج والنظام الحسابي المستقل بنجاح.")
+    logger.info("تم تشغيل محرك XAUUSD Quant Bot v3.0 بنجاح.")
 
     try:
         application.run_polling(drop_pending_updates=True)
