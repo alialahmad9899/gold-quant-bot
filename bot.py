@@ -1569,7 +1569,15 @@ def generate_quant_signal():
             sell_score += 1
 
         signal_type = "HOLD"
-        if buy_score >= 6 and sell_score < 3 and smc["is_discount"]:
+
+        # منطق الدخول المطور لمنع التناقض والتكيف مع الحركة التصحيحية
+        if h4_trend == "BULLISH" and smc["is_discount"]:
+            if buy_score >= 5 and sell_score <= 4:
+                signal_type = "BUY"
+        elif h4_trend == "BEARISH" and smc["is_premium"]:
+            if sell_score >= 5 and buy_score <= 4:
+                signal_type = "SELL"
+        elif buy_score >= 6 and sell_score < 3 and smc["is_discount"]:
             signal_type = "BUY"
         elif sell_score >= 6 and buy_score < 3 and smc["is_premium"]:
             signal_type = "SELL"
@@ -1682,7 +1690,17 @@ def run_backtest_simulation(initial_balance=10000.0, risk_per_trade=0.01):
         buy_score = (2 if h4_trend == "BULLISH" else 0) + (3 if smc["bos_bullish"] else 0) + (2 if smc["fvg_bullish"] or smc["ob_bullish"] else 0)
         sell_score = (2 if h4_trend == "BEARISH" else 0) + (3 if smc["bos_bearish"] else 0) + (2 if smc["fvg_bearish"] or smc["ob_bearish"] else 0)
 
-        sig = "BUY" if buy_score >= 6 and smc["is_discount"] else "SELL" if sell_score >= 6 and smc["is_premium"] else "HOLD"
+        sig = "HOLD"
+        if h4_trend == "BULLISH" and smc["is_discount"]:
+            if buy_score >= 5 and sell_score <= 4:
+                sig = "BUY"
+        elif h4_trend == "BEARISH" and smc["is_premium"]:
+            if sell_score >= 5 and buy_score <= 4:
+                sig = "SELL"
+        elif buy_score >= 6 and sell_score < 3 and smc["is_discount"]:
+            sig = "BUY"
+        elif sell_score >= 6 and buy_score < 3 and smc["is_premium"]:
+            sig = "SELL"
 
         if sig in {"BUY", "SELL"}:
             entry_price = float(sub_df["Close"].iloc[-1]) + (ESTIMATED_SPREAD_USD if sig == "BUY" else -ESTIMATED_SPREAD_USD)
