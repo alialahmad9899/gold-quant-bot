@@ -1350,7 +1350,7 @@ def monitor_open_trades():
 
     now = utc_now()
 
-    # 1. مراقبة صفقات M15 / H4
+    # 1. مراقبة صفقات M15 / H4 وسطح M5 السريع
     for table in ["signal_logs", "scalp_signal_logs"]:
         rows = fetch_open_trades(table=table)
         for row in rows:
@@ -1698,7 +1698,6 @@ def generate_m5_scalp_signal():
     if quality_state in {DataQualityState.INVALID, DataQualityState.STALE, DataQualityState.NEWS_BLACKOUT}:
         return wait_result(quality_reason, quality_state, macro_data.get("gold_spot"))
 
-    # جلب بيانات فريم 5 دقائق M5 مباشرة من أسرع مصدر
     df_m5 = download_yf(GOLD_SYMBOL, "3d", "5m")
     if df_m5.empty or len(df_m5) < 30:
         df_m5 = download_yf("GLD", "3d", "5m")
@@ -1710,10 +1709,8 @@ def generate_m5_scalp_signal():
     closed_time = ensure_utc_timestamp(df_m5_closed.index[-1])
     candle_id = f"XAUUSD_M5_{closed_time.strftime('%Y%m%d_%H%M')}"
 
-    # تحليل SMC على فريم 5 دقائق
     smc_m5 = detect_institutional_smc(df_m5_closed)
 
-    # تحليل اتجاه H4 لربطه بالسكالبينج
     df_h4 = resample_m15_to_h4(df_m15)
     h4_trend = "NEUTRAL"
     if len(df_h4) >= 15:
@@ -1726,15 +1723,13 @@ def generate_m5_scalp_signal():
     if live_execution_price is None or live_execution_price <= 0:
         return wait_result("سعر التداول المباشر غير متاح حالياً.", DataQualityState.INVALID)
 
-    # حساب مؤشر ATR المخصص بفريم 5 دقائق لحساب ستوب وتارغت خاطف
     atr_m5 = ta.volatility.AverageTrueRange(
         df_m5_closed["High"], df_m5_closed["Low"], df_m5_closed["Close"], window=14
     ).average_true_range().iloc[-1]
 
     if pd.isna(atr_m5) or atr_m5 <= 0:
-        atr_m5 = 2.0  # القيمة الافتراضية للسكالبينج إذا متعذر الحساب
+        atr_m5 = 2.0
 
-    # معايير دخول السكالبينج المرنة والدقيقة
     scalp_buy_score = (2 if h4_trend == "BULLISH" else 0) + (3 if smc_m5["bos_bullish"] or smc_m5["choch_bullish"] else 0) + (2 if smc_m5["ob_bullish"] or smc_m5["fvg_bullish"] or smc_m5["sweep_bullish"] else 0) + (1 if smc_m5["is_discount"] else 0)
     scalp_sell_score = (2 if h4_trend == "BEARISH" else 0) + (3 if smc_m5["bos_bearish"] or smc_m5["choch_bearish"] else 0) + (2 if smc_m5["ob_bearish"] or smc_m5["fvg_bearish"] or smc_m5["sweep_bearish"] else 0) + (1 if smc_m5["is_premium"] else 0)
 
@@ -2143,7 +2138,7 @@ async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def m5_scalp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالج طلب صفقة سكالبينج دخول فوري على فريم 5 دقائق"""
+    """معالج طلب صفقة سكالبينج دخول فوري على فريم 5 دقائق معدل لحل تناقض النصوص"""
     res = await asyncio.to_thread(generate_m5_scalp_signal)
 
     if res["status"] == "WAIT":
@@ -2161,13 +2156,13 @@ async def m5_scalp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🚀 <b>توصية دخول فوري (M5 Scalp): {sig_ar}</b>\n"
         "───────────────────────\n"
         f"🆔 <b>معرف الصفقة:</b> <code>{res['candle_id']}</code>\n"
-        f"⚡ <b>التوجيه المباشر:</b> <code>ادخل فوراً بالسعر الحالي دون انتظار!</code>\n"
         f"💵 <b>سعر التنفيذ اللحظي:</b> <code>${res['live_execution_price']:.2f}</code>\n"
         "───────────────────────\n"
     )
 
     if sig in {"BUY", "SELL"}:
         text += (
+            f"⚡ <b>التوجيه المباشر:</b> <code>ادخل فوراً بالسعر الحالي دون انتظار!</code>\n"
             f"🛑 <b>وقف الخسارة (SL):</b> <code>${res['sl']:.2f}</code>\n"
             f"🎯 <b>الهدف الأول الخاطف (TP1):</b> <code>${res['tp1']:.2f}</code>\n"
             f"🎯 <b>الهدف الثاني (TP2):</b> <code>${res['tp2']:.2f}</code>\n"
@@ -2181,7 +2176,10 @@ async def m5_scalp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• <b>كسر هيكل (BOS/CHoCH):</b> <code>{'صاعد ✅' if smc['bos_bullish'] or smc['choch_bullish'] else 'هابط 🔻' if smc['bos_bearish'] or smc['choch_bearish'] else 'لا يوجد ❌'}</code>\n"
         )
     else:
-        text += "⚠️ <b>حالة السوق السريع:</b> <code>لا توجد فرصة سكالبينج مكتملة الشروط الآن.</code>\n"
+        text += (
+            "⚡ <b>التوجيه المباشر:</b> <code>انتظر ولا تدخل الآن!</code>\n"
+            "⚠️ <b>حالة السوق السريع:</b> <code>لا توجد فرصة سكالبينج مكتملة الشروط الآن.</code>\n"
+        )
 
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
