@@ -202,6 +202,23 @@ system_monitor = SystemMonitor()
 # ------------------------------------
 # 🛠️ أدوات مساعدة وتجهيز البيانات
 # ------------------------------------
+async def safe_reply_text(update: Update, text: str, **kwargs):
+    """إرسال آمن للرسائل مع تجنب توقف البوت بسبب خطأ تنسيق التليغرام Markdown"""
+    try:
+        return await update.message.reply_text(text, **kwargs)
+    except Exception as e:
+        if "Can't parse entities" in str(e) or "400 Bad Request" in str(e):
+            kwargs.pop('parse_mode', None)
+            return await update.message.reply_text(text, **kwargs)
+        raise e
+
+def fetch_live_economic_news_alert():
+    """جلب حالة المفكرة الاقتصادية وتفادي توقف البوت عند عدم وجود مزود خارجي"""
+    try:
+        return False, "الظروف الإخبارية مستقرة", False
+    except Exception as e:
+        return False, f"تعذر الفحص: {e}", True
+
 def clean_df_columns(df):
     """تسطيح عناوين الأعمدة المركبة الناتجة عن yfinance الحديثة"""
     if isinstance(df.columns, pd.MultiIndex):
@@ -217,14 +234,13 @@ def get_main_keyboard():
     keyboard = [
         [KeyboardButton("⚡ إشارة فورية"), KeyboardButton("🧠 تحليل بنية السوق")],
         [KeyboardButton("📊 الأسعار اللحظية"), KeyboardButton("📈 إحصائيات النظام")],
-        [KeyboardButton("📉 اختبار الاستراتيجية العكسي"), KeyboardButton("🔍 فحص الأخطاء الشامل")]
+        [KeyboardButton("📉 اختبار الاستراتيجية العكسي"), KeyboardButton("🔍 فحص الأخطاء الشامل")],
+        [KeyboardButton("🧹 تصفير البيانات")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-
 def arabic_direction(value):
     return {"BULLISH": "صاعد 🟢", "BEARISH": "هابط 🔴", "RANGING": "متذبذب 🟡", "NEUTRAL": "محايد 🟡"}.get(str(value), str(value))
-
 
 def arabic_trade_status(value):
     return {"OPEN": "مفتوحة 🟢", "TP1_HIT": "الهدف الأول محقق 🎯", "TP2_HIT": "الهدف الثاني محقق 🏆", "SL_HIT": "وقف الخسارة محقق 🛑", "EXPIRED": "منتهية ⏳", "CANCELLED": "ملغاة 🚫"}.get(str(value), str(value))
@@ -636,7 +652,6 @@ def log_trade(signal_type, entry, sl, tp1, tp2, rsi, dxy_corr, macd_diff, stoch_
     finally:
         release_db_connection(conn)
 
-
 def update_trade_state(trade_id, new_status, exit_price=None, realized_r=None, slippage=None):
     conn = get_db_connection()
     try:
@@ -661,7 +676,6 @@ def update_trade_state(trade_id, new_status, exit_price=None, realized_r=None, s
         if payload:
             enqueue_learning_event('TRADE_OUTCOME',f'trade_outcome:{trade_id}:{new_status}',payload,priority=1 if new_status=='SL_HIT' else 3)
     return changed
-
 
 def _build_trade_learning_payload(trade_id, outcome_status):
     conn = get_db_connection()
@@ -694,7 +708,6 @@ def _build_trade_learning_payload(trade_id, outcome_status):
     finally:
         release_db_connection(conn)
 
-
 def enqueue_learning_event(event_type, event_key, payload_dict, priority=3):
     conn = get_db_connection()
     try:
@@ -715,7 +728,6 @@ def enqueue_learning_event(event_type, event_key, payload_dict, priority=3):
     finally:
         release_db_connection(conn)
 
-
 def recover_interrupted_learning_events():
     conn=get_db_connection()
     try:
@@ -729,7 +741,6 @@ def recover_interrupted_learning_events():
         system_monitor.record_error('AI_RECOVERY',e)
     finally:
         release_db_connection(conn)
-
 
 def claim_learning_batch(limit=5):
     limit=max(1,min(int(limit),LEARNING_BATCH_SIZE)); conn=get_db_connection(); claimed=[]
@@ -759,7 +770,6 @@ def claim_learning_batch(limit=5):
     finally:
         release_db_connection(conn)
 
-
 def mark_learning_completed(event_id):
     conn=get_db_connection()
     try:
@@ -770,7 +780,6 @@ def mark_learning_completed(event_id):
         except Exception: pass
         system_monitor.record_error('QUEUE_COMPLETE',e)
     finally: release_db_connection(conn)
-
 
 def mark_learning_deferred(event_id,error,retry_count):
     conn=get_db_connection()
@@ -783,7 +792,6 @@ def mark_learning_deferred(event_id,error,retry_count):
         except Exception: pass
         system_monitor.record_error('QUEUE_RETRY',e)
     finally: release_db_connection(conn)
-
 
 class CircuitBreaker:
     def __init__(self,failure_threshold=3,cooldown_seconds=120): self.failure_threshold=failure_threshold; self.cooldown_seconds=cooldown_seconds; self.failures=0; self.opened_at=None; self.lock=threading.Lock()
@@ -798,7 +806,6 @@ class CircuitBreaker:
             if self.failures>=self.failure_threshold: self.opened_at=time.monotonic()
 
 learning_circuit=CircuitBreaker()
-
 
 def process_learning_batch(events):
     if not events: return True
@@ -836,7 +843,6 @@ def process_learning_batch(events):
             if '429' in str(e) or 'RESOURCE_EXHAUSTED' in str(e): time.sleep(1.5+(hash(str(time.time()))%1000)/1000.0); continue
             break
     learning_circuit.failure(); raise RuntimeError(last_error or 'فشل تحليل دفعة التعلم')
-
 
 class LearningQueueManager:
     def __init__(self,maxsize=50): self.maxsize=maxsize; self.queue=None; self.enqueued_ids=set()
@@ -883,7 +889,6 @@ learning_manager=LearningQueueManager(MAX_LEARNING_QUEUE)
 LEARNING_STOP_EVENT=threading.Event()
 
 def monitor_open_trades():
-    # TP2 يُفحص قبل TP1 لتجنب التأخير عند القفز السعري.
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
@@ -975,7 +980,6 @@ def gemini_verify_signal(signal_data, market_summary):
     }}
     """
     
-    # 🔄 قائمة الموديلات الترتيبية: يبدأ بالموديل الخفيف (10 RPM) ثم ينتقل للبقية عند الاكتظاظ
     candidate_models = ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-2.0-flash']
 
     for target_model in candidate_models:
@@ -1000,7 +1004,6 @@ def gemini_verify_signal(signal_data, market_summary):
 
     return {"approved": True, "reason": "اعتماد كمي تلقائي (تم تجاوز حدود استخدام Gemini)"}
 
-# --- تتبع الصفقات المحسن المصلح بدقة تسلسلي زمنياً بالاعتماد على السعر الفوري والشموع ---
 def update_open_trades_outcome_historical(df_m15):
     conn = get_db_connection()
     resolved_ids = []
@@ -1012,7 +1015,6 @@ def update_open_trades_outcome_historical(df_m15):
         if not open_trades:
             return
 
-        # 💡 جلب السعر اللحظي الفوري لحسم الصفقة فوراً بدون انتظار تأخر الشموع
         spot_data = get_market_data()
         live_price = spot_data.get("gold", 0.0) if spot_data else 0.0
 
@@ -1030,7 +1032,6 @@ def update_open_trades_outcome_historical(df_m15):
             try:
                 outcome = None
 
-                # 1️⃣ الفحص الفوري المباشر عبر السعر اللحظي
                 if live_price > 1000:
                     if "BUY" in sig_type or "شراء" in sig_type:
                         if live_price >= tp1:
@@ -1043,7 +1044,6 @@ def update_open_trades_outcome_historical(df_m15):
                         elif live_price >= sl:
                             outcome = 0
 
-                # 2️⃣ فحص الشموع التاريخية M15 في حال لم تُحسم الصفقة بالسعر اللحظي
                 if outcome is None and not df_clean.empty:
                     if isinstance(trade_time_str, datetime):
                         trade_time = trade_time_str if trade_time_str.tzinfo else trade_time_str.replace(tzinfo=timezone.utc)
@@ -1097,10 +1097,7 @@ def update_open_trades_outcome_historical(df_m15):
         if payload:
             enqueue_learning_event('TRADE_OUTCOME',f'trade_outcome:{trade_id}:{status_for_learning}',payload,priority=1 if outcome==0 else 3)
 
-
-# --- خوارزمية التعلم الذاتي التتابعية زمنيًا الخالية من انحياز الاختيار والمعايرة الدقيقة ---
 def build_historic_market_features():
-    """توليد عينة تدريب كمية من شموع M15 بدون انحياز اختيار وبأولوية زمنية دقيقة لربح/خسارة الصفقة"""
     cache = get_chart_data_cached()
     df_m15 = cache.get("df_gold_m15")
     df_dxy_m15 = cache.get("df_dxy_m15")
@@ -1109,7 +1106,6 @@ def build_historic_market_features():
         return None, None
 
     df_clean = clean_df_columns(df_m15.copy())
-    # إصلاح الفهرس المكرر لضمان عدم حدوث خطأ get_loc
     df_clean = df_clean[~df_clean.index.duplicated(keep='first')]
 
     close = to_1d_series(df_clean['Close'])
@@ -1202,7 +1198,6 @@ def _financial_metrics(r_values):
     pf = gross_win / gross_loss if gross_loss > 0 else (999.0 if gross_win > 0 else 0.0)
     return {"trades": int(vals.size), "total_r": float(vals.sum()), "expectancy_r": float(vals.mean()), "profit_factor": float(pf), "max_drawdown_r": float(dd.max()) if dd.size else 0.0}
 
-
 def _save_model_evaluation(meta, promoted):
     conn = get_db_connection()
     try:
@@ -1218,7 +1213,6 @@ def _save_model_evaluation(meta, promoted):
         print(f"⚠️ تعذر حفظ تقييم النموذج: {e}")
     finally:
         release_db_connection(conn)
-
 
 def train_self_learning_model():
     """Champion-Challenger خفيف: آخر 1000 صف فقط، تقسيم زمني OOS، وترقية حسب العائد والتوقع المالي."""
@@ -1248,7 +1242,9 @@ def train_self_learning_model():
             df['realized_r'] = np.where(df['outcome'].values == 1, 1.0, -1.0)
 
         df = df.tail(limit).copy().reset_index(drop=True)
-        df[feature_cols] = df[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        
+        # 🔧 إصلاح خطأ استبدال np.inf المتوافق مع الإصدارات الحديثة لـ Pandas
+        df[feature_cols] = df[feature_cols].mask(np.isinf(df[feature_cols])).fillna(0.0)
         df['realized_r'] = pd.to_numeric(df['realized_r'], errors='coerce')
         df['realized_r'] = df['realized_r'].fillna(np.where(df['outcome'].astype(int) == 1, 1.0, -1.0))
         split_idx = int(len(df) * 0.75)
@@ -1290,6 +1286,7 @@ def train_self_learning_model():
             del df
             gc.collect()
         return CACHED_MODEL
+
 def check_news_guard():
     now_utc = datetime.now(timezone.utc)
     hour = now_utc.hour
@@ -1301,7 +1298,6 @@ def check_news_guard():
         return False, f"حظر آلي: صدور خبر شديد التأثير في السوق الآن ({news_title})."
     
     if fetch_failed:
-        # فشل مزود الأخبار لا يمنع فرصة فنية قوية؛ نتحول إلى وضع مراقبة مخفّض بدلاً من حظر شامل.
         return True, f"وضع مراقبة مخفّض: تعذر التحقق من الأخبار اللحظية ({news_title})."
 
     if hour in [21, 22]:
@@ -1345,10 +1341,8 @@ def detect_smc_setup(df):
 
 # ------------------------------------
 # 4. محرك البيانات الفورية الموحد والمُحصن بـ Multi-Symbol Fallbacks
-# [تحديث المرحلة 1 - توحيد أصل البيانات حول XAU/USD Spot حصراً لتجنب فارق الفروقات Futures Basis]
 # ------------------------------------
 def fetch_yahoo_direct(symbol, range_str="10d", interval_str="15m"):
-    """جلب الشموع مباشرة عبر Yahoo Finance v8 API مع تجنب حظر yfinance"""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Accept': 'application/json,text/html,application/xhtml+xml',
@@ -1379,13 +1373,10 @@ def fetch_yahoo_direct(symbol, range_str="10d", interval_str="15m"):
     return pd.DataFrame()
 
 def fetch_live_spot_gold():
-    """جلب سعر الذهب الفوري Spot Gold المباشر لرمز XAU/USD حصراً لضمان دقة التنفيذ والتحليل"""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Accept': 'application/json'
     }
-    
-    # 1. المصدر الرئيسي الموحد: XAUUSD Spot عبر Yahoo Chart API
     try:
         r = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval=1m&range=1d", headers=headers, timeout=3)
         if r.status_code == 200:
@@ -1396,7 +1387,6 @@ def fetch_live_spot_gold():
     except Exception:
         pass
 
-    # 2. المصدر الثاني المباشر: IFC Markets XAUUSD Spot Scraping
     try:
         url_ifc = "https://www.ifcmarkets.net/market-data/precious-metals-prices/xauusd"
         r = requests.get(url_ifc, headers=headers, timeout=3)
@@ -1413,7 +1403,6 @@ def fetch_live_spot_gold():
     except Exception:
         pass
 
-    # 3. المصدر الثالث الاحتياطي (Secondary Validation): Binance PAXGUSDT
     try:
         r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT", headers=headers, timeout=2)
         if r.status_code == 200:
@@ -1434,7 +1423,6 @@ def get_market_data():
     return {"gold": gold_price, "dxy": 99.85, "us10y": 4.63}
 
 def fetch_and_update_cache():
-    """تحديث الذاكرة العشوائية ومخزن الرسم البياني بأسلوب محمي بقفل Threading"""
     try:
         gold = fetch_live_spot_gold()
         headers = {'User-Agent': 'Mozilla/5.0'}
@@ -1467,7 +1455,6 @@ def fetch_and_update_cache():
         print(f"خطأ تحديث كاش البيانات: {e}")
 
 def get_chart_data_cached():
-    """جلب الرسوم البيانية الموحدة لـ XAU/USD Spot حصراً وحماية Single-Flight"""
     now = datetime.now(timezone.utc)
     
     with cache_lock:
@@ -1482,11 +1469,9 @@ def get_chart_data_cached():
                 return MARKET_DATA_CACHE.copy()
 
         try:
-            # توحيد الرمز المالي الرئيسي XAUUSD=X Spot
             df_gold_h1 = fetch_yahoo_direct("XAUUSD=X", range_str="60d", interval_str="1h")
             df_gold_m15 = fetch_yahoo_direct("XAUUSD=X", range_str="10d", interval_str="15m")
             
-            # الخيار الاحتياطي في حال تعذر السيرفر الرئيسي
             if df_gold_m15.empty:
                 df_gold_m15 = fetch_yahoo_direct("GC=F", range_str="10d", interval_str="15m")
             if df_gold_h1.empty:
@@ -1518,7 +1503,6 @@ def get_chart_data_cached():
         return MARKET_DATA_CACHE.copy()
 
 def get_verified_closed_m15(df):
-    """استخدام آخر شمعة M15 مكتملة فقط لمنع قراءة شمعة ما زالت تتكون."""
     if df is None or df.empty:
         return pd.DataFrame()
     x = clean_df_columns(df.copy())
@@ -1626,7 +1610,6 @@ def analyze_institutional_engine():
 # 5. خوارزمية توليد الإشارات الكمية المدمجة مع تدقيق Gemini
 # ------------------------------------
 def generate_quant_signal():
-    # محرك إشارات مرن: الفنيات تقود القرار، والذكاء الاصطناعي عامل ترجيح لا قفل مطلق.
     global LAST_SCANNER_CANDLE
     with SIGNAL_LOCK:
         safe_news, news_reason = check_news_guard()
@@ -1651,11 +1634,9 @@ def generate_quant_signal():
             return {"status":"WAIT","reason":"بيانات ATR/السعر غير صالحة حالياً.","price":current_price}
 
         volatility_ratio = round((atr/current_price)*100,4)
-        # لا نحظر السوق عند التذبذب الطبيعي؛ الحظر فقط عند ضعف استثنائي جداً.
         if volatility_ratio < 0.012:
             return {"status":"WAIT","reason":"التذبذب الحالي منخفض جداً ولا يكفي لإدارة صفقة بكفاءة.","price":current_price}
 
-        # نموذج التعلم الذاتي: ترجيح ناعم بدلاً من حظر آلي عند 52%.
         clf = train_self_learning_model()
         confidence = 0.60
         if clf:
@@ -1681,7 +1662,6 @@ def generate_quant_signal():
         if rsi > 30: bear_score += 0.5
         if smc.get('fvg_bullish') or smc.get('sweep_bullish'): bull_score += 1.5; reasons_bull.append('تأكيد سيولة/FVG صاعد')
         if smc.get('fvg_bearish') or smc.get('sweep_bearish'): bear_score += 1.5; reasons_bear.append('تأكيد سيولة/FVG هابط')
-        # DXY عامل ترجيح فقط، ولا يمنع الإشارة عند غيابه.
         if dxy_corr <= 0.35:
             bull_score += 0.5; bear_score += 0.5
         if confidence >= 0.58: bull_score += 0.75; bear_score += 0.75
@@ -1716,7 +1696,6 @@ def generate_quant_signal():
             'signal_candle_time':candle_timestamp,'score_bull':round(bull_score,2),'score_bear':round(bear_score,2)
         }
 
-        # Gemini مستشار مخاطر: لا يملك حق قتل فرصة قوية وحده إلا عند اجتماع مخاطرة عالية + ثقة منخفضة.
         gemini_eval = gemini_verify_signal(candidate_signal, {'h4_trend':h4_trend,'state_label':state})
         candidate_signal['gemini_note'] = gemini_eval.get('reason','تمت المراجعة بواسطة Gemini')
         candidate_signal['ai_score'] = 1.0 if gemini_eval.get('approved', True) else 0.0
@@ -1724,7 +1703,6 @@ def generate_quant_signal():
             return {'status':'WAIT','reason':f"مراجعة Gemini أوصت بالانتظار: {gemini_eval.get('reason','مخاطرة مرتفعة')}", 'price':current_price}
 
         inserted, trade_id = log_trade(signal_type, current_price, sl, tp1, tp2, round(rsi,1), dxy_corr, round(macd_diff,3), round(stoch_k,1), volatility_ratio, confidence, candle_id=candle_id, signal_score=max(bull_score,bear_score), ai_score=candidate_signal.get('ai_score'))
-        # إصلاح سباق الإشعارات: إذا لم تكن هذه العملية هي المالكة للإشارة، لا تعِد SUCCESS ولا تبث ثانية.
         if not inserted:
             return {'status':'WAIT','reason':'تمت معالجة هذه الشمعة مسبقاً؛ تم منع الإشعار المكرر.', 'price':current_price, 'candle_id':candle_id}
         candidate_signal['trade_id'] = trade_id
@@ -1735,7 +1713,6 @@ def generate_quant_signal():
 # 6. محرك اختبار الاستراتيجية العكسي (مُصلح ومطابق للنموذج الكمي)
 # ------------------------------------
 def run_quant_backtest():
-    """فحص الاستراتيجية العكسي بالتناغم مع كافة الفلاتر المؤسسية وموديل الذكاء الاصطناعي"""
     cache = get_chart_data_cached()
     df_m15 = cache.get("df_gold_m15")
     df_h1 = cache.get("df_gold_h1")
@@ -1771,7 +1748,6 @@ def run_quant_backtest():
     h1_ema200 = ta.trend.EMAIndicator(close_h1, window=200).ema_indicator().reindex(df_clean.index).ffill()
     h1_ema500 = ta.trend.EMAIndicator(close_h1, window=500).ema_indicator().reindex(df_clean.index).ffill()
 
-    # استدعاء نموذج التعلم الكمي المدرب لاستخدامه في الباك تست
     clf = train_self_learning_model()
 
     signals = 0
@@ -1928,7 +1904,6 @@ def run_quant_backtest():
 # 7. المراقبة الآلية ومراقب الذاكرة العشوائية والحيويّة
 # ------------------------------------
 async def keep_alive_ping():
-    """إرسال طلب HTTP ذاتي كل 8 دقائق لإبقاء سيرفر Render نشطاً ومستيقظاً 24/7"""
     url = os.getenv("RENDER_EXTERNAL_URL", "https://gold-quant-bot.onrender.com")
     while True:
         await asyncio.sleep(480)
@@ -1939,7 +1914,6 @@ async def keep_alive_ping():
             print(f"تنبيه فحص الاستيقاظ الذاتي: {e}")
 
 async def background_cache_worker():
-    """تحديث الكاش كل 5 ثوان لتوازن مثالي بين السرعة واستقرار السيرفر"""
     while True:
         try:
             await asyncio.to_thread(fetch_and_update_cache)
@@ -1987,7 +1961,6 @@ async def auto_market_scanner(app):
         await asyncio.sleep(30)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """معالج الأخطاء لمنع توقف البوت عند استثناءات التعارض والشبكة"""
     system_monitor.record_error("TELEGRAM", context.error)
 
 async def daily_telemetry_worker(app):
@@ -2010,16 +1983,79 @@ async def post_init(app):
     asyncio.create_task(daily_telemetry_worker(app))
 
 # ------------------------------------
+# 🧹 أمر تصفير كافة البيانات والذاكرة
+# ------------------------------------
+async def reset_all_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not is_authenticated(chat_id):
+        await safe_reply_text(update, "🔒 يرجى إدخال كلمة السر أولاً لاستخدام البوت.")
+        return
+
+    await safe_reply_text(update, "⏳ **جاري تصفير قاعدة البيانات وتفريغ الذاكرة العشوائية بالكامل...**", parse_mode='Markdown')
+
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        is_pg = is_postgres() and isinstance(conn, psycopg2.extensions.connection)
+
+        if is_pg:
+            cursor.execute("""
+                TRUNCATE TABLE trades, learning_events, gemini_insights, model_evaluations, 
+                subscribers, authenticated_users, config RESTART IDENTITY CASCADE;
+            """)
+        else:
+            tables = ['trades', 'learning_events', 'gemini_insights', 'model_evaluations', 'subscribers', 'authenticated_users', 'config']
+            for t in tables:
+                cursor.execute(f"DELETE FROM {t};")
+                try:
+                    cursor.execute(f"DELETE FROM sqlite_sequence WHERE name='{t}';")
+                except Exception:
+                    pass
+        conn.commit()
+    except Exception as e:
+        await safe_reply_text(update, f"❌ حدث خطأ أثناء تصفير قاعدة البيانات: {e}")
+        return
+    finally:
+        release_db_connection(conn)
+
+    with cache_lock:
+        GLOBAL_CACHE["market_data"] = {"gold": 0.0, "dxy": 99.85, "us10y": 4.63}
+        GLOBAL_CACHE["analysis"] = None
+        GLOBAL_CACHE["last_updated"] = None
+
+        MARKET_DATA_CACHE["df_gold_h1"] = pd.DataFrame()
+        MARKET_DATA_CACHE["df_gold_m15"] = pd.DataFrame()
+        MARKET_DATA_CACHE["df_dxy_m15"] = pd.DataFrame()
+        MARKET_DATA_CACHE["df_us10y_m15"] = pd.DataFrame()
+        MARKET_DATA_CACHE["last_fetch"] = None
+
+    global CACHED_MODEL, CACHED_MODEL_META, LAST_TRAIN_TIME
+    with MODEL_LOCK:
+        CACHED_MODEL = None
+        CACHED_MODEL_META = {}
+        LAST_TRAIN_TIME = None
+
+    authenticate_user(chat_id)
+    add_subscriber(chat_id)
+
+    await safe_reply_text(
+        update,
+        "🧹 **تم مسح كافة البيانات السابقة وتفرغ الذاكرة العشوائية بنجاح!**\n"
+        "يمكنك الآن البدء بحساب جديد وقاعدة بيانات نظيفة 100% 🚀",
+        reply_markup=get_main_keyboard(),
+        parse_mode='Markdown'
+    )
+
+# ------------------------------------
 # 🔍 8. دالة فحص الأخطاء الشامل والمباشر للنظام
 # ------------------------------------
 async def system_health_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """فحص شامل ودقيق لكافة أنظمة، اتصالات، وقواعد بيانات البوت كرمال كشف أي أخطاء ومحيها"""
     chat_id = update.effective_chat.id
     if not is_authenticated(chat_id):
-        await update.message.reply_text("🔒 يرجى إدخال كلمة السر أولاً لاستخدام البوت.")
+        await safe_reply_text(update, "🔒 يرجى إدخال كلمة السر أولاً لاستخدام البوت.")
         return
 
-    await update.message.reply_text("🔍 **جاري بدء الفحص الشامل لجميع الاتصالات، الخوادم، والأنظمة البرمجية...**\nقد يستغرق الفحص بضع ثوانٍ.", parse_mode='Markdown')
+    await safe_reply_text(update, "🔍 **جاري بدء الفحص الشامل لجميع الاتصالات، الخوادم، والأنظمة البرمجية...**\nقد يستغرق الفحص بضع ثوانٍ.", parse_mode='Markdown')
 
     report_lines = []
     issues_found = []
@@ -2029,7 +2065,6 @@ async def system_health_check(update: Update, context: ContextTypes.DEFAULT_TYPE
     if resource_summary['tier'] in {'DEFERRED','EMERGENCY'}:
         report_lines.append("  ⚠️ تم تأجيل مهام التعلم الثقيلة لحماية مسار التداول.")
 
-    # 1. فحص متغيرات البيئة والإعدادات
     report_lines.append("⚙️ **1. فحص متغيرات البيئة والإعدادات:**")
     if TOKEN and len(TOKEN) > 20:
         report_lines.append("  ✅ توكن التلغرام (TELEGRAM_TOKEN): صالح ومفعل من البيئة.")
@@ -2048,7 +2083,6 @@ async def system_health_check(update: Update, context: ContextTypes.DEFAULT_TYPE
         report_lines.append("  ⚠️ مفتاح الذكاء الاصطناعي: غير مضبوط في متغيرات البيئة.")
         issues_found.append("GEMINI_API_KEY مفقود.")
 
-    # 2. فحص اتصال قاعدة البيانات والجداول
     report_lines.append("\n🗄️ **2. فحص قاعدة البيانات والجداول:**")
     db_start = time.time()
     conn = None
@@ -2080,7 +2114,6 @@ async def system_health_check(update: Update, context: ContextTypes.DEFAULT_TYPE
         if conn:
             release_db_connection(conn)
 
-    # 3. فحص اتصال الذكاء الاصطناعي
     report_lines.append("\n🧠 **3. فحص اتصال ونماذج الذكاء الاصطناعي:**")
     if gemini_client:
         try:
@@ -2103,7 +2136,6 @@ async def system_health_check(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         report_lines.append("  ⚠️ خدمة الذكاء الاصطناعي غير مفعلة (يعمل النظام بالاعتماد الكمي التلقائي).")
 
-    # 4. فحص اتصالات مصادر أسعار السوق الموحدة (XAU/USD Spot)
     report_lines.append("\n📊 **4. فحص اتصالات مصادر أسعار السوق (XAU/USD Spot):**")
     gold_price = await asyncio.to_thread(fetch_live_spot_gold)
     if gold_price > 1000:
@@ -2124,7 +2156,6 @@ async def system_health_check(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         report_lines.append("  ⚠️ فشل تحميل بيانات الشموع (H1).")
 
-    # 5. فحص مصادر الأخبار الستة مع تدقيق المحتوى
     report_lines.append("\n📰 **5. فحص مصادر مفكرة الأخبار الاقتصادية مع تدقيق البيانات:**")
     try:
         is_high, news_info, is_fail = await asyncio.to_thread(fetch_live_economic_news_alert)
@@ -2137,7 +2168,6 @@ async def system_health_check(update: Update, context: ContextTypes.DEFAULT_TYPE
         report_lines.append(f"  ❌ خطأ فحص سيرفرات الأخبار: {ne}")
         issues_found.append(f"خطأ محرك الأخبار: {ne}")
 
-    # 6. فحص المحرك الكمي وموديل التعلم الذاتي
     report_lines.append("\n🤖 **6. فحص المحرك الكمي وموديل ML:**")
     try:
         engine_res = await asyncio.to_thread(analyze_institutional_engine)
@@ -2150,7 +2180,6 @@ async def system_health_check(update: Update, context: ContextTypes.DEFAULT_TYPE
         report_lines.append(f"  ❌ خطأ في المحرك المؤسسي: {ee}")
         issues_found.append(f"خطأ المحرك المؤسسي: {ee}")
 
-    # 7. فحص خادم Flask والويب
     report_lines.append("\n🌐 **7. فحص خادم الويب المحلي (Flask Server):**")
     try:
         port = int(os.environ.get("PORT", 10000))
@@ -2162,10 +2191,9 @@ async def system_health_check(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as we:
         report_lines.append(f"  ⚠️ تعذر الاتصال بخادم الويب المحلي: {we}")
 
-    # الخلاصة والنتيجة
     report_lines.append("\n───────────────────")
     if not issues_found:
-        report_lines.append("🎉 **النتيجة النهائية:** المرحلة 1 مكتملة بنجاح والتحديثات أثبتت جدارتها!")
+        report_lines.append("🎉 **النتيجة النهائية:** النظام يعمل بكفاءة واستقرار تام!")
     else:
         report_lines.append(f"🚨 **تم اكتشاف ({len(issues_found)}) تنبيه/خطأ بحاجة للمراجعة:**")
         for idx, issue in enumerate(issues_found, 1):
@@ -2175,9 +2203,9 @@ async def system_health_check(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if len(full_report) > 4000:
         for chunk in [full_report[i:i+4000] for i in range(0, len(full_report), 4000)]:
-            await update.message.reply_text(chunk, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+            await safe_reply_text(update, chunk, reply_markup=get_main_keyboard(), parse_mode='Markdown')
     else:
-        await update.message.reply_text(full_report, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+        await safe_reply_text(update, full_report, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
 # --- الأوامر المباشرة ---
 async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2190,7 +2218,8 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
         if text == PASSWORD:
             authenticate_user(chat_id)
             add_subscriber(chat_id)
-            await update.message.reply_text(
+            await safe_reply_text(
+                update,
                 "✅ **تم تسجيل الدخول بنجاح!**\n"
                 "مرحباً بك في البوت الكمي المؤسسي المدعوم بـ Gemini AI. تم تفعيل كافة الصلاحيات والتنبيهات التلقائية.\n\n"
                 "💡 يمكنك الآن الضغط على الأزرار في الأسفل لتنفيذ الأوامر فوراً.",
@@ -2199,7 +2228,7 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             await notify_admin(context, f"🔑 **تسجيل دخول ناجح!**\nالمستخدم: {user_info}")
         else:
-            await update.message.reply_text("❌ **كلمة السر غير صحيحة!**\nتم تسجيل محاولة الدخول وإبلاغ مسؤول النظام.")
+            await safe_reply_text(update, "❌ **كلمة السر غير صحيحة!**\nتم تسجيل محاولة الدخول وإبلاغ مسؤول النظام.")
             await notify_admin(context, f"⚠️ **محاولة دخول فاشلة!**\nالمستخدم: {user_info}\nكلمة السر المدخلة: `{text}`")
         return
 
@@ -2215,8 +2244,11 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
         await backtest(update, context)
     elif "فحص الأخطاء الشامل" in text or text in ["/health", "/check"]:
         await system_health_check(update, context)
+    elif "تصفير البيانات" in text or text == "/reset_all":
+        await reset_all_data(update, context)
     else:
-        await update.message.reply_text(
+        await safe_reply_text(
+            update,
             "💡 استخدم الأزرار الظاهرة في الأسفل للتحكم بالبوت.",
             reply_markup=get_main_keyboard()
         )
@@ -2227,7 +2259,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_info = f"{user.first_name} (@{user.username if user.username else 'بدون معرف'}) [ID: {chat_id}]"
 
     if not is_authenticated(chat_id):
-        await update.message.reply_text(
+        await safe_reply_text(
+            update,
             "🔒 **البوت محمي بكلمة سر.**\n"
             "يرجى إرسال كلمة السر الخاصة بك للدخول إلى النظام."
         )
@@ -2235,7 +2268,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     add_subscriber(chat_id)
-    await update.message.reply_text(
+    await safe_reply_text(
+        update,
         f"أهلاً بك مجدداً! 🚀\n"
         f"حسابك موثق ومفعل في **البوت الكمي الهجين المدعوم بالذكاء الاصطناعي**.\n\n"
         f"💡 اضغط على الأزرار أدناه لتنفيذ ما تريد:",
@@ -2246,25 +2280,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not is_authenticated(chat_id):
-        await update.message.reply_text("🔒 يرجى إدخال كلمة السر أولاً لاستخدام البوت.")
+        await safe_reply_text(update, "🔒 يرجى إدخال كلمة السر أولاً لاستخدام البوت.")
         return
     
     data = get_market_data()
     msg = f"📊 **أسعار الذهب اللحظية**\n🟡 الذهب (XAUUSD): ${data['gold']}\n💵 مؤشر الدولار: {data['dxy']}\n📈 عوائد السندات: {data['us10y']}%"
-    await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+    await safe_reply_text(update, msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not is_authenticated(chat_id):
-        await update.message.reply_text("🔒 يرجى إدخال كلمة السر أولاً لاستخدام البوت.")
+        await safe_reply_text(update, "🔒 يرجى إدخال كلمة السر أولاً لاستخدام البوت.")
         return
-    await update.message.reply_text("🧠 جاري تحليل اتجاه السوق والسيولة والبنية السعرية...")
+    await safe_reply_text(update, "🧠 جاري تحليل اتجاه السوق والسيولة والبنية السعرية...")
     res = await asyncio.to_thread(analyze_institutional_engine)
     if res:
         smc = res['smc']
         smc_status = "صاعد (FVG/Sweep)" if smc['fvg_bullish'] or smc['sweep_bullish'] else ("هابط (FVG/Sweep)" if smc['fvg_bearish'] or smc['sweep_bearish'] else "محايد")
         
-        # استخراج أحدث درس تم تعلمه بواسطة Gemini
         last_lesson = "لا يوجد أخطاء حديثة مفحوصة."
         conn = get_db_connection()
         try:
@@ -2289,21 +2322,21 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"───────────────────\n"
             f"🧠 **أحدث قاعدة تعلم ذاتي:**\n_{last_lesson}_"
         )
-        await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+        await safe_reply_text(update, msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
 async def backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not is_authenticated(chat_id):
-        await update.message.reply_text("🔒 يرجى إدخال كلمة السر أولاً لاستخدام البوت.")
+        await safe_reply_text(update, "🔒 يرجى إدخال كلمة السر أولاً لاستخدام البوت.")
         return
-    await update.message.reply_text("📈 جاري تشغيل الاختبار العكسي الكمي للبيانات التاريخية...")
+    await safe_reply_text(update, "📈 جاري تشغيل الاختبار العكسي الكمي للبيانات التاريخية...")
     report = await asyncio.to_thread(run_quant_backtest)
-    await update.message.reply_text(report, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+    await safe_reply_text(update, report, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not is_authenticated(chat_id):
-        await update.message.reply_text("🔒 يرجى إدخال كلمة السر أولاً لاستخدام البوت.")
+        await safe_reply_text(update, "🔒 يرجى إدخال كلمة السر أولاً لاستخدام البوت.")
         return
         
     conn = get_db_connection()
@@ -2312,14 +2345,12 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         is_pg = is_postgres() and isinstance(conn, psycopg2.extensions.connection)
         
-        # إحصائيات الصفقات المغلقة
         cursor.execute("SELECT COUNT(*), SUM(CASE WHEN outcome = 1 THEN 1 ELSE 0 END) FROM trades WHERE outcome IS NOT NULL")
         total_eval, total_wins = cursor.fetchone()
         total_eval = total_eval or 0
         total_wins = total_wins or 0
         overall_win_rate = round((total_wins / total_eval * 100), 1) if total_eval > 0 else 0
 
-        # إحصائيات الصفقات المفتوحة قيد التتبع حالياً
         cursor.execute("SELECT COUNT(*) FROM trades WHERE outcome IS NULL")
         pending_trades = cursor.fetchone()[0] or 0
 
@@ -2371,7 +2402,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"───────────────────\n"
             f"💡 *تم دمج الاختبار الراجع والتعلم الذاتي التلقائي عبر الذكاء الاصطناعي.*\n🧠 *النموذج النشط:* {('متوفر' if CACHED_MODEL else 'بانتظار عينة كافية')}"
         )
-        await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+        await safe_reply_text(update, msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
     except Exception as e:
         print(f"خطأ إحضار الإحصائيات: {e}")
     finally:
@@ -2380,9 +2411,9 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not is_authenticated(chat_id):
-        await update.message.reply_text("🔒 يرجى إدخال كلمة السر أولاً لاستخدام البوت.")
+        await safe_reply_text(update, "🔒 يرجى إدخال كلمة السر أولاً لاستخدام البوت.")
         return
-    await update.message.reply_text("⚡ جاري مطابقة شروط السوق ومراجعة المخاطر بالذكاء الاصطناعي...")
+    await safe_reply_text(update, "⚡ جاري مطابقة شروط السوق ومراجعة المخاطر بالذكاء الاصطناعي...")
     sig = await asyncio.to_thread(generate_quant_signal)
     if sig and sig["status"] == "SIGNAL":
         msg = (
@@ -2399,7 +2430,7 @@ async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         msg = f"⏸️ **تنبيه الانتظار المؤسسي**\n💡 السبب: {sig['reason'] if sig else 'لا توجد فرصة مطابقة'}"
-    await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+    await safe_reply_text(update, msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
 if __name__ == '__main__':
     flask_thread = threading.Thread(target=run_flask, daemon=True)
@@ -2419,6 +2450,7 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("backtest", backtest))
     app.add_handler(CommandHandler("health", system_health_check))
     app.add_handler(CommandHandler("check", system_health_check))
+    app.add_handler(CommandHandler("reset_all", reset_all_data))
     
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
     
