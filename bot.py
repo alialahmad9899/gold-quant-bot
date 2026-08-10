@@ -26,8 +26,9 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 from flask import Flask
 
-# إخفاء تنبيهات pandas الخاصة بروابط قاعدة البيانات لإبقاء السجل نظيفاً
-warnings.filterwarnings('ignore', category=UserWarning, module='pandas')
+# إخفاء تحذيرات pandas لقواعد البيانات كلياً
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', message='.*pandas only supports SQLAlchemy.*')
 
 # 🌐 استدعاء curl_cffi لتجاوز حظر Cloudflare وبصمات السيرفرات السحابية
 try:
@@ -90,7 +91,7 @@ if GEMINI_API_KEY and genai:
         print(f"⚠️ يتعذر تهيئة خدمة الذكاء الاصطناعي: {e}")
 
 # ------------------------------------
-# 🔑 إعدادات الحماية والآدمن والكاش وأمان الخيوط
+# 🔑 إعدادات الحماية والآدمن والكاش وأمان الخيوط والمهام
 # ------------------------------------
 ADMIN_CHAT_ID = 0
 
@@ -98,6 +99,16 @@ cache_lock = threading.Lock()
 fetch_lock = threading.Lock()
 SIGNAL_LOCK = threading.Lock()
 LAST_SCANNER_CANDLE = None
+
+# حاوية مراجع المهام الخلفية لمنع تدميرها بواسطة Python GC
+BACKGROUND_TASKS = set()
+
+def create_managed_task(coro):
+    """إنشاء وتتبع المهام الخلفية لمنع خطأ Task was destroyed but it is pending!"""
+    task = asyncio.create_task(coro)
+    BACKGROUND_TASKS.add(task)
+    task.add_done_callback(BACKGROUND_TASKS.discard)
+    return task
 
 GLOBAL_CACHE = {
     "market_data": {"gold": 0.0, "dxy": 99.85, "us10y": 4.63},
@@ -206,7 +217,8 @@ async def safe_reply_text(update: Update, text: str, **kwargs):
     try:
         return await update.message.reply_text(text, **kwargs)
     except Exception as e:
-        if "Can't parse entities" in str(e) or "400 Bad Request" in str(e):
+        err_msg = str(e)
+        if "Can't parse entities" in err_msg or "400" in err_msg or "Bad Request" in err_msg:
             kwargs_copy = dict(kwargs)
             kwargs_copy.pop('parse_mode', None)
             return await update.message.reply_text(text, **kwargs_copy)
@@ -217,7 +229,8 @@ async def safe_send_message(bot, chat_id: int, text: str, **kwargs):
     try:
         return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
     except Exception as e:
-        if "Can't parse entities" in str(e) or "400 Bad Request" in str(e):
+        err_msg = str(e)
+        if "Can't parse entities" in err_msg or "400" in err_msg or "Bad Request" in err_msg:
             kwargs_copy = dict(kwargs)
             kwargs_copy.pop('parse_mode', None)
             return await bot.send_message(chat_id=chat_id, text=text, **kwargs_copy)
@@ -1250,9 +1263,10 @@ def train_self_learning_model():
 
         df = df.tail(limit).copy().reset_index(drop=True)
         
-        # 🔧 إصلاح استبدال قيم np.inf الآمن لتجنب خطأ ndarray
+        # 🔧 إصلاح جذري تنظيف البيانات باستخدام np.nan_to_num المباشر لمنع استثناء ndarray
         for col in feature_cols:
-            df[col] = pd.to_numeric(df[col], errors='coerce').replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            arr = pd.to_numeric(df[col], errors='coerce').to_numpy()
+            df[col] = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
 
         df['realized_r'] = pd.to_numeric(df['realized_r'], errors='coerce')
         df['realized_r'] = df['realized_r'].fillna(np.where(df['outcome'].astype(int) == 1, 1.0, -1.0))
@@ -2002,11 +2016,12 @@ async def daily_telemetry_worker(app):
 async def post_init(app):
     recover_interrupted_learning_events()
     learning_manager.initialize()
-    asyncio.create_task(background_cache_worker())
-    asyncio.create_task(auto_market_scanner(app))
-    asyncio.create_task(keep_alive_ping())
-    asyncio.create_task(learning_manager.worker_loop(LEARNING_STOP_EVENT))
-    asyncio.create_task(daily_telemetry_worker(app))
+    # استخدام create_managed_task لمنع تدمير المهام بواسطة Garbage Collector
+    create_managed_task(background_cache_worker())
+    create_managed_task(auto_market_scanner(app))
+    create_managed_task(keep_alive_ping())
+    create_managed_task(learning_manager.worker_loop(LEARNING_STOP_EVENT))
+    create_managed_task(daily_telemetry_worker(app))
 
 # ------------------------------------
 # 🧹 أمر تصفير كافة البيانات والذاكرة
