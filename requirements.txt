@@ -5,3 +5,4 @@ numpy
 ta
 flask
 psycopg2-binary
+hmmlearn>=0.3.0
