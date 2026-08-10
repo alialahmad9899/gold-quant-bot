@@ -208,7 +208,7 @@ def next_boundary_delay_seconds(delay_seconds=10):
 
 
 # ---------------------------------------------------------------------------
-# دالة جلب السعر المباشر لسبوت الذهب XAU/USD الشكلي المباشر
+# دالة جلب السعر المباشر المطابق لمنصة PrimeXBT / TradingView Spot
 # ---------------------------------------------------------------------------
 
 def fetch_real_forex_spot_gold():
@@ -232,38 +232,37 @@ def fetch_real_forex_spot_gold():
     return None
 
 
-def fetch_investing_com_price():
-    """جلب سعر الذهب اللحظي المباشر لسبوت الذهب (XAU/USD) المطابق لـ Investing.com."""
-    # المحاولة الأولى: الجلب المباشر من Investing.com
+def fetch_primexbt_price():
+    """جلب سعر الذهب المباشر لزوج (XAU/USD) من صفحة PrimeXBT أو المصادر المباشرة لسبوت الذهب."""
+    # 1. محاولة الجلب المباشر من صفحة PrimeXBT
     try:
-        url = "https://sa.investing.com/currencies/xau-usd"
+        url = "https://primexbt.com/ar/price-chart/commodities/xau-usd"
         req = urllib.request.Request(
             url,
             headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
                 "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
-                "Referer": "https://sa.investing.com/",
+                "Referer": "https://primexbt.com/",
             },
         )
         with urllib.request.urlopen(req, timeout=5) as response:
             html_content = response.read().decode("utf-8", errors="ignore")
             patterns = [
-                r'data-test="instrument-price-last"[^>]*>([\d,\.]+)<',
-                r'class="text-2xl[^"]*"[^>]*>([\d,\.]+)<',
-                r'"last_price":([\d\.]+)',
+                r'القصوى[^>]*>([\d,\.]+)<',
+                r'([\d]{4}\.[\d]{2})',
+                r'"price":\s*([\d\.]+)',
             ]
             for pattern in patterns:
-                match = re.search(pattern, html_content)
-                if match:
-                    price_str = match.group(1).replace(",", "")
-                    price_val = float(price_str)
-                    if price_val > 0:
-                        return round(price_val, 2)
+                matches = re.findall(pattern, html_content)
+                for m in matches:
+                    val = float(m.replace(",", ""))
+                    if 3000 < val < 6000:
+                        return round(val, 2)
     except Exception as exc:
-        logger.debug("فشل الجلب المباشر من Investing.com: %s", exc)
+        logger.debug("فشل الجلب المباشر من PrimeXBT: %s", exc)
 
-    # المحاولة الثانية: جلب سعر Spot Gold (XAUUSD=X) المباشر من Yahoo Finance
+    # 2. محاولة جلب سعر سبوت الذهب XAUUSD=X المباشر من Yahoo Spot
     try:
         url = "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?range=1d&interval=1m"
         req = urllib.request.Request(
@@ -276,12 +275,29 @@ def fetch_investing_com_price():
             data = json.loads(response.read().decode())
             meta = data["chart"]["result"][0]["meta"]
             regular_price = meta.get("regularMarketPrice")
-            if regular_price and float(regular_price) > 0:
+            if regular_price and 3000 < float(regular_price) < 6000:
                 return round(float(regular_price), 2)
     except Exception as exc:
-        logger.debug("فشل جلب سعر XAUUSD=X من المصدر الثاني: %s", exc)
+        logger.debug("فشل جلب سعر XAUUSD=X من Yahoo Spot: %s", exc)
 
-    # المحاولة الثالثة: المصدر الاحتياطي العام لسبوت الذهب
+    # 3. محاولة جلب سعر TradingView المباشر لزوج XAUUSD
+    try:
+        url = "https://scanner.tradingview.com/symbol?symbol=OANDA:XAUUSD"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            },
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode())
+            price = data.get("price")
+            if price and 3000 < float(price) < 6000:
+                return round(float(price), 2)
+    except Exception as exc:
+        logger.debug("فشل جلب سعر TradingView: %s", exc)
+
+    # 4. المصدر الاحتياطي الفوري (Binance PAXG Spot)
     return fetch_real_forex_spot_gold()
 
 
@@ -513,12 +529,12 @@ def market_data_worker_loop(stop_event):
                         used_symbol = sym
                         break
 
-            # 1. جلب سعر سبوت الذهب المباشر لـ XAU/USD لعرضه شكلياً وتعيين النقاط منه
-            investing_price = fetch_investing_com_price()
+            # 1. جلب سعر سبوت الذهب المباشر لـ XAU/USD المطابق لمنصة PrimeXBT لعرضه شكلياً وتعيين النقاط منه
+            primexbt_price = fetch_primexbt_price()
             spot_price, bid, ask, spot_time = fetch_latest_asset_quote(gold_symbols, fallback_df=df_m15)
 
-            if investing_price is not None and investing_price > 0:
-                spot_price = investing_price
+            if primexbt_price is not None and primexbt_price > 0:
+                spot_price = primexbt_price
                 half_spread = ESTIMATED_SPREAD_USD / 2.0
                 bid = round(spot_price - half_spread, 2)
                 ask = round(spot_price + half_spread, 2)
@@ -1497,7 +1513,7 @@ def generate_quant_signal():
 
         signal_candle_close = float(df_closed["Close"].iloc[-1])
 
-        # 2. اعتماد السعر اللحظي من Investing.com فقط كتطبيق شكلي لتحديد أرقام الدخول والهدف والستوب
+        # 2. اعتماد السعر اللحظي من PrimeXBT فقط كتطبيق شكلي لتحديد أرقام الدخول والهدف والستوب
         live_execution_price = macro_data.get("gold_spot")
 
         if (
