@@ -87,7 +87,7 @@ YF_BAR_TIMESTAMP_MODE = os.getenv("YF_BAR_TIMESTAMP_MODE", "open").lower()
 if YF_BAR_TIMESTAMP_MODE not in {"open", "close"}:
     raise ValueError("YF_BAR_TIMESTAMP_MODE must be 'open' or 'close'")
 
-MARKET_FETCH_SECONDS = int(os.getenv("MARKET_FETCH_SECONDS", "60"))
+MARKET_FETCH_SECONDS = int(os.getenv("MARKET_FETCH_SECONDS", "10"))
 FULL_FETCH_SECONDS = int(os.getenv("FULL_FETCH_SECONDS", "14400"))
 CACHE_STALE_SECONDS = int(os.getenv("CACHE_STALE_SECONDS", "300"))
 HEALTH_STALE_SECONDS = int(os.getenv("HEALTH_STALE_SECONDS", "600"))
@@ -208,11 +208,11 @@ def next_boundary_delay_seconds(delay_seconds=10):
 
 
 # ---------------------------------------------------------------------------
-# دالة جلب السعر المباشر المطابق لمنصة PrimeXBT / TradingView Spot
+# دالة جلب السعر المباشر اللحظي عبر APIs حية (Live Spot APIs)
 # ---------------------------------------------------------------------------
 
 def fetch_real_forex_spot_gold():
-    """مصدر احتياطي سريع لجلب سعر سبوت الذهب المباشر."""
+    """مصدر مباشر ولحظي لجلب سعر سبوت الذهب المباشر من Binance PAXG Spot API."""
     url = "https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT"
     req = urllib.request.Request(
         url,
@@ -233,36 +233,8 @@ def fetch_real_forex_spot_gold():
 
 
 def fetch_primexbt_price():
-    """جلب سعر الذهب المباشر لزوج (XAU/USD) من صفحة PrimeXBT أو المصادر المباشرة لسبوت الذهب."""
-    # 1. محاولة الجلب المباشر من صفحة PrimeXBT
-    try:
-        url = "https://primexbt.com/ar/price-chart/commodities/xau-usd"
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
-                "Referer": "https://primexbt.com/",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=5) as response:
-            html_content = response.read().decode("utf-8", errors="ignore")
-            patterns = [
-                r'القصوى[^>]*>([\d,\.]+)<',
-                r'([\d]{4}\.[\d]{2})',
-                r'"price":\s*([\d\.]+)',
-            ]
-            for pattern in patterns:
-                matches = re.findall(pattern, html_content)
-                for m in matches:
-                    val = float(m.replace(",", ""))
-                    if 3000 < val < 6000:
-                        return round(val, 2)
-    except Exception as exc:
-        logger.debug("فشل الجلب المباشر من PrimeXBT: %s", exc)
-
-    # 2. محاولة جلب سعر سبوت الذهب XAUUSD=X المباشر من Yahoo Spot
+    """جلب سعر سبوت الذهب المباشر واللحظي دون الاعتماد على كود HTML الثابت."""
+    # 1. جلب السعر المباشر من API منصة Yahoo Chart Spot لزوج XAUUSD=X
     try:
         url = "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?range=1d&interval=1m"
         req = urllib.request.Request(
@@ -273,14 +245,16 @@ def fetch_primexbt_price():
         )
         with urllib.request.urlopen(req, timeout=5) as response:
             data = json.loads(response.read().decode())
-            meta = data["chart"]["result"][0]["meta"]
-            regular_price = meta.get("regularMarketPrice")
-            if regular_price and 3000 < float(regular_price) < 6000:
-                return round(float(regular_price), 2)
+            result = data.get("chart", {}).get("result", [])
+            if result:
+                meta = result[0].get("meta", {})
+                regular_price = meta.get("regularMarketPrice")
+                if regular_price and 3000 < float(regular_price) < 6000:
+                    return round(float(regular_price), 2)
     except Exception as exc:
         logger.debug("فشل جلب سعر XAUUSD=X من Yahoo Spot: %s", exc)
 
-    # 3. محاولة جلب سعر TradingView المباشر لزوج XAUUSD
+    # 2. محاولة جلب السعر المباشر من TradingView Scanner API لزوج XAUUSD
     try:
         url = "https://scanner.tradingview.com/symbol?symbol=OANDA:XAUUSD"
         req = urllib.request.Request(
@@ -297,7 +271,7 @@ def fetch_primexbt_price():
     except Exception as exc:
         logger.debug("فشل جلب سعر TradingView: %s", exc)
 
-    # 4. المصدر الاحتياطي الفوري (Binance PAXG Spot)
+    # 3. المصدر اللحظي المباشر السريع (Binance PAXG Spot)
     return fetch_real_forex_spot_gold()
 
 
@@ -529,7 +503,7 @@ def market_data_worker_loop(stop_event):
                         used_symbol = sym
                         break
 
-            # 1. جلب سعر سبوت الذهب المباشر لـ XAU/USD المطابق لمنصة PrimeXBT لعرضه شكلياً وتعيين النقاط منه
+            # 1. جلب سعر سبوت الذهب المباشر لـ XAU/USD المطابق لمنصات التداول المباشرة
             primexbt_price = fetch_primexbt_price()
             spot_price, bid, ask, spot_time = fetch_latest_asset_quote(gold_symbols, fallback_df=df_m15)
 
@@ -1513,7 +1487,7 @@ def generate_quant_signal():
 
         signal_candle_close = float(df_closed["Close"].iloc[-1])
 
-        # 2. اعتماد السعر اللحظي من PrimeXBT فقط كتطبيق شكلي لتحديد أرقام الدخول والهدف والستوب
+        # 2. اعتماد السعر اللحظي المباشر من منصة التداول
         live_execution_price = macro_data.get("gold_spot")
 
         if (
