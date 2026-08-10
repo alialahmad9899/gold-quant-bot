@@ -211,8 +211,43 @@ def next_boundary_delay_seconds(delay_seconds=10):
 # دالة جلب السعر المباشر اللحظي عبر APIs حية (Live Spot APIs)
 # ---------------------------------------------------------------------------
 
+def fetch_tradingview_live_spot():
+    """جلب سعر سبوت الذهب المباشر (XAU/USD) لحظياً من سيرفرات TradingView المباشرة (OANDA/FOREXCOM)"""
+    url = "https://scanner.tradingview.com/forex/scan"
+    payload = json.dumps({
+        "symbols": {"tickers": ["OANDA:XAUUSD", "FOREXCOM:XAUUSD", "CAPITALCOM:XAUUSD"]},
+        "columns": ["close"]
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Content-Type": "application/json"
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=4) as response:
+            data = json.loads(response.read().decode())
+            rows = data.get("data", [])
+            for row in rows:
+                val = row.get("d", [None])[0]
+                if val and 3000 < float(val) < 6000:
+                    return round(float(val), 2)
+    except Exception as exc:
+        logger.debug("فشل جلب سعر TradingView Scanner: %s", exc)
+    return None
+
+
 def fetch_real_forex_spot_gold():
-    """مصدر مباشر ولحظي لجلب سعر سبوت الذهب المباشر من Binance PAXG Spot API."""
+    """مصدر مباشر ولحظي لجلب سعر سبوت الذهب المباشر من منصات الفوركس أو بينانس."""
+    # 1. محاولة الجلب اللحظي المباشر من سيرفرات TradingView
+    tv_price = fetch_tradingview_live_spot()
+    if tv_price is not None and tv_price > 0:
+        return tv_price
+
+    # 2. المصدر الاحتياطي من بينانس PAXG
     url = "https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT"
     req = urllib.request.Request(
         url,
@@ -233,8 +268,27 @@ def fetch_real_forex_spot_gold():
 
 
 def fetch_primexbt_price():
-    """جلب سعر سبوت الذهب المباشر واللحظي دون الاعتماد على كود HTML الثابت."""
-    # 1. جلب السعر المباشر من API منصة Yahoo Chart Spot لزوج XAUUSD=X
+    """جلب سعر سبوت الذهب المباشر واللحظي المطبق في منصات التداول الحقيقية دون الاعتماد على كود HTML الثابت."""
+    # 1. المصدر المباشر والأسرع: TradingView Forex Scanner (OANDA / FOREXCOM)
+    tv_price = fetch_tradingview_live_spot()
+    if tv_price is not None and tv_price > 0:
+        return tv_price
+
+    # 2. المصدر الثاني (في حال إضافة FINNHUB_API_KEY في المتغيرات البيئية):
+    finnhub_key = os.getenv("FINNHUB_API_KEY")
+    if finnhub_key:
+        try:
+            url = f"https://finnhub.io/api/v1/quote?symbol=OANDA:XAU_USD&token={finnhub_key}"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                data = json.loads(resp.read().decode())
+                price = data.get("c")
+                if price and 3000 < float(price) < 6000:
+                    return round(float(price), 2)
+        except Exception as exc:
+            logger.debug("فشل جلب سعر Finnhub: %s", exc)
+
+    # 3. المصدر الثالث: Yahoo Finance Spot Chart Direct
     try:
         url = "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?range=1d&interval=1m"
         req = urllib.request.Request(
@@ -254,24 +308,7 @@ def fetch_primexbt_price():
     except Exception as exc:
         logger.debug("فشل جلب سعر XAUUSD=X من Yahoo Spot: %s", exc)
 
-    # 2. محاولة جلب السعر المباشر من TradingView Scanner API لزوج XAUUSD
-    try:
-        url = "https://scanner.tradingview.com/symbol?symbol=OANDA:XAUUSD"
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-            },
-        )
-        with urllib.request.urlopen(req, timeout=5) as response:
-            data = json.loads(response.read().decode())
-            price = data.get("price")
-            if price and 3000 < float(price) < 6000:
-                return round(float(price), 2)
-    except Exception as exc:
-        logger.debug("فشل جلب سعر TradingView: %s", exc)
-
-    # 3. المصدر اللحظي المباشر السريع (Binance PAXG Spot)
+    # 4. المصدر اللحظي الاحتياطي
     return fetch_real_forex_spot_gold()
 
 
