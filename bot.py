@@ -1263,13 +1263,17 @@ def train_self_learning_model():
 
         df = df.tail(limit).copy().reset_index(drop=True)
         
-        # 🔧 إصلاح جذري تنظيف البيانات باستخدام np.nan_to_num المباشر لمنع استثناء ndarray
+        # 🔧 تنظيف الأعمدة الرقمية لمنع القيم غير المحدودة بدون استثناءات ndarray
         for col in feature_cols:
             arr = pd.to_numeric(df[col], errors='coerce').to_numpy()
             df[col] = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
 
         df['realized_r'] = pd.to_numeric(df['realized_r'], errors='coerce')
-        df['realized_r'] = df['realized_r'].fillna(np.where(df['outcome'].astype(int) == 1, 1.0, -1.0))
+        
+        # 🔧 إصلاح استثناء "value parameter must be a scalar, dict or Series" عند دمج np.where مع fillna
+        fallback_r = pd.Series(np.where(df['outcome'].astype(int) == 1, 1.0, -1.0), index=df.index)
+        df['realized_r'] = df['realized_r'].fillna(fallback_r)
+
         split_idx = int(len(df) * 0.75)
         if split_idx < 50 or len(df) - split_idx < MODEL_MIN_OOS_TRADES:
             return CACHED_MODEL
