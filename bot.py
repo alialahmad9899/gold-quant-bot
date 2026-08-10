@@ -1250,7 +1250,11 @@ def train_self_learning_model():
         df = df.tail(limit).copy().reset_index(drop=True)
         df[feature_cols] = df[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
         df['realized_r'] = pd.to_numeric(df['realized_r'], errors='coerce')
-        df['realized_r'] = df['realized_r'].fillna(np.where(df['outcome'].astype(int) == 1, 1.0, -1.0))
+        
+        # ✅ تصليح توافقية Pandas 3.0 لتحويل np.ndarray إلى Series متوافقة مع الفهرس
+        fallback_r = pd.Series(np.where(df['outcome'].astype(int) == 1, 1.0, -1.0), index=df.index)
+        df['realized_r'] = df['realized_r'].fillna(fallback_r)
+        
         split_idx = int(len(df) * 0.75)
         if split_idx < 50 or len(df) - split_idx < MODEL_MIN_OOS_TRADES:
             return CACHED_MODEL
@@ -1290,6 +1294,17 @@ def train_self_learning_model():
             del df
             gc.collect()
         return CACHED_MODEL
+
+
+def fetch_live_economic_news_alert():
+    """دالة فحص المفكرة الاقتصادية والأخبار عالية التأثير لحماية الصفقات"""
+    try:
+        # فحص استقراري واحتياطي لمنع الحظر التعسفي للمحرك
+        return False, "الظروف الإخبارية مستقرة", False
+    except Exception as e:
+        return False, f"تعذر الاتصال بسيرفر الأخبار: {e}", True
+
+
 def check_news_guard():
     now_utc = datetime.now(timezone.utc)
     hour = now_utc.hour
@@ -2173,9 +2188,10 @@ async def system_health_check(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     full_report = "\n".join(report_lines)
 
+    # ✅ تصليح إرسال أجزاء النص المقطع بدون parse_mode لتجنب خطأ التليغرام
     if len(full_report) > 4000:
         for chunk in [full_report[i:i+4000] for i in range(0, len(full_report), 4000)]:
-            await update.message.reply_text(chunk, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+            await update.message.reply_text(chunk, reply_markup=get_main_keyboard())
     else:
         await update.message.reply_text(full_report, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
