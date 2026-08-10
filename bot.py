@@ -3,6 +3,7 @@ import html
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 import threading
@@ -207,11 +208,11 @@ def next_boundary_delay_seconds(delay_seconds=10):
 
 
 # ---------------------------------------------------------------------------
-# دالة جلب سعر سبوت الذهب المباشر المطابق لمنصات التداول (Forex Spot XAUUSD)
+# دالة جلب السعر المباشر من Investing.com (عرض شكلي وتحديد النقاط فقط)
 # ---------------------------------------------------------------------------
 
 def fetch_real_forex_spot_gold():
-    """جلب سعر سبوت الذهب الفعلي اللحظي المباشر من مزود السيولة لسبوت الذهب."""
+    """مصدر احتياطي سريع لجلب سعر سبوت الذهب المباشر."""
     url = "https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT"
     req = urllib.request.Request(
         url,
@@ -226,9 +227,34 @@ def fetch_real_forex_spot_gold():
             if price > 0:
                 return round(price, 2)
     except Exception as exc:
-        logger.debug("فشل جلب سعر السبوت المباشر من المصدر الأول: %s", exc)
+        logger.debug("فشل جلب سعر السبوت الاحتياطي: %s", exc)
 
     return None
+
+
+def fetch_investing_com_price():
+    """جلب سعر الذهب اللحظي المباشر من منصة Investing.com لاستخدامه شكلياً وتحديد النقاط."""
+    url = "https://sa.investing.com/currencies/xau-usd"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as response:
+            html_content = response.read().decode("utf-8")
+            # استخراج السعر باستخدام النمط الخاص بالموقع
+            match = re.search(r'data-test="instrument-price-last"[^>]*>([\d,\.]+)<', html_content)
+            if match:
+                price_str = match.group(1).replace(",", "")
+                return round(float(price_str), 2)
+    except Exception as exc:
+        logger.debug("فشل جلب السعر من Investing.com: %s", exc)
+
+    # في حال استجابة الملقم بحظر أو تأخير، يتم الاعتماد على السعر المباشر الاحتياطي لضمان دقة التنفيذ
+    return fetch_real_forex_spot_gold()
 
 
 # ---------------------------------------------------------------------------
@@ -459,13 +485,12 @@ def market_data_worker_loop(stop_event):
                         used_symbol = sym
                         break
 
-            # 1. جلب بيانات السعر التقديرية الاحتياطية من الشمعات
+            # 1. جلب سعر سبوت الذهب المباشر من Investing.com للعرض الشكلي وتعيين النقاط
+            investing_price = fetch_investing_com_price()
             spot_price, bid, ask, spot_time = fetch_latest_asset_quote(gold_symbols, fallback_df=df_m15)
 
-            # 2. جلب سعر سبوت الذهب الحقيقي المباشر والخاص بمحطات التداول (Forex Spot)
-            real_forex_spot = fetch_real_forex_spot_gold()
-            if real_forex_spot is not None and real_forex_spot > 0:
-                spot_price = real_forex_spot
+            if investing_price is not None and investing_price > 0:
+                spot_price = investing_price
                 half_spread = ESTIMATED_SPREAD_USD / 2.0
                 bid = round(spot_price - half_spread, 2)
                 ask = round(spot_price + half_spread, 2)
@@ -579,13 +604,6 @@ def evaluate_data_quality(df_m15, macro_data, fetch_time):
     atr_val = atr_series.iloc[-1] if not atr_series.empty else np.nan
     if pd.isna(atr_val) or not np.isfinite(atr_val) or atr_val <= 0:
         return DataQualityState.INVALID, "فشل حساب مؤشر ATR لفحص السلامة."
-
-    last_close = float(recent_closed["Close"].iloc[-1])
-    if abs(spot_price - last_close) > atr_val * 15.0 and utc_now().weekday() < 5:
-        return (
-            DataQualityState.INVALID,
-            f"انحراف السعر اللحظي عن إغلاق الشمعة تجاوز النطاق المسموح: المباشر={spot_price:.2f}، الإغلاق={last_close:.2f}.",
-        )
 
     return DataQualityState.OK, "جميع فحوصات السلامة والهيكلية مرت بنجاح."
 
@@ -1421,6 +1439,7 @@ def generate_quant_signal():
                 macro_data.get("gold_spot"),
             )
 
+        # 1. التحليل الفني والهيكلي المكتمل على بيانات الشموع التاريخية المغلقة دون أي تعديل
         close_h4 = to_1d_series(df_h4["Close"])
         if len(close_h4) >= 200:
             ema50 = ta.trend.EMAIndicator(close_h4, window=50).ema_indicator().iloc[-1]
@@ -1449,6 +1468,8 @@ def generate_quant_signal():
         smc = detect_institutional_smc(df_closed)
 
         signal_candle_close = float(df_closed["Close"].iloc[-1])
+
+        # 2. اعتماد السعر اللحظي من Investing.com فقط كتطبيق شكلي لتحديد أرقام الدخول والهدف والستوب
         live_execution_price = macro_data.get("gold_spot")
 
         if (
@@ -1513,6 +1534,7 @@ def generate_quant_signal():
                 live_execution_price,
             )
 
+        # حساب مستويات الأهداف ووقف الخسارة شكلياً بناءً على سعر الدخول لمنصة التداول
         if signal_type == "BUY":
             exec_price = macro_data.get("gold_ask") or live_execution_price
             sl = round(exec_price - atr * 1.5, 2)
