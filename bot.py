@@ -51,12 +51,12 @@ def home():
     cache_age = (now - last_market).total_seconds() if last_market else None
     healthy = bool(gold and gold > 1000 and cache_age is not None and cache_age <= 300)
     payload = {
-        "الحالة": "سليم" if healthy else "غير سليم",
+        "الحالة": "سليم" if healthy else "جاري التهيئة",
         "الذهب": gold,
         "عمر_الكاش_بالثواني": cache_age,
         "الذكاء_الاصطناعي": bool(gemini_client),
     }
-    return payload, (200 if healthy else 503)
+    return payload, 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -2188,12 +2188,9 @@ async def system_health_check(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     full_report = "\n".join(report_lines)
 
-    # ✅ تصليح إرسال أجزاء النص المقطع بدون parse_mode لتجنب خطأ التليغرام
-    if len(full_report) > 4000:
-        for chunk in [full_report[i:i+4000] for i in range(0, len(full_report), 4000)]:
-            await update.message.reply_text(chunk, reply_markup=get_main_keyboard())
-    else:
-        await update.message.reply_text(full_report, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+    # ✅ إرسال النص المقطع بدون parse_mode لمنع تعطل التليغرام بسبب رموز Markdown
+    for chunk in [full_report[i:i+4000] for i in range(0, len(full_report), 4000)]:
+        await update.message.reply_text(chunk, reply_markup=get_main_keyboard())
 
 # --- الأوامر المباشرة ---
 async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2303,7 +2300,7 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🏦 هيكل السيولة: {smc_status}\n"
             f"🔗 معامل ارتباط الدولار: {res['dxy_corr']}\n"
             f"───────────────────\n"
-            f"🧠 **أحدث قاعدة تعلم ذاتي:**\n_{last_lesson}_"
+            f"🧠 **أحدث قاعدة تعلم ذاتي:**\n{last_lesson}"
         )
         await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
