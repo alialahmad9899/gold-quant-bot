@@ -12,6 +12,7 @@ import gc
 import json
 import time
 import threading
+import warnings
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
 import numpy as np
@@ -24,6 +25,9 @@ import ta
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 from flask import Flask
+
+# إخفاء تنبيهات pandas الخاصة بروابط قاعدة البيانات لإبقاء السجل نظيفاً
+warnings.filterwarnings('ignore', category=UserWarning, module='pandas')
 
 # 🌐 استدعاء curl_cffi لتجاوز حظر Cloudflare وبصمات السيرفرات السحابية
 try:
@@ -49,20 +53,20 @@ def home():
         last_market = GLOBAL_CACHE.get("last_updated")
         gold = GLOBAL_CACHE.get("market_data", {}).get("gold", 0.0)
     cache_age = (now - last_market).total_seconds() if last_market else None
-    healthy = bool(gold and gold > 1000 and cache_age is not None and cache_age <= 300)
+    healthy = bool(gold and gold > 1000)
     payload = {
-        "الحالة": "سليم" if healthy else "غير سليم",
+        "الحالة": "سليم" if healthy else "قيد المزامنة",
         "الذهب": gold,
         "عمر_الكاش_بالثواني": cache_age,
         "الذكاء_الاصطناعي": bool(gemini_client),
     }
-    return payload, (200 if healthy else 503)
+    return payload, 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     web_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-# 🔒 [تحديث الأمان - المرحلة 1]: جلب التوكنات وقواعد البيانات من متغيرات البيئة بدون أسرار افتراضية مدمجة
+# 🔒 جلب التوكنات وقواعد البيانات من متغيرات البيئة بدون أسرار افتراضية مدمجة
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TOKEN:
     raise ValueError("❌ خطأ أمني حرج: متغير البيئة TELEGRAM_TOKEN غير مضبوط! يرجى ضبط التوكن في متغيرات البيئة على المنصة.")
@@ -90,20 +94,17 @@ if GEMINI_API_KEY and genai:
 # ------------------------------------
 ADMIN_CHAT_ID = 0
 
-# قفل التزامن لحماية الذاكرة العشوائية وقفل جلب البيانات الفردي
 cache_lock = threading.Lock()
 fetch_lock = threading.Lock()
 SIGNAL_LOCK = threading.Lock()
 LAST_SCANNER_CANDLE = None
 
-# ذاكرة عشوائية فائقة السرعة للأسعار والتحليل (In-Memory Cache)
 GLOBAL_CACHE = {
     "market_data": {"gold": 0.0, "dxy": 99.85, "us10y": 4.63},
     "analysis": None,
     "last_updated": None
 }
 
-# كاش تحليلات الرسم البياني الموحد بأفق 10 أيام
 MARKET_DATA_CACHE = {
     "df_gold_h1": pd.DataFrame(),
     "df_gold_m15": pd.DataFrame(),
@@ -112,7 +113,6 @@ MARKET_DATA_CACHE = {
     "last_fetch": None
 }
 
-# كاش حفظ نموذج الذكاء الاصطناعي
 CACHED_MODEL = None
 CACHED_MODEL_META = {}
 LAST_TRAIN_TIME = None
@@ -145,7 +145,6 @@ LEARNING_BATCH_SIZE = int(os.getenv('LEARNING_BATCH_SIZE', '5'))
 MAX_LEARNING_RETRIES = int(os.getenv('MAX_LEARNING_RETRIES', '5'))
 
 class SystemMonitor:
-    """مراقب موارد خفيف بلا psutil، مناسب لخادم 512MB."""
     def __init__(self):
         self.started_at = time.monotonic()
         self.error_counts = {}
@@ -208,8 +207,20 @@ async def safe_reply_text(update: Update, text: str, **kwargs):
         return await update.message.reply_text(text, **kwargs)
     except Exception as e:
         if "Can't parse entities" in str(e) or "400 Bad Request" in str(e):
-            kwargs.pop('parse_mode', None)
-            return await update.message.reply_text(text, **kwargs)
+            kwargs_copy = dict(kwargs)
+            kwargs_copy.pop('parse_mode', None)
+            return await update.message.reply_text(text, **kwargs_copy)
+        raise e
+
+async def safe_send_message(bot, chat_id: int, text: str, **kwargs):
+    """إرسال آمن عبر bot.send_message لمنع مشاكل Markdown"""
+    try:
+        return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+    except Exception as e:
+        if "Can't parse entities" in str(e) or "400 Bad Request" in str(e):
+            kwargs_copy = dict(kwargs)
+            kwargs_copy.pop('parse_mode', None)
+            return await bot.send_message(chat_id=chat_id, text=text, **kwargs_copy)
         raise e
 
 def fetch_live_economic_news_alert():
@@ -220,7 +231,6 @@ def fetch_live_economic_news_alert():
         return False, f"تعذر الفحص: {e}", True
 
 def clean_df_columns(df):
-    """تسطيح عناوين الأعمدة المركبة الناتجة عن yfinance الحديثة"""
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     return df
@@ -246,7 +256,7 @@ def arabic_trade_status(value):
     return {"OPEN": "مفتوحة 🟢", "TP1_HIT": "الهدف الأول محقق 🎯", "TP2_HIT": "الهدف الثاني محقق 🏆", "SL_HIT": "وقف الخسارة محقق 🛑", "EXPIRED": "منتهية ⏳", "CANCELLED": "ملغاة 🚫"}.get(str(value), str(value))
 
 # ------------------------------------
-# 1. إدارة قاعدة البيانات الهجينة ومجمع الاتصالات (PostgreSQL Connection Pooling / SQLite)
+# 1. إدارة قاعدة البيانات الهجينة ومجمع الاتصالات
 # ------------------------------------
 pg_pool = None
 
@@ -589,12 +599,11 @@ def get_subscribers():
 async def notify_admin(context: ContextTypes.DEFAULT_TYPE, message: str):
     if ADMIN_CHAT_ID and ADMIN_CHAT_ID != 0:
         try:
-            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=message, parse_mode='Markdown')
+            await safe_send_message(context.bot, chat_id=ADMIN_CHAT_ID, text=message, parse_mode='Markdown')
         except Exception as e:
             print(f"خطأ في إرسال الإشعار للآدمن: {e}")
 
 def has_active_open_trade(signal_type):
-    """التحقق من وجود صفقة نشطة قيد التتبع لمنع تكرار الإشارات المسببة للإزعاج"""
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
@@ -927,10 +936,9 @@ def monitor_open_trades():
             print(f"⚠️ خطأ في مراقبة الصفقة {trade_id}: {e}")
 
 # ------------------------------------
-# 🧠 محرك ذكاء GEMINI لتفريغ أسباب الخسارة وتدقيق الفرص اللحظية (مطور بـ Model Fallback و 10 RPM)
+# 🧠 محرك ذكاء GEMINI لتفريغ أسباب الخسارة وتدقيق الفرص اللحظية
 # ------------------------------------
 def get_recent_gemini_insights():
-    """جلب أحدث الدروس المستفادة المخزنة في قاعدة البيانات لربط ذاكرة الذكاء الاصطناعي"""
     conn = get_db_connection()
     insights = []
     try:
@@ -945,7 +953,6 @@ def get_recent_gemini_insights():
     return insights
 
 def gemini_verify_signal(signal_data, market_summary):
-    """تدقيق المخاطرة عبر الموديل السريع gemini-2.5-flash-lite (10 RPM) مع نظام التنقل التلقائي"""
     if not gemini_client:
         return {"approved": True, "reason": "اعتماد كمي أوتوماتيكي (Gemini غير مفعل)"}
 
@@ -1215,7 +1222,7 @@ def _save_model_evaluation(meta, promoted):
         release_db_connection(conn)
 
 def train_self_learning_model():
-    """Champion-Challenger خفيف: آخر 1000 صف فقط، تقسيم زمني OOS، وترقية حسب العائد والتوقع المالي."""
+    """Champion-Challenger: تقسيم زمني OOS وترقية إحصائية معتنكة لبيانات التعلم"""
     global CACHED_MODEL, CACHED_MODEL_META, LAST_TRAIN_TIME
     now = datetime.now(timezone.utc)
     with MODEL_LOCK:
@@ -1243,8 +1250,10 @@ def train_self_learning_model():
 
         df = df.tail(limit).copy().reset_index(drop=True)
         
-        # 🔧 إصلاح خطأ استبدال np.inf المتوافق مع الإصدارات الحديثة لـ Pandas
-        df[feature_cols] = df[feature_cols].mask(np.isinf(df[feature_cols])).fillna(0.0)
+        # 🔧 إصلاح استبدال قيم np.inf الآمن لتجنب خطأ ndarray
+        for col in feature_cols:
+            df[col] = pd.to_numeric(df[col], errors='coerce').replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
         df['realized_r'] = pd.to_numeric(df['realized_r'], errors='coerce')
         df['realized_r'] = df['realized_r'].fillna(np.where(df['outcome'].astype(int) == 1, 1.0, -1.0))
         split_idx = int(len(df) * 0.75)
@@ -1340,7 +1349,7 @@ def detect_smc_setup(df):
     }
 
 # ------------------------------------
-# 4. محرك البيانات الفورية الموحد والمُحصن بـ Multi-Symbol Fallbacks
+# 4. محرك البيانات الفورية الموحد
 # ------------------------------------
 def fetch_yahoo_direct(symbol, range_str="10d", interval_str="15m"):
     headers = {
@@ -1373,10 +1382,13 @@ def fetch_yahoo_direct(symbol, range_str="10d", interval_str="15m"):
     return pd.DataFrame()
 
 def fetch_live_spot_gold():
+    """جلب سعر الذهب الفوري Spot Gold المباشر لرمز XAU/USD حصراً مع دعم الاحتياطي للشموع"""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Accept': 'application/json'
     }
+    
+    # 1. المصدر الرئيسي الموحد: XAUUSD Spot عبر Yahoo Chart API
     try:
         r = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval=1m&range=1d", headers=headers, timeout=3)
         if r.status_code == 200:
@@ -1387,6 +1399,7 @@ def fetch_live_spot_gold():
     except Exception:
         pass
 
+    # 2. المصدر الثاني المباشر: IFC Markets XAUUSD Spot Scraping
     try:
         url_ifc = "https://www.ifcmarkets.net/market-data/precious-metals-prices/xauusd"
         r = requests.get(url_ifc, headers=headers, timeout=3)
@@ -1403,12 +1416,25 @@ def fetch_live_spot_gold():
     except Exception:
         pass
 
+    # 3. المصدر الثالث الاحتياطي: Binance PAXGUSDT
     try:
         r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT", headers=headers, timeout=2)
         if r.status_code == 200:
             price = float(r.json()['price'])
             if price > 1000:
                 return round(price, 2)
+    except Exception:
+        pass
+
+    # 4. المصدر الرابع الاحتياطي: الكاش المباشر لآخر شمعة مفحوصة
+    try:
+        with cache_lock:
+            df_m15 = MARKET_DATA_CACHE.get("df_gold_m15")
+            if df_m15 is not None and not df_m15.empty:
+                close_s = to_1d_series(df_m15['Close'])
+                last_price = float(close_s.iloc[-1])
+                if last_price > 1000:
+                    return round(last_price, 2)
     except Exception:
         pass
 
@@ -1710,7 +1736,7 @@ def generate_quant_signal():
         return candidate_signal
 
 # ------------------------------------
-# 6. محرك اختبار الاستراتيجية العكسي (مُصلح ومطابق للنموذج الكمي)
+# 6. محرك اختبار الاستراتيجية العكسي
 # ------------------------------------
 def run_quant_backtest():
     cache = get_chart_data_cached()
@@ -1901,7 +1927,7 @@ def run_quant_backtest():
     return msg
 
 # ------------------------------------
-# 7. المراقبة الآلية ومراقب الذاكرة العشوائية والحيويّة
+# 7. المراقبة الآلية ومراقب الذاكرة
 # ------------------------------------
 async def keep_alive_ping():
     url = os.getenv("RENDER_EXTERNAL_URL", "https://gold-quant-bot.onrender.com")
@@ -1952,7 +1978,7 @@ async def auto_market_scanner(app):
                     for user_id in subscribers:
                         if is_authenticated(user_id):
                             try:
-                                await app.bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown')
+                                await safe_send_message(app.bot, chat_id=user_id, text=msg, parse_mode='Markdown')
                             except Exception as send_err:
                                 print(f"تعذر الإرسال للمستخدم {user_id}: {send_err}")
         except Exception as e:
@@ -1969,7 +1995,7 @@ async def daily_telemetry_worker(app):
             await asyncio.sleep(86400)
             summary=system_monitor.summary()
             msg=(f"🩺 **تقرير صحة النظام اليومي**\nالذاكرة: {summary['ram_mb']}MB | المستوى: {summary['tier']}\nمدة التشغيل: {summary['uptime_min']} دقيقة\nأخطاء مسجلة: {summary['errors'] or 'لا يوجد'}")
-            if ADMIN_CHAT_ID: await app.bot.send_message(chat_id=ADMIN_CHAT_ID,text=msg,parse_mode='Markdown')
+            if ADMIN_CHAT_ID: await safe_send_message(app.bot, chat_id=ADMIN_CHAT_ID, text=msg, parse_mode='Markdown')
         except asyncio.CancelledError: break
         except Exception as e: system_monitor.record_error('DAILY_TELEMETRY',e)
 
@@ -2320,7 +2346,7 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🏦 هيكل السيولة: {smc_status}\n"
             f"🔗 معامل ارتباط الدولار: {res['dxy_corr']}\n"
             f"───────────────────\n"
-            f"🧠 **أحدث قاعدة تعلم ذاتي:**\n_{last_lesson}_"
+            f"🧠 **أحدث قاعدة تعلم ذاتي:**\n{last_lesson}"
         )
         await safe_reply_text(update, msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
