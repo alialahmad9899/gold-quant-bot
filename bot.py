@@ -847,7 +847,7 @@ def process_learning_batch(events):
 {chr(10).join(lines)}
 """
     last_error=None
-    for target_model in ['gemini-1.5-flash', 'gemini-2.0-flash', 'gemini-1.5-pro']:
+    for target_model in ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash-exp']:
         try:
             response=gemini_client.models.generate_content(model=target_model,contents=prompt,config=types.GenerateContentConfig(response_mime_type='application/json'))
             result=json.loads(response.text); lesson=result.get('lesson','')
