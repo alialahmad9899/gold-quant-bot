@@ -90,6 +90,182 @@ if GEMINI_API_KEY and genai:
     except Exception as e:
         print(f"⚠️ يتعذر تهيئة خدمة الذكاء الاصطناعي: {e}")
 
+# ------------------------------------------------------------------
+# 🧠 محرك الاستكشاف والتدوير الديناميكي التام (Pure Dynamic Discovery Engine)
+# ------------------------------------------------------------------
+DISCOVERED_MODELS_CACHE = []
+LAST_MODELS_DISCOVERY_TIME = None
+MODELS_DISCOVERY_LOCK = threading.Lock()
+SESSION_BLACKLIST_404 = set()
+MODEL_COOLDOWNS_429 = {}
+
+# حظر دائم للعائلات القديمة الملغاة
+DEPRECATED_MODEL_PATTERNS = ['gemini-1.5', 'gemini-2.0', 'embedding', 'aqa', 'imagen', 'whisper', 'tts']
+
+def discover_available_models(force_refresh=False):
+    """
+    الاستعلام الفعلي الحصري عبر models.list() لاستخراج الموديلات المتاحة لمفتاحك
+    وفلترة الموديلات التي تدعم توليد النصوص generateContent فقط.
+    """
+    global DISCOVERED_MODELS_CACHE, LAST_MODELS_DISCOVERY_TIME
+    if not gemini_client:
+        return []
+
+    now = time.monotonic()
+    with MODELS_DISCOVERY_LOCK:
+        # تجديد الكاش كل ساعة أو عند الطلب الإجباري
+        if not force_refresh and DISCOVERED_MODELS_CACHE and LAST_MODELS_DISCOVERY_TIME and (now - LAST_MODELS_DISCOVERY_TIME < 3600):
+            # تصفية الموديلات الموجودة في الـ blacklist المؤقت لهذه الجلسة
+            return [m for m in DISCOVERED_MODELS_CACHE if m not in SESSION_BLACKLIST_404]
+
+        try:
+            available = []
+            models_list = gemini_client.models.list()
+            for m in models_list:
+                m_name = getattr(m, 'name', '') or ''
+                clean_name = m_name.replace('models/', '') if m_name.startswith('models/') else m_name
+                
+                if not clean_name:
+                    continue
+
+                # استبعاد العائلات المحظورة والأنماط غير النصية
+                if any(pat in clean_name.lower() for pat in DEPRECATED_MODEL_PATTERNS):
+                    continue
+                
+                # التحقق الصارم من دعم توليد النصوص generateContent
+                supported_methods = getattr(m, 'supported_generation_methods', []) or []
+                supported_actions = getattr(m, 'supported_actions', []) or []
+                all_supported = [str(x).lower() for x in (supported_methods + supported_actions)]
+                
+                if all_supported:
+                    if any('generatecontent' in act for act in all_supported):
+                        available.append(clean_name)
+                else:
+                    available.append(clean_name)
+
+            if available:
+                DISCOVERED_MODELS_CACHE = available
+                LAST_MODELS_DISCOVERY_TIME = now
+                # تنظيف البلاك ليست عند الاكتشاف الجديد
+                SESSION_BLACKLIST_404.clear()
+                logger.info("✅ [Dynamic Discovery] تم اكتشاف الموديلات المتاحة فعلياً لمفتاحك: %s", DISCOVERED_MODELS_CACHE)
+                return [m for m in DISCOVERED_MODELS_CACHE if m not in SESSION_BLACKLIST_404]
+
+        except Exception as e:
+            logger.warning("⚠️ [Dynamic Discovery] تعذر الاستعلام عبر models.list(): %s", e)
+
+        return [m for m in DISCOVERED_MODELS_CACHE if m not in SESSION_BLACKLIST_404]
+
+def prioritize_models_for_task(task_type="vetting"):
+    """
+    ترتيب الموديلات المكتشفة ديناميكياً فقط حسب نوع المهمة وتجنب الموديلات تحت الـ Cooldown
+    """
+    available = discover_available_models(force_refresh=False)
+    now = time.monotonic()
+    
+    # استبعاد الموديلات التي ما زالت في فترة التهدئة المؤقتة (429 Cooldown)
+    active_candidates = [m for m in available if now >= MODEL_COOLDOWNS_429.get(m, 0)]
+    
+    # إذا كانت كل الموديلات في فترة تهدئة، نستخدم كل المتاح
+    pool_models = active_candidates if active_candidates else available
+    
+    def score_model(name):
+        n = name.lower()
+        score = 0
+        if task_type == "vetting":
+            # للمهام المعقدة والقرارات: نفضل الموديلات الكاملة ثم السريعة
+            if 'flash' in n and 'lite' not in n:
+                score += 30
+            elif 'pro' in n:
+                score += 20
+            elif 'lite' in n:
+                score += 10
+        else:
+            # لمهام التعلم، تفريغ الخسائر، والفحص الخفيف: نفضل الموديلات الاقتصادية الخفيفة
+            if 'lite' in n:
+                score += 30
+            elif 'flash' in n:
+                score += 20
+            elif 'pro' in n:
+                score += 10
+        # تفضيل الموديلات ذات الإصدارات الأحدث رقمياً
+        nums = re.findall(r'\d+', n)
+        if nums:
+            try:
+                score += int(nums[0])
+            except Exception:
+                pass
+        return score
+
+    sorted_candidates = sorted(pool_models, key=score_model, reverse=True)
+    return sorted_candidates
+
+def execute_gemini_dynamic_request(prompt, response_mime_type="application/json", task_type="vetting"):
+    """
+    تنفيذ استدعاء الذكاء الاصطناعي بالاعتماد الحصري على الموديلات المكتشفة مع معالجة ذكية للأخطاء:
+    - 404: إضافة الموديل لـ SESSION_BLACKLIST_404 والانتقال للبديل.
+    - 429: تطبيق Backoff وإضافة فترة Cooldown للموديل والانتقال للبديل.
+    - 400: رمي الخطأ مباشرة دون تضييع الموديلات (المشكلة في الـ Payload/Prompt).
+    - 5xx/Network: محاولة بديلة ثم Graceful Fallback.
+    """
+    if not gemini_client:
+        raise RuntimeError("خدمة Gemini غير مهيأة أو المفتاح مفقود.")
+
+    candidates = prioritize_models_for_task(task_type=task_type)
+    if not candidates:
+        # محاولة إعادة الاكتشاف الإجباري في حال كانت القائمة فارغة
+        candidates = discover_available_models(force_refresh=True)
+        if not candidates:
+            raise RuntimeError("لم يتم العثور على أي موديل متاح وداعم لـ generateContent لمفتاحك.")
+
+    config_params = {}
+    if response_mime_type:
+        config_params["response_mime_type"] = response_mime_type
+    cfg = types.GenerateContentConfig(**config_params) if config_params else None
+
+    last_error = None
+
+    for target_model in candidates:
+        for attempt in range(2):
+            try:
+                response = gemini_client.models.generate_content(
+                    model=target_model,
+                    contents=prompt,
+                    config=cfg
+                )
+                if response and response.text:
+                    return response.text, target_model
+            except Exception as e:
+                err_str = str(e)
+                last_error = e
+
+                # 1. خطأ 404: الموديل غير موجود / معطل في هذا المسار
+                if "404" in err_str or "NOT_FOUND" in err_str or "is not found" in err_str:
+                    logger.warning(f"🚫 [404 NOT_FOUND] الموديل [{target_model}] غير متاح. جاري وضعه في البلاك ليست المؤقت وتجربة موديل آخر...")
+                    with MODELS_DISCOVERY_LOCK:
+                        SESSION_BLACKLIST_404.add(target_model)
+                    break
+
+                # 2. خطأ 429: استنفاد الحصة المجانية أو ضغط الطلبات
+                elif "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    cooldown_time = time.monotonic() + 45  # 45 ثانية تهدئة لهذا الموديل
+                    MODEL_COOLDOWNS_429[target_model] = cooldown_time
+                    logger.warning(f"⏳ [429 QUOTA] بلوغ حد الطلبات على [{target_model}]. جاري تطبيق التهدئة والانتقال للبديل...")
+                    time.sleep(1.2 + (hash(str(time.time())) % 500) / 1000.0)
+                    continue
+
+                # 3. خطأ 400: الطلب نفسه غير صالح (لا ننتقل لموديل آخر لأن المشكلة في المعاملات)
+                elif "400" in err_str or "INVALID_ARGUMENT" in err_str or "Bad Request" in err_str:
+                    logger.error(f"❌ [400 INVALID_ARGUMENT] خطأ في صياغة الطلب أو الـ Config: {err_str}")
+                    raise e
+
+                # 4. أخطاء أخرى (شبكة أو 5xx)
+                else:
+                    logger.warning(f"⚠️ خطأ أثناء استدعاء [{target_model}]: {err_str}")
+                    break
+
+    raise RuntimeError(f"تعذرت جميع محاولات النماذج المكتشفة ديناميكياً. آخر خطأ مسجل: {last_error}")
+
 # ------------------------------------
 # 🔑 إعدادات الحماية والآدمن والكاش وأمان الخيوط والمهام
 # ------------------------------------
@@ -100,7 +276,6 @@ fetch_lock = threading.Lock()
 SIGNAL_LOCK = threading.Lock()
 LAST_SCANNER_CANDLE = None
 
-# حاوية مراجع المهام الخلفية لمنع تدميرها بواسطة Python GC
 BACKGROUND_TASKS = set()
 
 def create_managed_task(coro):
@@ -213,7 +388,6 @@ system_monitor = SystemMonitor()
 # 🛠️ أدوات مساعدة وتجهيز البيانات
 # ------------------------------------
 async def safe_reply_text(update: Update, text: str, **kwargs):
-    """إرسال آمن للرسائل مع تجنب توقف البوت بسبب خطأ تنسيق التليغرام Markdown"""
     try:
         return await update.message.reply_text(text, **kwargs)
     except Exception as e:
@@ -225,7 +399,6 @@ async def safe_reply_text(update: Update, text: str, **kwargs):
         raise e
 
 async def safe_send_message(bot, chat_id: int, text: str, **kwargs):
-    """إرسال آمن عبر bot.send_message لمنع مشاكل Markdown"""
     try:
         return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
     except Exception as e:
@@ -237,7 +410,6 @@ async def safe_send_message(bot, chat_id: int, text: str, **kwargs):
         raise e
 
 def fetch_live_economic_news_alert():
-    """جلب حالة المفكرة الاقتصادية وتفادي توقف البوت عند عدم وجود مزود خارجي"""
     try:
         return False, "الظروف الإخبارية مستقرة", False
     except Exception as e:
@@ -376,9 +548,16 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS model_evaluations (
                     id SERIAL PRIMARY KEY,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    model_name VARCHAR(100), feature_version VARCHAR(50),
-                    sample_size INTEGER, oos_trades INTEGER, total_r REAL,
-                    expectancy_r REAL, profit_factor REAL, max_drawdown_r REAL, promoted INTEGER DEFAULT 0
+                    model_name VARCHAR(100), 
+                    feature_version VARCHAR(50),
+                    strategy_version VARCHAR(50),
+                    sample_size INTEGER, 
+                    oos_trades INTEGER, 
+                    total_r REAL,
+                    expectancy_r REAL, 
+                    profit_factor REAL, 
+                    max_drawdown_r REAL, 
+                    promoted INTEGER DEFAULT 0
                 );
             ''')
         else:
@@ -450,10 +629,25 @@ def init_db():
 
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS model_evaluations (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT, model_name TEXT, feature_version TEXT,
-                    sample_size INTEGER, oos_trades INTEGER, total_r REAL, expectancy_r REAL, profit_factor REAL, max_drawdown_r REAL, promoted INTEGER DEFAULT 0
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                    created_at TEXT, 
+                    model_name TEXT, 
+                    feature_version TEXT,
+                    strategy_version TEXT,
+                    sample_size INTEGER, 
+                    oos_trades INTEGER, 
+                    total_r REAL, 
+                    expectancy_r REAL, 
+                    profit_factor REAL, 
+                    max_drawdown_r REAL, 
+                    promoted INTEGER DEFAULT 0
                 )
             ''')
+            cursor.execute("PRAGMA table_info(model_evaluations)")
+            me_cols = [col[1] for col in cursor.fetchall()]
+            if "strategy_version" not in me_cols:
+                cursor.execute("ALTER TABLE model_evaluations ADD COLUMN strategy_version TEXT")
+
         if is_postgres() and isinstance(conn, psycopg2.extensions.connection):
             cursor.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS candle_id VARCHAR(100)")
             cursor.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS trade_status VARCHAR(20) DEFAULT 'OPEN'")
@@ -464,6 +658,7 @@ def init_db():
             cursor.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS realized_r REAL")
             cursor.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS slippage REAL")
             cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_candle_id ON trades(candle_id)")
+            cursor.execute("ALTER TABLE model_evaluations ADD COLUMN IF NOT EXISTS strategy_version VARCHAR(50)")
 
         if is_postgres() and isinstance(conn, psycopg2.extensions.connection):
             cursor.execute("""
@@ -846,25 +1041,28 @@ def process_learning_batch(events):
 النتائج:
 {chr(10).join(lines)}
 """
-    last_error=None
-    for target_model in ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash-exp']:
-        try:
-            response=gemini_client.models.generate_content(model=target_model,contents=prompt,config=types.GenerateContentConfig(response_mime_type='application/json'))
-            result=json.loads(response.text); lesson=result.get('lesson','')
-            if lesson:
-                conn=get_db_connection()
-                try:
-                    cur=conn.cursor(); is_pg=is_postgres() and isinstance(conn,psycopg2.extensions.connection); ts=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-                    if is_pg: cur.execute('INSERT INTO gemini_insights (created_at,lesson) VALUES (%s,%s)',(ts,lesson))
-                    else: cur.execute('INSERT INTO gemini_insights (created_at,lesson) VALUES (?,?)',(ts,lesson))
-                    conn.commit()
-                finally: release_db_connection(conn)
-            learning_circuit.success(); return True
-        except Exception as e:
-            last_error=e
-            if '429' in str(e) or 'RESOURCE_EXHAUSTED' in str(e): time.sleep(1.5+(hash(str(time.time()))%1000)/1000.0); continue
-            break
-    learning_circuit.failure(); raise RuntimeError(last_error or 'فشل تحليل دفعة التعلم')
+    try:
+        resp_text, used_model = execute_gemini_dynamic_request(prompt, response_mime_type="application/json", task_type="batch")
+        result = json.loads(resp_text)
+        lesson = result.get('lesson', '')
+        if lesson:
+            conn = get_db_connection()
+            try:
+                cur = conn.cursor()
+                is_pg = is_postgres() and isinstance(conn, psycopg2.extensions.connection)
+                ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+                if is_pg:
+                    cur.execute('INSERT INTO gemini_insights (created_at, lesson) VALUES (%s, %s)', (ts, lesson))
+                else:
+                    cur.execute('INSERT INTO gemini_insights (created_at, lesson) VALUES (?, ?)', (ts, lesson))
+                conn.commit()
+            finally:
+                release_db_connection(conn)
+        learning_circuit.success()
+        return True
+    except Exception as e:
+        learning_circuit.failure()
+        raise RuntimeError(e or 'فشل تحليل دفعة التعلم')
 
 class LearningQueueManager:
     def __init__(self,maxsize=50): self.maxsize=maxsize; self.queue=None; self.enqueued_ids=set()
@@ -1000,29 +1198,13 @@ def gemini_verify_signal(signal_data, market_summary):
     }}
     """
     
-    candidate_models = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash-exp']
-
-    for target_model in candidate_models:
-        for attempt in range(2):
-            try:
-                response = gemini_client.models.generate_content(
-                    model=target_model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json"
-                    )
-                )
-                data = json.loads(response.text)
-                return data
-            except Exception as e:
-                err_str = str(e)
-                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                    time.sleep(2)
-                    continue
-                else:
-                    break
-
-    return {"approved": True, "reason": "اعتماد كمي تلقائي (تم تجاوز حدود استخدام Gemini)"}
+    try:
+        resp_text, used_model = execute_gemini_dynamic_request(prompt, response_mime_type="application/json", task_type="vetting")
+        data = json.loads(resp_text)
+        return data
+    except Exception as e:
+        logger.warning(f"⚠️ [Gemini Vetting Fallback] تعذر مراجعة الإشارة عبر Gemini: {e}")
+        return {"approved": True, "reason": "اعتماد كمي تلقائي (خدمة الذكاء الاصطناعي غير متاحة مؤقتاً)"}
 
 def update_open_trades_outcome_historical(df_m15):
     conn = get_db_connection()
@@ -1061,7 +1243,7 @@ def update_open_trades_outcome_historical(df_m15):
                     elif "SELL" in sig_type or "بيع" in sig_type:
                         if live_price <= tp1:
                             outcome = 1
-                        elif live_price >= sl:
+                        elif live_price <= sl:
                             outcome = 0
 
                 if outcome is None and not df_clean.empty:
@@ -1126,7 +1308,7 @@ def build_historic_market_features():
         return None, None
 
     df_clean = clean_df_columns(df_m15.copy())
-    df_clean = df_clean[~df_clean.index.duplicated(keep='first')]
+    df_clean = df_clean[~df_clean.index.duplicated(keep='first')].sort_index()
 
     close = to_1d_series(df_clean['Close'])
     high = to_1d_series(df_clean['High'])
@@ -1134,7 +1316,7 @@ def build_historic_market_features():
     open_p = to_1d_series(df_clean['Open'])
 
     if df_dxy_m15 is not None and not df_dxy_m15.empty:
-        df_dxy_clean = clean_df_columns(df_dxy_m15.copy())
+        df_dxy_clean = clean_df_columns(df_dxy_m15.copy()).sort_index()
         close_dxy = to_1d_series(df_dxy_clean['Close'])
         returns_gold = np.log(close / close.shift(1))
         returns_dxy_aligned = np.log(close_dxy / close_dxy.shift(1)).reindex(index=returns_gold.index).ffill().fillna(0)
@@ -1225,7 +1407,26 @@ def _save_model_evaluation(meta, promoted):
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         is_pg = is_postgres() and isinstance(conn, psycopg2.extensions.connection)
         ph = "%s" if is_pg else "?"
-        cur.execute(f"INSERT INTO model_evaluations (created_at, model_name, feature_version, sample_size, oos_trades, total_r, expectancy_r, profit_factor, max_drawdown_r, promoted) VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph})", (ts, meta.get("model_name", "RandomForest"), meta.get("feature_version", "v1"), meta.get("sample_size", 0), meta.get("oos_trades", 0), meta.get("total_r", 0.0), meta.get("expectancy_r", 0.0), meta.get("profit_factor", 0.0), meta.get("max_drawdown_r", 0.0), int(bool(promoted))))
+        cur.execute(
+            f"""
+            INSERT INTO model_evaluations 
+            (created_at, model_name, feature_version, strategy_version, sample_size, oos_trades, total_r, expectancy_r, profit_factor, max_drawdown_r, promoted) 
+            VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph})
+            """, 
+            (
+                ts, 
+                meta.get("model_name", MODEL_VERSION), 
+                meta.get("feature_version", FEATURE_VERSION), 
+                meta.get("strategy_version", STRATEGY_VERSION), 
+                meta.get("sample_size", 0), 
+                meta.get("oos_trades", 0), 
+                meta.get("total_r", 0.0), 
+                meta.get("expectancy_r", 0.0), 
+                meta.get("profit_factor", 0.0), 
+                meta.get("max_drawdown_r", 0.0), 
+                int(bool(promoted))
+            )
+        )
         conn.commit()
     except Exception as e:
         try: conn.rollback()
@@ -1234,8 +1435,69 @@ def _save_model_evaluation(meta, promoted):
     finally:
         release_db_connection(conn)
 
+def _run_walk_forward_validation(df, feature_cols, n_splits=4):
+    """
+    محرك التحقق الزمني المتقدم Walk-Forward Validation (Expanding Windows).
+    الماضي -> التدريب | المستقبل الحصري -> تقييم OOS (بدون أي تسريب مستقبلي).
+    """
+    n_samples = len(df)
+    min_train_size = int(n_samples * 0.40)
+    remaining_samples = n_samples - min_train_size
+    oos_step = remaining_samples // n_splits
+    
+    if oos_step < 5:
+        return None, None
+        
+    all_oos_selected_r = []
+    
+    for split_idx in range(n_splits):
+        train_end = min_train_size + (split_idx * oos_step)
+        oos_end = train_end + oos_step if split_idx < n_splits - 1 else n_samples
+        
+        X_train = df.loc[:train_end-1, feature_cols]
+        y_train = df.loc[:train_end-1, 'outcome'].astype(int)
+        
+        X_oos = df.loc[train_end:oos_end-1, feature_cols]
+        y_oos = df.loc[train_end:oos_end-1, 'outcome'].astype(int)
+        realized_oos = df.loc[train_end:oos_end-1, 'realized_r'].astype(float).to_numpy()
+        
+        if len(np.unique(y_train)) < 2 or len(y_oos) == 0:
+            continue
+            
+        fold_clf = RandomForestClassifier(
+            n_estimators=50,
+            max_depth=3,
+            min_samples_leaf=3,
+            class_weight='balanced',
+            random_state=42,
+            n_jobs=1
+        )
+        fold_clf.fit(X_train, y_train)
+        pred = fold_clf.predict(X_oos)
+        
+        selected_r = np.where(pred == 1, realized_oos, 0.0)
+        all_oos_selected_r.extend(selected_r)
+        
+    if not all_oos_selected_r:
+        return None, None
+        
+    oos_metrics = _financial_metrics(all_oos_selected_r)
+    
+    # تدريب النموذج المتحدي النهائي (Challenger) على كامل التاريخ المرتب زمنياً
+    challenger_model = RandomForestClassifier(
+        n_estimators=50,
+        max_depth=3,
+        min_samples_leaf=3,
+        class_weight='balanced',
+        random_state=42,
+        n_jobs=1
+    )
+    challenger_model.fit(df[feature_cols], df['outcome'].astype(int))
+    
+    return challenger_model, oos_metrics
+
 def train_self_learning_model():
-    """Champion-Challenger: تقسيم زمني OOS وترقية إحصائية معتنكة لبيانات التعلم"""
+    """Champion-Challenger: تدريب Walk-Forward زمني صارم وترقية إحصائية موثقة"""
     global CACHED_MODEL, CACHED_MODEL_META, LAST_TRAIN_TIME
     now = datetime.now(timezone.utc)
     with MODEL_LOCK:
@@ -1246,7 +1508,32 @@ def train_self_learning_model():
         df = None
         try:
             limit = int(max(100, min(MODEL_TRAIN_LIMIT, 1000)))
-            df = pd.read_sql_query(f"SELECT rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, outcome, realized_r FROM trades WHERE outcome IS NOT NULL ORDER BY id DESC LIMIT {limit}", conn)
+            # 🔴 الترتيب الزمني الصارم: جلب أحدث limit صفقة مع ترتيبها تصاعدياً (الأقدم أولاً -> الأحدث آخراً)
+            if is_postgres() and isinstance(conn, psycopg2.extensions.connection):
+                query = f"""
+                    SELECT rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, outcome, realized_r, id
+                    FROM (
+                        SELECT rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, outcome, realized_r, id
+                        FROM trades
+                        WHERE outcome IS NOT NULL
+                        ORDER BY id DESC
+                        LIMIT {limit}
+                    ) sub
+                    ORDER BY id ASC
+                """
+            else:
+                query = f"""
+                    SELECT rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, outcome, realized_r, id
+                    FROM (
+                        SELECT rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, outcome, realized_r, id
+                        FROM trades
+                        WHERE outcome IS NOT NULL
+                        ORDER BY id DESC
+                        LIMIT {limit}
+                    )
+                    ORDER BY id ASC
+                """
+            df = pd.read_sql_query(query, conn)
         except Exception as e:
             print(f"تنبيه استعلام قاعدة البيانات لتدريب الذكاء الاصطناعي: {e}")
         finally:
@@ -1263,40 +1550,41 @@ def train_self_learning_model():
 
         df = df.tail(limit).copy().reset_index(drop=True)
         
-        # 🔧 تنظيف الأعمدة الرقمية لمنع القيم غير المحدودة بدون استثناءات ndarray
         for col in feature_cols:
             arr = pd.to_numeric(df[col], errors='coerce').to_numpy()
             df[col] = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
 
         df['realized_r'] = pd.to_numeric(df['realized_r'], errors='coerce')
-        
-        # 🔧 إصلاح استثناء "value parameter must be a scalar, dict or Series" عند دمج np.where مع fillna
         fallback_r = pd.Series(np.where(df['outcome'].astype(int) == 1, 1.0, -1.0), index=df.index)
         df['realized_r'] = df['realized_r'].fillna(fallback_r)
 
-        split_idx = int(len(df) * 0.75)
-        if split_idx < 50 or len(df) - split_idx < MODEL_MIN_OOS_TRADES:
-            return CACHED_MODEL
-
-        X_train, y_train = df.loc[:split_idx-1, feature_cols], df.loc[:split_idx-1, 'outcome'].astype(int)
-        X_oos, y_oos = df.loc[split_idx:, feature_cols], df.loc[split_idx:, 'outcome'].astype(int)
-        realized_oos = df.loc[split_idx:, 'realized_r'].astype(float).to_numpy()
-        if len(np.unique(y_train)) < 2 or len(np.unique(y_oos)) < 2:
+        if len(df) < MODEL_MIN_OOS_TRADES:
             return CACHED_MODEL
 
         try:
             if not system_monitor.heavy_tasks_allowed():
                 logger.warning('[HEALTH] تم تأجيل تدريب Challenger بسبب ضغط الذاكرة.')
                 return CACHED_MODEL
-            candidate = RandomForestClassifier(n_estimators=50, max_depth=3, min_samples_leaf=3, class_weight='balanced', random_state=42, n_jobs=1)
-            candidate.fit(X_train, y_train)
-            pred = candidate.predict(X_oos)
-            selected_r = np.where(pred == 1, realized_oos, 0.0)
-            metrics = _financial_metrics(selected_r)
-            metrics.update({"model_name": "RandomForest", "feature_version": "v1", "sample_size": int(len(df)), "oos_trades": int(len(selected_r))})
+
+            candidate, metrics = _run_walk_forward_validation(df, feature_cols, n_splits=4)
+            if candidate is None or metrics is None:
+                return CACHED_MODEL
+
+            metrics.update({
+                "model_name": MODEL_VERSION,
+                "feature_version": FEATURE_VERSION,
+                "strategy_version": STRATEGY_VERSION,
+                "sample_size": int(len(df)),
+                "oos_trades": int(metrics.get("trades", 0))
+            })
 
             current = CACHED_MODEL_META or {"total_r": -np.inf, "expectancy_r": -np.inf, "max_drawdown_r": np.inf, "profit_factor": 0.0}
-            promoted = (metrics["total_r"] >= current.get("total_r", -np.inf) + MODEL_PROMOTION_MARGIN_R and metrics["expectancy_r"] >= current.get("expectancy_r", -np.inf) and metrics["max_drawdown_r"] <= max(3.0, current.get("max_drawdown_r", np.inf)) and metrics["profit_factor"] >= 1.0)
+            promoted = (
+                metrics["total_r"] >= current.get("total_r", -np.inf) + MODEL_PROMOTION_MARGIN_R 
+                and metrics["expectancy_r"] >= current.get("expectancy_r", -np.inf) 
+                and metrics["max_drawdown_r"] <= max(3.0, current.get("max_drawdown_r", np.inf)) 
+                and metrics["profit_factor"] >= 1.0
+            )
             if CACHED_MODEL is None:
                 promoted = metrics["total_r"] > 0 and metrics["expectancy_r"] > 0 and metrics["profit_factor"] >= 1.0 and metrics["max_drawdown_r"] <= 5.0
 
@@ -1304,9 +1592,9 @@ def train_self_learning_model():
             LAST_TRAIN_TIME = now
             if promoted:
                 CACHED_MODEL, CACHED_MODEL_META = candidate, metrics
-                print(f"🧠 تمت ترقية النموذج: Total R={metrics['total_r']:.2f} | Expectancy={metrics['expectancy_r']:.3f}R | PF={metrics['profit_factor']:.2f} | DD={metrics['max_drawdown_r']:.2f}R")
+                print(f"🧠 [ترقية Walk-Forward] تم اعتماد النموذج: Total R={metrics['total_r']:.2f} | Expectancy={metrics['expectancy_r']:.3f}R | PF={metrics['profit_factor']:.2f} | DD={metrics['max_drawdown_r']:.2f}R")
             else:
-                print("🧠 تم رفض Challenger والإبقاء على النموذج النشط لتجنب تقلب النماذج.")
+                print(f"🧠 [رفض Challenger] لم يتجاوز المتحدي مقاييس النموذج الحالي (Total R={metrics['total_r']:.2f}).")
         except Exception as err:
             print(f"تنبيه تدريب الذكاء الاصطناعي: {err}")
         finally:
@@ -1766,7 +2054,7 @@ def run_quant_backtest():
         return "⚠️ لا تتوفر بيانات كافية لإجراء الفحص العكسي حالياً."
 
     df_clean = clean_df_columns(df_m15.copy())
-    df_clean = df_clean[~df_clean.index.duplicated(keep='first')]
+    df_clean = df_clean[~df_clean.index.duplicated(keep='first')].sort_index()
     
     close = to_1d_series(df_clean['Close'])
     high = to_1d_series(df_clean['High'])
@@ -1774,7 +2062,7 @@ def run_quant_backtest():
     open_p = to_1d_series(df_clean['Open'])
 
     if df_dxy is not None and not df_dxy.empty:
-        close_dxy = to_1d_series(clean_df_columns(df_dxy)['Close'])
+        close_dxy = to_1d_series(clean_df_columns(df_dxy).sort_index()['Close'])
         r_gold = np.log(close / close.shift(1))
         r_dxy = np.log(close_dxy / close_dxy.shift(1)).reindex(index=r_gold.index).ffill().fillna(0)
         dxy_corr_series = r_gold.rolling(window=20).corr(r_dxy).fillna(0)
@@ -1788,7 +2076,7 @@ def run_quant_backtest():
     macd_diff = ta.trend.MACD(close).macd_diff()
     stoch_k = ta.momentum.StochasticOscillator(high, low, close).stoch()
 
-    close_h1 = to_1d_series(clean_df_columns(df_h1)['Close'])
+    close_h1 = to_1d_series(clean_df_columns(df_h1).sort_index()['Close'])
     h1_ema200 = ta.trend.EMAIndicator(close_h1, window=200).ema_indicator().reindex(df_clean.index).ffill()
     h1_ema500 = ta.trend.EMAIndicator(close_h1, window=500).ema_indicator().reindex(df_clean.index).ffill()
 
@@ -1900,7 +2188,7 @@ def run_quant_backtest():
                 f_low = low_vals[fut_idx]
 
                 if f_high >= sl and f_low <= tp:
-                    outcome = 0 if abs(f_open - sl) < abs(f_open - tp) else 1
+                    outcome = 0 if abs(f_open - sl) < abs(open_val - tp) else 1
                     break
                 elif f_high >= sl:
                     outcome = 0
@@ -2020,7 +2308,13 @@ async def daily_telemetry_worker(app):
 async def post_init(app):
     recover_interrupted_learning_events()
     learning_manager.initialize()
-    # استخدام create_managed_task لمنع تدمير المهام بواسطة Garbage Collector
+    # استكشاف الموديلات المتاحة عند بدء التشغيل
+    if gemini_client:
+        try:
+            await asyncio.to_thread(discover_available_models, True)
+        except Exception as e:
+            logger.warning("تعذر الاستكشاف الأولي للموديلات: %s", e)
+
     create_managed_task(background_cache_worker())
     create_managed_task(auto_market_scanner(app))
     create_managed_task(keep_alive_ping())
@@ -2147,7 +2441,7 @@ async def system_health_check(update: Update, context: ContextTypes.DEFAULT_TYPE
                 missing_tables.append(t)
 
         if not missing_tables:
-            report_lines.append("  ✅ سلامة الجداول (5/5): جميع الجداول الأساسية موجودة وتعمل.")
+            report_lines.append("  ✅ سلامة الجداول (7/7): جميع الجداول الأساسية موجودة وتعمل.")
         else:
             report_lines.append(f"  ❌ نقص في الجداول التالية: {', '.join(missing_tables)}")
             issues_found.append(f"جداول قاعدة البيانات المفقودة: {missing_tables}")
@@ -2159,16 +2453,23 @@ async def system_health_check(update: Update, context: ContextTypes.DEFAULT_TYPE
         if conn:
             release_db_connection(conn)
 
-    report_lines.append("\n🧠 **3. فحص اتصال ونماذج الذكاء الاصطناعي:**")
+    report_lines.append("\n🧠 **3. فحص اتصال ونماذج الذكاء الاصطناعي (Dynamic Discovery):**")
     if gemini_client:
         try:
-            test_resp = await asyncio.to_thread(
-                gemini_client.models.generate_content,
-                model='gemini-1.5-flash',
-                contents='ping'
+            discovered_models = await asyncio.to_thread(discover_available_models, True)
+            if discovered_models:
+                report_lines.append(f"  ✅ استكشاف الموديلات النشطة لمفتاحك: تم العثور على {len(discovered_models)} موديل ({', '.join(discovered_models[:3])}).")
+            else:
+                report_lines.append("  ⚠️ لم يتم العثور على موديلات تدعم generateContent من خلال ListModels.")
+                
+            test_resp, used_m = await asyncio.to_thread(
+                execute_gemini_dynamic_request,
+                'ping',
+                None,
+                'health'
             )
-            if test_resp and test_resp.text:
-                report_lines.append("  ✅ اتصال نموذج الذكاء الاصطناعي السريع: يعمل بنجاح وسريع الاستجابة.")
+            if test_resp:
+                report_lines.append(f"  ✅ استجابة الموديل المكتشف [{used_m}]: يعمل بنجاح وسريع الاستجابة.")
             else:
                 report_lines.append("  ⚠️ خدمة الذكاء الاصطناعي استجابت دون نص.")
         except Exception as ge:
@@ -2207,7 +2508,7 @@ async def system_health_check(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not is_fail:
             report_lines.append(f"  ✅ الاتصال بمصادر الأخبار ومطابقة البيانات: ناجح وموثق.")
         else:
-            report_lines.append(f"  ⚠️ تعذر الاتصال بكافة خوادم الأخبار الستة: {news_info}")
+            report_lines.append(f"  ⚠️ تعذر الاتصال بمصادر الأخبار: {news_info}")
             issues_found.append("سيرفرات الأخبار الخارجية حظرت الاتصال أو متوقفة.")
     except Exception as ne:
         report_lines.append(f"  ❌ خطأ فحص سيرفرات الأخبار: {ne}")
@@ -2445,7 +2746,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🟢 **صفقات الشراء:** {buy_rate}% نجاح ({buy_wins}/{buy_total})\n"
             f"🔴 **صفقات البيع:** {sell_rate}% نجاح ({sell_wins}/{sell_total})\n"
             f"───────────────────\n"
-            f"💡 *تم دمج الاختبار الراجع والتعلم الذاتي التلقائي عبر الذكاء الاصطناعي.*\n🧠 *النموذج النشط:* {('متوفر' if CACHED_MODEL else 'بانتظار عينة كافية')}"
+            f"💡 *تم دمج اختبار Walk-Forward والتعلم الذاتي التلقائي عبر الذكاء الاصطناعي.*\n🧠 *النموذج النشط:* {('متوفر' if CACHED_MODEL else 'بانتظار عينة كافية')}"
         )
         await safe_reply_text(update, msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
     except Exception as e:
@@ -2499,5 +2800,5 @@ if __name__ == '__main__':
     
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
     
-    print("🤖 البوت الهجين (Quant + Gemini API) يعمل بكفاءة تامة وجاهز للمراقبة 24/7...")
+    print("🤖 البوت الهجين (Quant + Pure Dynamic Gemini Discovery + Walk-Forward ML) يعمل بكفاءة تامة...")
     app.run_polling(drop_pending_updates=True)
