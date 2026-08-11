@@ -847,7 +847,7 @@ def process_learning_batch(events):
 {chr(10).join(lines)}
 """
     last_error=None
-    for target_model in ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-1.5-flash']:
+    for target_model in ['gemini-1.5-flash', 'gemini-2.0-flash', 'gemini-1.5-pro']:
         try:
             response=gemini_client.models.generate_content(model=target_model,contents=prompt,config=types.GenerateContentConfig(response_mime_type='application/json'))
             result=json.loads(response.text); lesson=result.get('lesson','')
@@ -1000,7 +1000,7 @@ def gemini_verify_signal(signal_data, market_summary):
     }}
     """
     
-    candidate_models = ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-1.5-flash']
+    candidate_models = ['gemini-1.5-flash', 'gemini-2.0-flash', 'gemini-1.5-pro']
 
     for target_model in candidate_models:
         for attempt in range(2):
@@ -2164,7 +2164,7 @@ async def system_health_check(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             test_resp = await asyncio.to_thread(
                 gemini_client.models.generate_content,
-                model='gemini-2.5-flash',
+                model='gemini-1.5-flash',
                 contents='ping'
             )
             if test_resp and test_resp.text:
@@ -2396,7 +2396,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_wins = total_wins or 0
         overall_win_rate = round((total_wins / total_eval * 100), 1) if total_eval > 0 else 0
 
-        cursor.execute("SELECT COUNT(*) FROM trades WHERE outcome IS NULL")
+        cursor.execute("SELECT COUNT(*) FROM trades WHERE outcome IS NOT NULL")
         pending_trades = cursor.fetchone()[0] or 0
 
         if is_pg:
