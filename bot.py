@@ -847,7 +847,7 @@ def process_learning_batch(events):
 {chr(10).join(lines)}
 """
     last_error=None
-    for target_model in ['gemini-2.5-flash-lite','gemini-2.5-flash','gemini-2.0-flash']:
+    for target_model in ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-1.5-flash']:
         try:
             response=gemini_client.models.generate_content(model=target_model,contents=prompt,config=types.GenerateContentConfig(response_mime_type='application/json'))
             result=json.loads(response.text); lesson=result.get('lesson','')
@@ -1000,7 +1000,7 @@ def gemini_verify_signal(signal_data, market_summary):
     }}
     """
     
-    candidate_models = ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-2.0-flash']
+    candidate_models = ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-1.5-flash']
 
     for target_model in candidate_models:
         for attempt in range(2):
@@ -2164,7 +2164,7 @@ async def system_health_check(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             test_resp = await asyncio.to_thread(
                 gemini_client.models.generate_content,
-                model='gemini-2.5-flash-lite',
+                model='gemini-2.5-flash',
                 contents='ping'
             )
             if test_resp and test_resp.text:
