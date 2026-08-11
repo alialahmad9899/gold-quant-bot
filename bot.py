@@ -1000,7 +1000,7 @@ def gemini_verify_signal(signal_data, market_summary):
     }}
     """
     
-    candidate_models = ['gemini-1.5-flash', 'gemini-2.0-flash', 'gemini-1.5-pro']
+    candidate_models = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash-exp']
 
     for target_model in candidate_models:
         for attempt in range(2):
