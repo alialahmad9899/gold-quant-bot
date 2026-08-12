@@ -25,29 +25,24 @@ jobs:
           bot = Path('bot.py')
           text = bot.read_text(encoding='utf-8')
 
-          replacements = {
-              "outcome = 0 if abs(f_open - sl) < abs(f_open - tp) else 1":
-                  "outcome = 0 if abs(f_open - sl) < abs(f_open - tp) else 1",
-              "outcome = 0 if abs(f_open - sl) < abs(open_val - tp) else 1":
-                  "outcome = 0 if abs(f_open - sl) < abs(f_open - tp) else 1",
-              'cursor.execute("SELECT COUNT(*) FROM trades WHERE outcome IS NOT NULL")\n        pending_trades = cursor.fetchone()[0] or 0':
-                  'cursor.execute("SELECT COUNT(*) FROM trades WHERE outcome IS NULL AND trade_status IN (\'OPEN\', \'TP1_HIT\')")\n        pending_trades = cursor.fetchone()[0] or 0',
-              '"provider":"legacy provider"':
-                  '"provider":"Yahoo Finance"',
-          }
+          if 'open_val' not in text:
+              raise SystemExit('expected legacy backtest variable anchor is missing')
+          text = text.replace('open_val', 'f_open')
 
-          for old, new in replacements.items():
-              if old not in text:
-                  raise SystemExit(f'missing repair anchor: {old[:100]}')
-              text = text.replace(old, new, 1)
+          old_stats = 'cursor.execute("SELECT COUNT(*) FROM trades WHERE outcome IS NOT NULL")\n        pending_trades = cursor.fetchone()[0] or 0'
+          new_stats = 'cursor.execute("SELECT COUNT(*) FROM trades WHERE outcome IS NULL AND trade_status IN (\'OPEN\', \'TP1_HIT\')")\n        pending_trades = cursor.fetchone()[0] or 0'
+          if old_stats not in text:
+              raise SystemExit('pending-trades query anchor is missing')
+          text = text.replace(old_stats, new_stats, 1)
 
+          text = text.replace('"provider":"legacy provider"', '"provider":"Yahoo Finance"')
           bot.write_text(text, encoding='utf-8')
 
           Path('.gitignore').write_text('''# Python\n__pycache__/\n*.py[cod]\n*.pyo\n.pytest_cache/\n.mypy_cache/\n.ruff_cache/\n\n# Local runtime state\ntrades.db\n*.sqlite\n*.sqlite3\n*.db-wal\n*.db-shm\nxau_quant_bot.log\n*.log\n\n# Secrets / local configuration\n.env\n.env.*\n!.env.example\n''', encoding='utf-8')
 
           Path('README.md').write_text('''# Gold Quant Bot\n\nبوت تداول كمي للذهب XAUUSD يعمل عبر Telegram، ويجمع بين تحليل السوق، إدارة دورة حياة الصفقة، التعلم الآلي، ومراجعة Gemini عند تفعيلها.\n\n## بنية المشروع\n\n- `bot.py` — التطبيق الرئيسي ومحركات السوق والصفقات والتعلم.\n- `tests/` — اختبارات regression خفيفة تمنع عودة أخطاء معروفة.\n- `.github/workflows/` — CI دائم فقط؛ الإصلاحات لمرة واحدة لا تُحفظ كـworkflow.\n- `requirements.txt` — اعتماديات التشغيل.\n\n## بيانات السوق\n\nYahoo Finance هو المصدر الأساسي لبيانات XAUUSD والشموع التاريخية، مع استخدام `XAUUSD=X` للسعر الفوري و`DX-Y.NYB` و`^TNX` للمؤشرات المساندة. لا يستخدم مسار الإنتاج مصادر سعر ذهب بديلة مثل العقود الآجلة أو العملات المشفرة أو scraping.\n\n## التشغيل\n\nاضبط متغيرات البيئة المطلوبة: `TELEGRAM_TOKEN` و`BOT_PASSWORD` و`DATABASE_URL` عند استخدام PostgreSQL، و`GEMINI_API_KEY` عند تفعيل Gemini. ثم ثبّت الاعتماديات من `requirements.txt` وشغّل `python bot.py`.\n\n## قاعدة البيانات\n\nيفضل PostgreSQL عند توفير `DATABASE_URL`. SQLite متاح كخيار محلي/احتياطي للتشغيل التطويري.\n\n## ملاحظة الاختبارات\n\nاختبارات المستودع تتحقق من مصدر سعر الذهب ومسارات lifecycle المعروفة، وتستخدم `py_compile` كفحص أساسي لصحة بناء `bot.py`.\n''', encoding='utf-8')
 
-          Path('tests/test_repo_regressions.py').write_text('''from pathlib import Path\n\ntext = Path("bot.py").read_text(encoding="utf-8")\n\nassert "open_val" not in text, "undefined backtest variable open_val remains"\nassert "WHERE outcome IS NULL AND trade_status IN ('OPEN','TP1_HIT')" in text, "stats must count open lifecycle trades"\nassert '"provider":"legacy provider"' not in text, "legacy provider label remains"\nassert '"provider":"Yahoo Finance"' in text, "reset state must keep canonical provider"\n\nprint("REPO_REGRESSIONS_OK")\n''', encoding='utf-8')
+          Path('tests/test_repo_regressions.py').write_text('''from pathlib import Path\n\ntext = Path("bot.py").read_text(encoding="utf-8")\n\nassert "open_val" not in text, "undefined backtest variable open_val remains"\nassert "WHERE outcome IS NULL AND trade_status IN ('OPEN', 'TP1_HIT')" in text, "stats must count open lifecycle trades"\nassert '"provider":"legacy provider"' not in text, "legacy provider label remains"\nassert '"provider":"Yahoo Finance"' in text, "reset state must keep canonical provider"\n\nprint("REPO_REGRESSIONS_OK")\n''', encoding='utf-8')
           PY
 
           python3 -m py_compile bot.py
