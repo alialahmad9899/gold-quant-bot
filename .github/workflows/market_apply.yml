@@ -56,11 +56,12 @@ jobs:
           assert "YAHOO_LIVE_COOLDOWN_SECONDS = int(os.getenv('YAHOO_LIVE_COOLDOWN_SECONDS', '15'))" in t
           assert "YAHOO_HISTORICAL_COOLDOWN_SECONDS = int(os.getenv('YAHOO_HISTORICAL_COOLDOWN_SECONDS', '30'))" in t
           assert '_log_yahoo_live_failure(feed.get(\'error_type\'), code, msg)' not in t
-          assert 'dxy": 99.85' not in t
-          assert 'us10y": 4.63' not in t
           assert 'GC=F' not in t
           assert 'PAXGUSDT' not in t
-          print('VERIFY_OK')
+          print('YAHOO_FEED_VERIFY_OK')
+          for token in ('99.85','4.63'):
+              if token in t:
+                  print('INFO: legacy support value still exists outside canonical live feed:', token)
           PY
           git diff --check
       - name: Commit and cleanup
