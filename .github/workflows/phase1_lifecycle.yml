@@ -21,6 +21,7 @@ jobs:
           from pathlib import Path
           import ast
           import textwrap
+          import math
 
           p = Path('bot.py')
           text = p.read_text(encoding='utf-8')
@@ -89,12 +90,10 @@ jobs:
               conn=get_db_connection()
               try:
                   cur=conn.cursor(); f_entry,f_sl,f_tp1,f_tp2=map(float,(entry,sl,tp1,tp2)); f_rsi,f_dxy,f_macd,f_stoch,f_vol,f_conf=map(float,(rsi,dxy_corr,macd_diff,stoch_k,volatility_ratio,confidence)); candle_id=candle_id or datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S'); now=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'); is_pg=is_postgres() and isinstance(conn,psycopg2.extensions.connection); params=(now,signal_type,f_entry,f_sl,f_tp1,f_tp2,f_rsi,f_dxy,f_macd,f_stoch,f_vol,f_conf,candle_id,FEATURE_VERSION,STRATEGY_VERSION,MODEL_VERSION,signal_score,ai_score)
-                  if is_pg:
-                      cur.execute("INSERT INTO trades (timestamp,signal_type,entry_price,sl,tp1,tp2,rsi,dxy_corr,macd_diff,stoch_k,volatility_ratio,outcome,confidence,candle_id,trade_status,feature_version,strategy_version,model_version,signal_score,ai_score,slippage) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NULL,%s,%s,'OPEN',%s,%s,%s,%s,%s,NULL) ON CONFLICT (candle_id) DO NOTHING RETURNING id",params)
-                  else:
-                      cur.execute("INSERT OR IGNORE INTO trades (timestamp,signal_type,entry_price,sl,tp1,tp2,rsi,dxy_corr,macd_diff,stoch_k,volatility_ratio,outcome,confidence,candle_id,trade_status,feature_version,strategy_version,model_version,signal_score,ai_score,slippage) VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,?,?, 'OPEN',?,?,?,?,?,NULL)",params)
+                  if is_pg: cur.execute("INSERT INTO trades (timestamp,signal_type,entry_price,sl,tp1,tp2,rsi,dxy_corr,macd_diff,stoch_k,volatility_ratio,outcome,confidence,candle_id,trade_status,feature_version,strategy_version,model_version,signal_score,ai_score,slippage) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NULL,%s,%s,'OPEN',%s,%s,%s,%s,%s,NULL) ON CONFLICT (candle_id) DO NOTHING RETURNING id",params)
+                  else: cur.execute("INSERT OR IGNORE INTO trades (timestamp,signal_type,entry_price,sl,tp1,tp2,rsi,dxy_corr,macd_diff,stoch_k,volatility_ratio,outcome,confidence,candle_id,trade_status,feature_version,strategy_version,model_version,signal_score,ai_score,slippage) VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,?,?, 'OPEN',?,?,?,?,?,NULL)",params)
                   inserted=cur.rowcount==1; trade_id=None
-                  if inserted: trade_id=(cur.fetchone()[0] if is_pg and cur.fetchone else cur.lastrowid) if not is_pg else (lambda r:r[0] if r else None)(cur.fetchone())
+                  if inserted: trade_id=cur.lastrowid if not is_pg else ((lambda r:r[0] if r else None)(cur.fetchone()))
                   conn.commit(); return inserted,trade_id
               except Exception as e:
                   try: conn.rollback()
@@ -115,8 +114,7 @@ jobs:
                   if new_status=='TP1_HIT' and current_status!='OPEN': return False
                   if final_status and current_status not in {'OPEN','TP1_HIT'}: return False
                   now=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-                  if new_status=='TP1_HIT':
-                      sql=f"UPDATE trades SET trade_status={ph},tp1_hit_at={ph},slippage=NULL WHERE id={ph} AND trade_status='OPEN' AND outcome IS NULL"; params=(new_status,now,trade_id)
+                  if new_status=='TP1_HIT': sql=f"UPDATE trades SET trade_status={ph},tp1_hit_at={ph},slippage=NULL WHERE id={ph} AND trade_status='OPEN' AND outcome IS NULL"; params=(new_status,now,trade_id)
                   else:
                       if exit_price is None: exit_price=tp2 if new_status=='TP2_HIT' else sl
                       final_r=_calculate_realized_r(signal_type,entry,sl,exit_price)
@@ -170,7 +168,8 @@ jobs:
               df_clean=df_clean[~df_clean.index.duplicated(keep='first')].sort_index()
               for trade_id,trade_time_str,sig_type,entry,sl,tp1,tp2,status in open_trades:
                   try:
-                      trade_time=trade_time_str if isinstance(trade_time_str,datetime) and trade_time_str.tzinfo else (trade_time_str.replace(tzinfo=timezone.utc) if isinstance(trade_time_str,datetime) else datetime.strptime(str(trade_time_str)[:19],'%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc))
+                      if isinstance(trade_time_str,datetime): trade_time=trade_time_str if trade_time_str.tzinfo else trade_time_str.replace(tzinfo=timezone.utc)
+                      else: trade_time=datetime.strptime(str(trade_time_str)[:19],'%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
                       current_status=status if status in {'OPEN','TP1_HIT'} else 'OPEN'
                       for _,bar in df_clean[df_clean.index>=trade_time].iterrows():
                           events=evaluate_trade_lifecycle(sig_type,current_status,entry,sl,tp1,tp2,bar_open=float(bar['Open']),bar_high=float(bar['High']),bar_low=float(bar['Low']))
@@ -187,7 +186,9 @@ jobs:
               text=text.replace(target,"        is_valid, validation_reason = validate_trade_levels(signal_type, current_price, sl, tp1, tp2)\n        if not is_valid:\n            return {'status':'WAIT','reason':f'مستويات Entry/SL/TP غير صالحة: {validation_reason}','price':current_price}\n\n"+target,1)
 
           ast.parse(text)
-          tree=ast.parse(text); wanted={'_trade_direction','validate_trade_levels','_calculate_realized_r','evaluate_trade_lifecycle'}; nodes=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in wanted]; ns={'np':__import__('numpy')}; exec(compile(ast.Module(body=nodes,type_ignores=[]),'bot.py','exec'),ns)
+          class FakeNP:
+              isfinite = staticmethod(math.isfinite)
+          tree=ast.parse(text); wanted={'_trade_direction','validate_trade_levels','_calculate_realized_r','evaluate_trade_lifecycle'}; nodes=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in wanted]; ns={'np':FakeNP}; exec(compile(ast.Module(body=nodes,type_ignores=[]),'bot.py','exec'),ns)
           validate=ns['validate_trade_levels']; calc_r=ns['_calculate_realized_r']; evaluate=ns['evaluate_trade_lifecycle']
           assert validate('BUY',100,95,108,110)[0] and not validate('BUY',105,100,108,110)[0]
           assert validate('SELL',100,105,92,90)[0] and not validate('SELL',95,100,92,90)[0]
@@ -199,7 +200,8 @@ jobs:
           assert evaluate('SELL','OPEN',100,105,92,90,price=106)==[('SL_HIT',106.0)]
           assert calc_r('BUY',100,95,110)==2.0 and calc_r('BUY',100,95,95)==-1.0
           assert calc_r('SELL',100,105,90)==2.0 and calc_r('SELL',100,105,105)==-1.0
-          path.write_text(text,encoding='utf-8')
+          assert text != original
+          p.write_text(text,encoding='utf-8')
           print('Phase 1 lifecycle tests passed.')
           PY
           python3 -m py_compile bot.py
