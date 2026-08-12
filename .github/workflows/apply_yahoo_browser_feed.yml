@@ -1,0 +1,204 @@
+name: apply-yahoo-browser-feed
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Patch Yahoo market-data engine
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import ast
+
+          path = Path('bot.py')
+          text = path.read_text(encoding='utf-8')
+
+          def replace_function(src, name, replacement, next_marker=None):
+              pattern = re.compile(rf'^def {re.escape(name)}\(.*?(?=^def |^class |\\Z)', re.MULTILINE | re.DOTALL)
+              m = pattern.search(src)
+              if not m:
+                  raise RuntimeError(f'Function not found: {name}')
+              return src[:m.start()] + replacement.strip() + '\n\n' + src[m.end():].lstrip('\n')
+
+          http_helper = r'''
+          def http_get_yahoo(url, timeout=6):
+              """Yahoo JSON fetch with browser impersonation and host fallback."""
+              headers = {
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                  'Accept': 'application/json,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                  'Accept-Language': 'en-US,en;q=0.9',
+                  'Origin': 'https://finance.yahoo.com',
+                  'Referer': 'https://finance.yahoo.com/',
+              }
+              for host in ('query1.finance.yahoo.com', 'query2.finance.yahoo.com'):
+                  target = re.sub(r'https://query[12]\\.finance\\.yahoo\\.com', f'https://{host}', url, count=1)
+                  if HAS_CURL_CFFI:
+                      try:
+                          response = curl_requests.get(target, headers=headers, impersonate='chrome124', timeout=timeout)
+                          if response.status_code == 200:
+                              return response.json()
+                      except Exception:
+                          pass
+                  try:
+                      response = requests.get(target, headers=headers, timeout=timeout)
+                      if response.status_code == 200:
+                          return response.json()
+                  except Exception:
+                      pass
+              return None
+          '''
+
+          # Replace the legacy direct historical fetch with a browser-impersonated implementation.
+          historical = r'''
+          def fetch_yahoo_direct(symbol, range_str='10d', interval_str='15m'):
+              """Fetch historical OHLC from Yahoo only; no Futures/Crypto/scraping fallback."""
+              if _yahoo_historical_cooldown_active():
+                  return pd.DataFrame()
+              url = f'https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval={interval_str}&range={range_str}'
+              try:
+                  data = http_get_yahoo(url, timeout=8)
+                  if not data:
+                      _set_yahoo_historical_cooldown('network_or_http', f'Yahoo returned no JSON for {symbol} {interval_str}.')
+                      return pd.DataFrame()
+                  result = ((data.get('chart') or {}).get('result') or [])
+                  if not result or not isinstance(result[0], dict):
+                      _set_yahoo_historical_cooldown('missing_result', f'Yahoo {symbol} response has no chart.result.')
+                      return pd.DataFrame()
+                  timestamps = result[0].get('timestamp') or []
+                  quote = ((result[0].get('indicators') or {}).get('quote') or [])
+                  if not timestamps or not quote:
+                      _set_yahoo_historical_cooldown('missing_ohlc', f'Yahoo {symbol} returned no OHLC data.')
+                      return pd.DataFrame()
+                  q = quote[0]
+                  df = pd.DataFrame({
+                      'Open': q.get('open', []),
+                      'High': q.get('high', []),
+                      'Low': q.get('low', []),
+                      'Close': q.get('close', []),
+                      'Volume': q.get('volume', [0] * len(timestamps)),
+                  }, index=pd.to_datetime(timestamps, unit='s', utc=True)).dropna(subset=['Open','High','Low','Close'])
+                  if df.empty:
+                      _set_yahoo_historical_cooldown('empty_ohlc', f'Yahoo {symbol} returned an empty OHLC frame.')
+                      return pd.DataFrame()
+                  with YAHOO_HISTORICAL_STATE_LOCK:
+                      YAHOO_HISTORICAL_FEED_STATE['blocked_until'] = 0.0
+                      YAHOO_HISTORICAL_FEED_STATE['error_type'] = None
+                      YAHOO_HISTORICAL_FEED_STATE['error_message'] = None
+                  return df
+              except Exception as exc:
+                  msg = f'{type(exc).__name__}: {exc}'[:300]
+                  low = msg.lower()
+                  kind = 'rate_limited' if any(x in low for x in ('429','too many requests','rate limit','yfratelimiterror')) else ('timeout' if 'timeout' in low else 'network_or_response')
+                  _set_yahoo_historical_cooldown(kind, msg)
+                  return pd.DataFrame()
+          '''
+
+          live = r'''
+          def fetch_live_spot_gold():
+              """Return live Spot XAU/USD from Yahoo XAUUSD=X only; never use historical Close as live."""
+              feed = fetch_canonical_xauusd_feed()
+              return float(feed['mid']) if feed.get('status') == 'ACTIVE' and feed.get('mid') else 0.0
+          '''
+
+          cache = r'''
+          def fetch_and_update_cache():
+              """Refresh live Spot and supporting Yahoo snapshots without hardcoded market prices."""
+              try:
+                  feed = fetch_canonical_xauusd_feed()
+                  gold = feed.get('mid') if feed.get('status') == 'ACTIVE' else 0.0
+
+                  dxy = None
+                  data_dxy = http_get_yahoo('https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB?interval=1m&range=1d', timeout=4)
+                  if data_dxy:
+                      try:
+                          meta = data_dxy['chart']['result'][0]['meta']
+                          value = _finite_positive(meta.get('regularMarketPrice'))
+                          dxy = round(value, 4) if value is not None else None
+                      except Exception:
+                          dxy = None
+
+                  us10y = None
+                  data_tnx = http_get_yahoo('https://query1.finance.yahoo.com/v8/finance/chart/^TNX?interval=1m&range=1d', timeout=4)
+                  if data_tnx:
+                      try:
+                          meta = data_tnx['chart']['result'][0]['meta']
+                          value = _finite_positive(meta.get('regularMarketPrice'))
+                          us10y = round(value, 4) if value is not None else None
+                      except Exception:
+                          us10y = None
+
+                  with cache_lock:
+                      previous = GLOBAL_CACHE.get('market_data') or {}
+                      GLOBAL_CACHE['market_data'] = {
+                          'gold': round(float(gold), 2) if gold else 0.0,
+                          'dxy': dxy if dxy is not None else previous.get('dxy'),
+                          'us10y': us10y if us10y is not None else previous.get('us10y'),
+                          'price_feed': feed,
+                      }
+                      if gold:
+                          GLOBAL_CACHE['last_updated'] = datetime.now(timezone.utc)
+              except Exception as exc:
+                  logger.warning('[MARKET_DATA] cache refresh failure type=%s message=%s', type(exc).__name__, str(exc)[:300])
+          '''
+
+          # Replace the helper and the three requested functions.
+          anchor = 'def fetch_yahoo_direct('
+          idx = text.find(anchor)
+          if idx < 0:
+              raise RuntimeError('fetch_yahoo_direct anchor not found')
+          text = text[:idx] + http_helper.strip() + '\n\n' + text[idx:]
+          text = replace_function(text, 'fetch_yahoo_direct', historical)
+          text = replace_function(text, 'fetch_live_spot_gold', live)
+          text = replace_function(text, 'fetch_and_update_cache', cache)
+
+          # Make canonical live feed use http_get_yahoo for query1/query2 browser impersonation.
+          old = """    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36', 'Accept': 'application/json', 'Referer': 'https://finance.yahoo.com/'}\n    try:\n        kwargs = {'timeout': 8}\n        if HAS_CURL_CFFI:\n            kwargs['impersonate'] = 'chrome124'\n        response = curl_requests.get('https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X', params={'interval': '1m', 'range': '1d'}, headers=headers, **kwargs)\n    except Exception as exc:\n"""
+          new = """    try:\n        payload = http_get_yahoo('https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval=1m&range=1d', timeout=8)\n    except Exception as exc:\n"""
+          if old not in text:
+              raise RuntimeError('canonical Yahoo request anchor not found')
+          text = text.replace(old, new, 1)
+
+          old_block = """    code = int(getattr(response, 'status_code', 0) or 0)\n    if code == 429:\n        msg = _yahoo_live_error_message(response) or 'Yahoo live HTTP 429 rate limit.'\n        _set_yahoo_live_cooldown('rate_limited', msg)\n        _log_yahoo_live_failure('rate_limited', code, msg)\n        return _refresh_cached_feed_status(cached) if cached else _build_missing_yahoo_feed('rate_limited', msg)\n    if 500 <= code <= 599:\n        msg = _yahoo_live_error_message(response) or f'Yahoo live HTTP {code}.'\n        _set_yahoo_live_cooldown('server_error', msg)\n        _log_yahoo_live_failure('server_error', code, msg)\n        return _refresh_cached_feed_status(cached) if cached else _build_missing_yahoo_feed('server_error', msg)\n    if code != 200:\n        msg = _yahoo_live_error_message(response) or f'Yahoo live HTTP {code}.'\n        return _build_missing_yahoo_feed('http_error', msg)\n    try:\n        payload = response.json()\n    except Exception as exc:\n        msg = f'{type(exc).__name__}: {exc}'[:300]\n        _set_yahoo_live_cooldown('malformed_json', msg)\n        _log_yahoo_live_failure('malformed_json', code, msg)\n        return _refresh_cached_feed_status(cached) if cached else _build_missing_yahoo_feed('malformed_json', msg)\n\n"""
+          new_block = """    if payload is None:\n        msg = 'Yahoo query1/query2 returned no valid JSON for XAUUSD=X.'\n        _set_yahoo_live_cooldown('network_or_http', msg)\n        _log_yahoo_live_failure('network_or_http', None, msg)\n        return _refresh_cached_feed_status(cached) if cached else _build_missing_yahoo_feed('network_or_http', msg)\n\n"""
+          if old_block not in text:
+              raise RuntimeError('canonical response handling anchor not found')
+          text = text.replace(old_block, new_block, 1)
+
+          # Keep source truthful and prevent accidental historical-live fallback regressions.
+          forbidden = ('GC=F', 'PAXGUSDT', 'ifcmarkets.net', 'api.argentapi.com', 'yfinance')
+          lower = text.lower()
+          for token in forbidden:
+              if token.lower() in lower:
+                  raise RuntimeError(f'Forbidden legacy provider reference remains: {token}')
+
+          ast.parse(text)
+          path.write_text(text, encoding='utf-8')
+          print('BOT_PATCH_OK')
+          PY
+
+      - name: Validate and commit
+        run: |
+          python3 -m py_compile bot.py
+          python3 tests/test_market_provider_hygiene.py
+          git diff --check
+          grep -n "def http_get_yahoo\|def fetch_yahoo_direct\|def fetch_live_spot_gold\|def fetch_and_update_cache" bot.py
+          grep -n "XAUUSD=X" bot.py | head
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bot.py
+          git commit -m "fix: harden Yahoo spot feed with browser impersonation"
+          git rm .github/workflows/apply_yahoo_browser_feed.yml
+          git commit -m "chore: remove one-time Yahoo feed patch workflow"
+          git push origin main
