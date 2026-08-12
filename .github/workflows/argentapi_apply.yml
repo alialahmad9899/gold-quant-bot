@@ -25,7 +25,9 @@ jobs:
           insert = needle + "\nif 'metals.dev' in final_text.lower():\n    final_text = final_text.replace('metals.dev', 'legacy provider').replace('Metals.Dev', 'legacy provider')\n    BOT.write_text(final_text, encoding='utf-8')"
           if needle not in s:
               raise SystemExit('test-runner insertion point not found')
-          p.write_text(s.replace(needle, insert, 1), encoding='utf-8')
+          s = s.replace(needle, insert, 1)
+          s = s.replace("ns = {'np': FakeNP}", "ns = {'np': FakeNP, 'math': math}")
+          p.write_text(s, encoding='utf-8')
           PY
       - name: Ensure runtime helper imports
         shell: bash
