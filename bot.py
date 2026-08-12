@@ -1298,7 +1298,7 @@ def build_historic_market_features():
     close_vals = close.values
     high_vals = high.values
     low_vals = low.values
-    open_vals = open_p.values
+    f_opens = open_p.values
     atr_vals = atr.values
 
     valid_indices = []
@@ -1318,7 +1318,7 @@ def build_historic_market_features():
 
         outcome = None
         for future_idx in range(loc + 1, loc + 13):
-            f_open = open_vals[future_idx]
+            f_open = f_opens[future_idx]
             f_high = high_vals[future_idx]
             f_low = low_vals[future_idx]
             
@@ -2166,7 +2166,7 @@ def run_quant_backtest():
     high_vals = high.values
     low_vals = low.values
     close_vals = close.values
-    open_vals = open_p.values
+    f_opens = open_p.values
     atr_vals = atr.values
     rsi_vals = rsi.values
     ema9_vals = ema9.values
@@ -2225,7 +2225,7 @@ def run_quant_backtest():
             sl = c_price - (c_atr * 1.2)
             
             for fut_idx in range(i + 1, i + 13):
-                f_open = open_vals[fut_idx]
+                f_open = f_opens[fut_idx]
                 f_high = high_vals[fut_idx]
                 f_low = low_vals[fut_idx]
                 
@@ -2255,12 +2255,12 @@ def run_quant_backtest():
             sl = c_price + (c_atr * 1.2)
             
             for fut_idx in range(i + 1, i + 13):
-                f_open = open_vals[fut_idx]
+                f_open = f_opens[fut_idx]
                 f_high = high_vals[fut_idx]
                 f_low = low_vals[fut_idx]
 
                 if f_high >= sl and f_low <= tp:
-                    outcome = 0 if abs(f_open - sl) < abs(open_val - tp) else 1
+                    outcome = 0 if abs(f_open - sl) < abs(f_open - tp) else 1
                     break
                 elif f_high >= sl:
                     outcome = 0
@@ -2430,7 +2430,7 @@ async def reset_all_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
         release_db_connection(conn)
 
     with cache_lock:
-        GLOBAL_CACHE["market_data"] = {"gold": 0.0, "dxy": 99.85, "us10y": 4.63, "price_feed": {"symbol":"XAUUSD","provider":"legacy provider","status":"MISSING","spot":None,"mid":None,"bid":None,"ask":None,"timestamp":None,"age_seconds":None}}
+        GLOBAL_CACHE["market_data"] = {"gold": 0.0, "dxy": 99.85, "us10y": 4.63, "price_feed": {"symbol":"XAUUSD","provider":"Yahoo Finance","status":"MISSING","spot":None,"mid":None,"bid":None,"ask":None,"timestamp":None,"age_seconds":None}}
         GLOBAL_CACHE["analysis"] = None
         GLOBAL_CACHE["last_updated"] = None
 
@@ -2788,7 +2788,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_wins = total_wins or 0
         overall_win_rate = round((total_wins / total_eval * 100), 1) if total_eval > 0 else 0
 
-        cursor.execute("SELECT COUNT(*) FROM trades WHERE outcome IS NOT NULL")
+        cursor.execute("SELECT COUNT(*) FROM trades WHERE outcome IS NULL AND trade_status IN ('OPEN', 'TP1_HIT')")
         pending_trades = cursor.fetchone()[0] or 0
 
         if is_pg:
