@@ -1,4 +1,5 @@
 name: fix-yahoo-test-runner
+# trigger: run after workflow installation
 
 on:
   push:
