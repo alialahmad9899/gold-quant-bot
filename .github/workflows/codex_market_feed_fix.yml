@@ -15,6 +15,7 @@ jobs:
       - name: Apply and validate
         run: |
           set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --quiet pandas
           python3 .github/codex_market_feed_fix.py
           git diff --check
           git diff -- bot.py
