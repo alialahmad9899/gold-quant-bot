@@ -5,9 +5,11 @@
 ## بنية المشروع
 
 - `bot.py` — التطبيق الرئيسي ومحركات السوق والصفقات والتعلم.
-- `tests/` — اختبارات regression خفيفة تمنع عودة أخطاء معروفة.
-- `.github/workflows/` — CI دائم فقط؛ الإصلاحات لمرة واحدة لا تُحفظ كـworkflow.
+- `tests/` — اختبارات regression الأساسية.
 - `requirements.txt` — اعتماديات التشغيل.
+- `.gitignore` — يمنع تسريب ملفات التشغيل المحلية والأسرار والـbytecode.
+
+لا توجد workflows مؤقتة أو patch runners داخل المستودع في النسخة النظيفة الحالية.
 
 ## بيانات السوق
 
@@ -21,6 +23,10 @@ Yahoo Finance هو المصدر الأساسي لبيانات XAUUSD والشم�
 
 يفضل PostgreSQL عند توفير `DATABASE_URL`. SQLite متاح كخيار محلي/احتياطي للتشغيل التطويري.
 
-## ملاحظة الاختبارات
+## التحقق
 
-اختبارات المستودع تتحقق من مصدر سعر الذهب ومسارات lifecycle المعروفة، وتستخدم `py_compile` كفحص أساسي لصحة بناء `bot.py`.
+الحد الأدنى قبل النشر:
+
+`python3 -m py_compile bot.py`
+
+`python3 tests/test_market_provider_hygiene.py`
