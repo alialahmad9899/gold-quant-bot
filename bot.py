@@ -75,9 +75,6 @@ if not TOKEN:
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
-TWELVE_DATA_LIVE_INTERVAL_SECONDS = int(os.getenv("TWELVE_DATA_LIVE_INTERVAL_SECONDS", "120"))
-TWELVE_DATA_HISTORICAL_INTERVAL_SECONDS = int(os.getenv("TWELVE_DATA_HISTORICAL_INTERVAL_SECONDS", "300"))
 
 PASSWORD = os.getenv("BOT_PASSWORD")
 if not PASSWORD:
@@ -117,9 +114,7 @@ def discover_available_models(force_refresh=False):
 
     now = time.monotonic()
     with MODELS_DISCOVERY_LOCK:
-        # تجديد الكاش كل ساعة أو عند الطلب الإجباري
         if not force_refresh and DISCOVERED_MODELS_CACHE and LAST_MODELS_DISCOVERY_TIME and (now - LAST_MODELS_DISCOVERY_TIME < 3600):
-            # تصفية الموديلات الموجودة في الـ blacklist المؤقت لهذه الجلسة
             return [m for m in DISCOVERED_MODELS_CACHE if m not in SESSION_BLACKLIST_404]
 
         try:
@@ -132,11 +127,9 @@ def discover_available_models(force_refresh=False):
                 if not clean_name:
                     continue
 
-                # استبعاد العائلات المحظورة والأنماط غير النصية
                 if any(pat in clean_name.lower() for pat in DEPRECATED_MODEL_PATTERNS):
                     continue
                 
-                # التحقق الصارم من دعم توليد النصوص generateContent
                 supported_methods = getattr(m, 'supported_generation_methods', []) or []
                 supported_actions = getattr(m, 'supported_actions', []) or []
                 all_supported = [str(x).lower() for x in (supported_methods + supported_actions)]
@@ -150,7 +143,6 @@ def discover_available_models(force_refresh=False):
             if available:
                 DISCOVERED_MODELS_CACHE = available
                 LAST_MODELS_DISCOVERY_TIME = now
-                # تنظيف البلاك ليست عند الاكتشاف الجديد
                 SESSION_BLACKLIST_404.clear()
                 logger.info("✅ [Dynamic Discovery] تم اكتشاف الموديلات المتاحة فعلياً لمفتاحك: %s", DISCOVERED_MODELS_CACHE)
                 return [m for m in DISCOVERED_MODELS_CACHE if m not in SESSION_BLACKLIST_404]
@@ -167,17 +159,13 @@ def prioritize_models_for_task(task_type="vetting"):
     available = discover_available_models(force_refresh=False)
     now = time.monotonic()
     
-    # استبعاد الموديلات التي ما زالت في فترة التهدئة المؤقتة (429 Cooldown)
     active_candidates = [m for m in available if now >= MODEL_COOLDOWNS_429.get(m, 0)]
-    
-    # إذا كانت كل الموديلات في فترة تهدئة، نستخدم كل المتاح
     pool_models = active_candidates if active_candidates else available
     
     def score_model(name):
         n = name.lower()
         score = 0
         if task_type == "vetting":
-            # للمهام المعقدة والقرارات: نفضل الموديلات الكاملة ثم السريعة
             if 'flash' in n and 'lite' not in n:
                 score += 30
             elif 'pro' in n:
@@ -185,14 +173,12 @@ def prioritize_models_for_task(task_type="vetting"):
             elif 'lite' in n:
                 score += 10
         else:
-            # لمهام التعلم، تفريغ الخسائر، والفحص الخفيف: نفضل الموديلات الاقتصادية الخفيفة
             if 'lite' in n:
                 score += 30
             elif 'flash' in n:
                 score += 20
             elif 'pro' in n:
                 score += 10
-        # تفضيل الموديلات ذات الإصدارات الأحدث رقمياً
         nums = re.findall(r'\d+', n)
         if nums:
             try:
@@ -205,19 +191,11 @@ def prioritize_models_for_task(task_type="vetting"):
     return sorted_candidates
 
 def execute_gemini_dynamic_request(prompt, response_mime_type="application/json", task_type="vetting"):
-    """
-    تنفيذ استدعاء الذكاء الاصطناعي بالاعتماد الحصري على الموديلات المكتشفة مع معالجة ذكية للأخطاء:
-    - 404: إضافة الموديل لـ SESSION_BLACKLIST_404 والانتقال للبديل.
-    - 429: تطبيق Backoff وإضافة فترة Cooldown للموديل والانتقال للبديل.
-    - 400: رمي الخطأ مباشرة دون تضييع الموديلات (المشكلة في الـ Payload/Prompt).
-    - 5xx/Network: محاولة بديلة ثم Graceful Fallback.
-    """
     if not gemini_client:
         raise RuntimeError("خدمة Gemini غير مهيأة أو المفتاح مفقود.")
 
     candidates = prioritize_models_for_task(task_type=task_type)
     if not candidates:
-        # محاولة إعادة الاكتشاف الإجباري في حال كانت القائمة فارغة
         candidates = discover_available_models(force_refresh=True)
         if not candidates:
             raise RuntimeError("لم يتم العثور على أي موديل متاح وداعم لـ generateContent لمفتاحك.")
@@ -243,27 +221,23 @@ def execute_gemini_dynamic_request(prompt, response_mime_type="application/json"
                 err_str = str(e)
                 last_error = e
 
-                # 1. خطأ 404: الموديل غير موجود / معطل في هذا المسار
                 if "404" in err_str or "NOT_FOUND" in err_str or "is not found" in err_str:
                     logger.warning(f"🚫 [404 NOT_FOUND] الموديل [{target_model}] غير متاح. جاري وضعه في البلاك ليست المؤقت وتجربة موديل آخر...")
                     with MODELS_DISCOVERY_LOCK:
                         SESSION_BLACKLIST_404.add(target_model)
                     break
 
-                # 2. خطأ 429: استنفاد الحصة المجانية أو ضغط الطلبات
                 elif "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                    cooldown_time = time.monotonic() + 45  # 45 ثانية تهدئة لهذا الموديل
+                    cooldown_time = time.monotonic() + 45
                     MODEL_COOLDOWNS_429[target_model] = cooldown_time
                     logger.warning(f"⏳ [429 QUOTA] بلوغ حد الطلبات على [{target_model}]. جاري تطبيق التهدئة والانتقال للبديل...")
                     time.sleep(1.2 + (hash(str(time.time())) % 500) / 1000.0)
                     continue
 
-                # 3. خطأ 400: الطلب نفسه غير صالح (لا ننتقل لموديل آخر لأن المشكلة في المعاملات)
                 elif "400" in err_str or "INVALID_ARGUMENT" in err_str or "Bad Request" in err_str:
                     logger.error(f"❌ [400 INVALID_ARGUMENT] خطأ في صياغة الطلب أو الـ Config: {err_str}")
                     raise e
 
-                # 4. أخطاء أخرى (شبكة أو 5xx)
                 else:
                     logger.warning(f"⚠️ خطأ أثناء استدعاء [{target_model}]: {err_str}")
                     break
@@ -283,7 +257,6 @@ LAST_SCANNER_CANDLE = None
 BACKGROUND_TASKS = set()
 
 def create_managed_task(coro):
-    """إنشاء وتتبع المهام الخلفية لمنع خطأ Task was destroyed but it is pending!"""
     task = asyncio.create_task(coro)
     BACKGROUND_TASKS.add(task)
     task.add_done_callback(BACKGROUND_TASKS.discard)
@@ -330,9 +303,10 @@ FEATURE_VERSION = os.getenv('FEATURE_VERSION', 'v2.8-features-1')
 STRATEGY_VERSION = os.getenv('STRATEGY_VERSION', 'v2.8-flexible')
 MODEL_VERSION = os.getenv('MODEL_VERSION', 'rf-v1')
 PRICE_FEED_STALE_SECONDS = int(os.getenv('PRICE_FEED_STALE_SECONDS', '90'))
-PRICE_FEED_MIN_REQUEST_INTERVAL = 60.0
+PRICE_FEED_MIN_REQUEST_INTERVAL = 3.0
 PRICE_FEED_LOCK = threading.Lock()
 CANONICAL_XAUUSD_FEED_CACHE = {'feed': None, 'last_request_monotonic': 0.0}
+
 YAHOO_LIVE_COOLDOWN_SECONDS = int(os.getenv('YAHOO_LIVE_COOLDOWN_SECONDS', '15'))
 YAHOO_HISTORICAL_COOLDOWN_SECONDS = int(os.getenv('YAHOO_HISTORICAL_COOLDOWN_SECONDS', '30'))
 YAHOO_HISTORICAL_FETCH_INTERVAL_SECONDS = int(os.getenv('YAHOO_HISTORICAL_FETCH_INTERVAL_SECONDS', '300'))
@@ -340,6 +314,7 @@ YAHOO_LIVE_FEED_STATE = {'blocked_until': 0.0, 'error_type': None, 'error_messag
 YAHOO_HISTORICAL_FEED_STATE = {'blocked_until': 0.0, 'error_type': None, 'error_message': None}
 YAHOO_LIVE_STATE_LOCK = threading.Lock()
 YAHOO_HISTORICAL_STATE_LOCK = threading.Lock()
+
 RAM_WARNING_MB = float(os.getenv('RAM_WARNING_MB', '400'))
 RAM_DEFER_MB = float(os.getenv('RAM_DEFER_MB', '450'))
 RAM_EMERGENCY_MB = float(os.getenv('RAM_EMERGENCY_MB', '480'))
@@ -458,7 +433,7 @@ def arabic_trade_status(value):
     return {"OPEN": "مفتوحة 🟢", "TP1_HIT": "الهدف الأول محقق 🎯", "TP2_HIT": "الهدف الثاني محقق 🏆", "SL_HIT": "وقف الخسارة محقق 🛑", "EXPIRED": "منتهية ⏳", "CANCELLED": "ملغاة 🚫"}.get(str(value), str(value))
 
 # ------------------------------------
-# 1. إدارة قاعدة البيانات الهجينة ومجمع الاتصالات
+# 1. إدارة قاعدة البيانات ومجمع الاتصالات
 # ------------------------------------
 pg_pool = None
 
@@ -547,21 +522,10 @@ def init_db():
                     signal_score REAL,
                     ai_score REAL
                 );
-                CREATE TABLE IF NOT EXISTS subscribers (
-                    chat_id BIGINT PRIMARY KEY
-                );
-                CREATE TABLE IF NOT EXISTS authenticated_users (
-                    chat_id BIGINT PRIMARY KEY
-                );
-                CREATE TABLE IF NOT EXISTS config (
-                    key VARCHAR(50) PRIMARY KEY,
-                    value BIGINT
-                );
-                CREATE TABLE IF NOT EXISTS gemini_insights (
-                    id SERIAL PRIMARY KEY,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    lesson TEXT
-                );
+                CREATE TABLE IF NOT EXISTS subscribers (chat_id BIGINT PRIMARY KEY);
+                CREATE TABLE IF NOT EXISTS authenticated_users (chat_id BIGINT PRIMARY KEY);
+                CREATE TABLE IF NOT EXISTS config (key VARCHAR(50) PRIMARY KEY, value BIGINT);
+                CREATE TABLE IF NOT EXISTS gemini_insights (id SERIAL PRIMARY KEY, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, lesson TEXT);
                 CREATE TABLE IF NOT EXISTS model_evaluations (
                     id SERIAL PRIMARY KEY,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -611,71 +575,28 @@ def init_db():
             ''')
             cursor.execute("PRAGMA table_info(trades)")
             columns = [col[1] for col in cursor.fetchall()]
-            if "macd_diff" not in columns:
-                cursor.execute("ALTER TABLE trades ADD COLUMN macd_diff REAL DEFAULT 0")
-            if "stoch_k" not in columns:
-                cursor.execute("ALTER TABLE trades ADD COLUMN stoch_k REAL DEFAULT 0")
-            if "volatility_ratio" not in columns:
-                cursor.execute("ALTER TABLE trades ADD COLUMN volatility_ratio REAL DEFAULT 0")
-            lifecycle_columns = {
-                "candle_id": "TEXT", "trade_status": "TEXT DEFAULT 'OPEN'",
-                "tp1_hit_at": "TEXT", "tp2_hit_at": "TEXT", "sl_hit_at": "TEXT",
-                "exit_price": "REAL", "realized_r": "REAL", "slippage": "REAL"
-            }
-            for col_name, col_type in lifecycle_columns.items():
+            for col_name, col_type in {
+                "macd_diff": "REAL DEFAULT 0", "stoch_k": "REAL DEFAULT 0", "volatility_ratio": "REAL DEFAULT 0",
+                "candle_id": "TEXT", "trade_status": "TEXT DEFAULT 'OPEN'", "tp1_hit_at": "TEXT", "tp2_hit_at": "TEXT",
+                "sl_hit_at": "TEXT", "exit_price": "REAL", "realized_r": "REAL", "slippage": "REAL",
+                "feature_version": "TEXT", "strategy_version": "TEXT", "model_version": "TEXT",
+                "signal_score": "REAL", "ai_score": "REAL"
+            }.items():
                 if col_name not in columns:
                     cursor.execute(f"ALTER TABLE trades ADD COLUMN {col_name} {col_type}")
             cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_candle_id ON trades(candle_id)")
-
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS subscribers (chat_id INTEGER PRIMARY KEY)
-            ''')
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS authenticated_users (chat_id INTEGER PRIMARY KEY)
-            ''')
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value INTEGER)
-            ''')
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS gemini_insights (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    created_at TEXT,
-                    lesson TEXT
-                )
-            ''')
-
+            cursor.execute("CREATE TABLE IF NOT EXISTS subscribers (chat_id INTEGER PRIMARY KEY)")
+            cursor.execute("CREATE TABLE IF NOT EXISTS authenticated_users (chat_id INTEGER PRIMARY KEY)")
+            cursor.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value INTEGER)")
+            cursor.execute("CREATE TABLE IF NOT EXISTS gemini_insights (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT, lesson TEXT)")
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS model_evaluations (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                    created_at TEXT, 
-                    model_name TEXT, 
-                    feature_version TEXT,
-                    strategy_version TEXT,
-                    sample_size INTEGER, 
-                    oos_trades INTEGER, 
-                    total_r REAL, 
-                    expectancy_r REAL, 
-                    profit_factor REAL, 
-                    max_drawdown_r REAL, 
-                    promoted INTEGER DEFAULT 0
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT, model_name TEXT, 
+                    feature_version TEXT, strategy_version TEXT, sample_size INTEGER, 
+                    oos_trades INTEGER, total_r REAL, expectancy_r REAL, profit_factor REAL, 
+                    max_drawdown_r REAL, promoted INTEGER DEFAULT 0
                 )
             ''')
-            cursor.execute("PRAGMA table_info(model_evaluations)")
-            me_cols = [col[1] for col in cursor.fetchall()]
-            if "strategy_version" not in me_cols:
-                cursor.execute("ALTER TABLE model_evaluations ADD COLUMN strategy_version TEXT")
-
-        if is_postgres() and isinstance(conn, psycopg2.extensions.connection):
-            cursor.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS candle_id VARCHAR(100)")
-            cursor.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS trade_status VARCHAR(20) DEFAULT 'OPEN'")
-            cursor.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS tp1_hit_at TIMESTAMP")
-            cursor.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS tp2_hit_at TIMESTAMP")
-            cursor.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS sl_hit_at TIMESTAMP")
-            cursor.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_price REAL")
-            cursor.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS realized_r REAL")
-            cursor.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS slippage REAL")
-            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_candle_id ON trades(candle_id)")
-            cursor.execute("ALTER TABLE model_evaluations ADD COLUMN IF NOT EXISTS strategy_version VARCHAR(50)")
 
         if is_postgres() and isinstance(conn, psycopg2.extensions.connection):
             cursor.execute("""
@@ -695,14 +616,6 @@ def init_db():
             """)
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_learning_status ON learning_events(status)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_learning_retry ON learning_events(next_retry_at)")
-            for ddl in [
-                "ALTER TABLE trades ADD COLUMN IF NOT EXISTS feature_version VARCHAR(50)",
-                "ALTER TABLE trades ADD COLUMN IF NOT EXISTS strategy_version VARCHAR(50)",
-                "ALTER TABLE trades ADD COLUMN IF NOT EXISTS model_version VARCHAR(50)",
-                "ALTER TABLE trades ADD COLUMN IF NOT EXISTS signal_score REAL",
-                "ALTER TABLE trades ADD COLUMN IF NOT EXISTS ai_score REAL",
-            ]:
-                cursor.execute(ddl)
         else:
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS learning_events (
@@ -721,14 +634,7 @@ def init_db():
             """)
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_learning_status ON learning_events(status)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_learning_retry ON learning_events(next_retry_at)")
-            cursor.execute("PRAGMA table_info(trades)")
-            trade_columns = [col[1] for col in cursor.fetchall()]
-            for col_name, col_type in {
-                'feature_version':'TEXT', 'strategy_version':'TEXT', 'model_version':'TEXT',
-                'signal_score':'REAL', 'ai_score':'REAL'
-            }.items():
-                if col_name not in trade_columns:
-                    cursor.execute(f"ALTER TABLE trades ADD COLUMN {col_name} {col_type}")
+
         conn.commit()
     except Exception as e:
         print(f"خطأ أثناء تهيئة قاعدة البيانات: {e}")
@@ -843,93 +749,91 @@ def has_active_open_trade(signal_type):
         release_db_connection(conn)
 
 def _trade_direction(signal_type):
-    raw=str(signal_type or '').upper()
+    raw = str(signal_type or '').upper()
     if 'BUY' in raw or 'شراء' in raw: return 'BUY'
     if 'SELL' in raw or 'بيع' in raw: return 'SELL'
     return None
 
-def validate_trade_levels(signal_type,entry,sl,tp1,tp2):
-    direction=_trade_direction(signal_type)
-    try: entry_f,sl_f,tp1_f,tp2_f=[float(v) for v in (entry,sl,tp1,tp2)]
-    except (TypeError,ValueError): return False,'Entry/SL/TP must be numeric.'
-    if not all(np.isfinite(v) and v>0 for v in (entry_f,sl_f,tp1_f,tp2_f)): return False,'Entry/SL/TP must be finite positive prices.'
-    valid=(sl_f<entry_f<tp1_f<tp2_f) if direction=='BUY' else ((tp2_f<tp1_f<entry_f<sl_f) if direction=='SELL' else False)
-    return (True,'OK') if valid else (False,'Invalid BUY/SELL price ordering for Entry/SL/TP.')
+def validate_trade_levels(signal_type, entry, sl, tp1, tp2):
+    direction = _trade_direction(signal_type)
+    try: entry_f, sl_f, tp1_f, tp2_f = [float(v) for v in (entry, sl, tp1, tp2)]
+    except (TypeError, ValueError): return False, 'Entry/SL/TP must be numeric.'
+    if not all(np.isfinite(v) and v > 0 for v in (entry_f, sl_f, tp1_f, tp2_f)): return False, 'Entry/SL/TP must be finite positive prices.'
+    valid = (sl_f < entry_f < tp1_f < tp2_f) if direction == 'BUY' else ((tp2_f < tp1_f < entry_f < sl_f) if direction == 'SELL' else False)
+    return (True, 'OK') if valid else (False, 'Invalid BUY/SELL price ordering for Entry/SL/TP.')
 
-def _calculate_realized_r(signal_type,entry,sl,exit_price):
-    direction=_trade_direction(signal_type); risk=abs(float(entry)-float(sl)); exit_f=float(exit_price)
-    if direction not in {'BUY','SELL'} or risk<=0 or not np.isfinite(exit_f): return None
-    return (exit_f-float(entry))/risk if direction=='BUY' else (float(entry)-exit_f)/risk
+def _calculate_realized_r(signal_type, entry, sl, exit_price):
+    direction = _trade_direction(signal_type); risk = abs(float(entry) - float(sl)); exit_f = float(exit_price)
+    if direction not in {'BUY', 'SELL'} or risk <= 0 or not np.isfinite(exit_f): return None
+    return (exit_f - float(entry)) / risk if direction == 'BUY' else (float(entry) - exit_f) / risk
 
-def evaluate_trade_lifecycle(signal_type,status,entry,sl,tp1,tp2,*,price=None,bar_open=None,bar_high=None,bar_low=None):
-    direction=_trade_direction(signal_type); valid,reason=validate_trade_levels(signal_type,entry,sl,tp1,tp2)
+def evaluate_trade_lifecycle(signal_type, status, entry, sl, tp1, tp2, *, price=None, bar_open=None, bar_high=None, bar_low=None):
+    direction = _trade_direction(signal_type); valid, reason = validate_trade_levels(signal_type, entry, sl, tp1, tp2)
     if not valid: raise ValueError(reason)
-    status=str(status or 'OPEN').upper(); events=[]
+    status = str(status or 'OPEN').upper(); events = []
     if price is not None:
-        price=float(price); milestone=status=='OPEN' and (price>=tp1 if direction=='BUY' else price<=tp1)
-        final='TP2_HIT' if ((direction=='BUY' and price>=tp2) or (direction=='SELL' and price<=tp2)) else ('SL_HIT' if ((direction=='BUY' and price<=sl) or (direction=='SELL' and price>=sl)) else None)
-        if milestone: events.append(('TP1_HIT',float(tp1)))
-        if final: events.append((final,price))
+        price = float(price); milestone = status == 'OPEN' and (price >= tp1 if direction == 'BUY' else price <= tp1)
+        final = 'TP2_HIT' if ((direction == 'BUY' and price >= tp2) or (direction == 'SELL' and price <= tp2)) else ('SL_HIT' if ((direction == 'BUY' and price <= sl) or (direction == 'SELL' and price >= sl)) else None)
+        if milestone: events.append(('TP1_HIT', float(tp1)))
+        if final: events.append((final, price))
         return events
-    if any(v is None for v in (bar_open,bar_high,bar_low)): return events
-    bar_open,bar_high,bar_low=map(float,(bar_open,bar_high,bar_low)); milestone=status=='OPEN' and (bar_high>=tp1 if direction=='BUY' else bar_low<=tp1)
-    sl_hit=(bar_low<=sl) if direction=='BUY' else (bar_high>=sl); tp2_hit=(bar_high>=tp2) if direction=='BUY' else (bar_low<=tp2)
+    if any(v is None for v in (bar_open, bar_high, bar_low)): return events
+    bar_open, bar_high, bar_low = map(float, (bar_open, bar_high, bar_low)); milestone = status == 'OPEN' and (bar_high >= tp1 if direction == 'BUY' else bar_low <= tp1)
+    sl_hit = (bar_low <= sl) if direction == 'BUY' else (bar_high >= sl); tp2_hit = (bar_high >= tp2) if direction == 'BUY' else (bar_low <= tp2)
     if sl_hit and tp2_hit:
-        final='SL_HIT' if abs(bar_open-sl)<=abs(bar_open-tp2) else 'TP2_HIT'; final_price=sl if final=='SL_HIT' else tp2
-    elif sl_hit: final,final_price='SL_HIT',sl
-    elif tp2_hit: final,final_price='TP2_HIT',tp2
-    else: final,final_price=None,None
-    if milestone: events.append(('TP1_HIT',float(tp1)))
-    if final: events.append((final,float(final_price)))
+        final = 'SL_HIT' if abs(bar_open - sl) <= abs(bar_open - tp2) else 'TP2_HIT'; final_price = sl if final == 'SL_HIT' else tp2
+    elif sl_hit: final, final_price = 'SL_HIT', sl
+    elif tp2_hit: final, final_price = 'TP2_HIT', tp2
+    else: final, final_price = None, None
+    if milestone: events.append(('TP1_HIT', float(tp1)))
+    if final: events.append((final, float(final_price)))
     return events
 
-def log_trade(signal_type,entry,sl,tp1,tp2,rsi,dxy_corr,macd_diff,stoch_k,volatility_ratio,confidence,candle_id=None,signal_score=None,ai_score=None):
-    ok,reason=validate_trade_levels(signal_type,entry,sl,tp1,tp2)
-    if not ok: logger.warning('[TRADE_VALIDATION] %s',reason); return False,None
-    conn=get_db_connection()
+def log_trade(signal_type, entry, sl, tp1, tp2, rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, confidence, candle_id=None, signal_score=None, ai_score=None):
+    ok, reason = validate_trade_levels(signal_type, entry, sl, tp1, tp2)
+    if not ok: logger.warning('[TRADE_VALIDATION] %s', reason); return False, None
+    conn = get_db_connection()
     try:
-        cur=conn.cursor(); f_entry,f_sl,f_tp1,f_tp2=map(float,(entry,sl,tp1,tp2)); f_rsi,f_dxy,f_macd,f_stoch,f_vol,f_conf=map(float,(rsi,dxy_corr,macd_diff,stoch_k,volatility_ratio,confidence)); candle_id=candle_id or datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S'); now=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'); is_pg=is_postgres() and isinstance(conn,psycopg2.extensions.connection); params=(now,signal_type,f_entry,f_sl,f_tp1,f_tp2,f_rsi,f_dxy,f_macd,f_stoch,f_vol,f_conf,candle_id,FEATURE_VERSION,STRATEGY_VERSION,MODEL_VERSION,signal_score,ai_score)
-        if is_pg: cur.execute("INSERT INTO trades (timestamp,signal_type,entry_price,sl,tp1,tp2,rsi,dxy_corr,macd_diff,stoch_k,volatility_ratio,outcome,confidence,candle_id,trade_status,feature_version,strategy_version,model_version,signal_score,ai_score,slippage) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NULL,%s,%s,'OPEN',%s,%s,%s,%s,%s,NULL) ON CONFLICT (candle_id) DO NOTHING RETURNING id",params)
-        else: cur.execute("INSERT OR IGNORE INTO trades (timestamp,signal_type,entry_price,sl,tp1,tp2,rsi,dxy_corr,macd_diff,stoch_k,volatility_ratio,outcome,confidence,candle_id,trade_status,feature_version,strategy_version,model_version,signal_score,ai_score,slippage) VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,?,?, 'OPEN',?,?,?,?,?,NULL)",params)
-        inserted=cur.rowcount==1; trade_id=None
-        if inserted: trade_id=cur.lastrowid if not is_pg else ((lambda r:r[0] if r else None)(cur.fetchone()))
-        conn.commit(); return inserted,trade_id
+        cur = conn.cursor(); f_entry, f_sl, f_tp1, f_tp2 = map(float, (entry, sl, tp1, tp2)); f_rsi, f_dxy, f_macd, f_stoch, f_vol, f_conf = map(float, (rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, confidence)); candle_id = candle_id or datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S'); now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'); is_pg = is_postgres() and isinstance(conn, psycopg2.extensions.connection); params = (now, signal_type, f_entry, f_sl, f_tp1, f_tp2, f_rsi, f_dxy, f_macd, f_stoch, f_vol, f_conf, candle_id, FEATURE_VERSION, STRATEGY_VERSION, MODEL_VERSION, signal_score, ai_score)
+        if is_pg: cur.execute("INSERT INTO trades (timestamp,signal_type,entry_price,sl,tp1,tp2,rsi,dxy_corr,macd_diff,stoch_k,volatility_ratio,outcome,confidence,candle_id,trade_status,feature_version,strategy_version,model_version,signal_score,ai_score,slippage) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NULL,%s,%s,'OPEN',%s,%s,%s,%s,%s,NULL) ON CONFLICT (candle_id) DO NOTHING RETURNING id", params)
+        else: cur.execute("INSERT OR IGNORE INTO trades (timestamp,signal_type,entry_price,sl,tp1,tp2,rsi,dxy_corr,macd_diff,stoch_k,volatility_ratio,outcome,confidence,candle_id,trade_status,feature_version,strategy_version,model_version,signal_score,ai_score,slippage) VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,?,?, 'OPEN',?,?,?,?,?,NULL)", params)
+        inserted = cur.rowcount == 1; trade_id = None
+        if inserted: trade_id = cur.lastrowid if not is_pg else ((lambda r: r[0] if r else None)(cur.fetchone()))
+        conn.commit(); return inserted, trade_id
     except Exception as e:
         try: conn.rollback()
         except Exception: pass
-        system_monitor.record_error('TRADE_INSERT',e); return False,None
+        system_monitor.record_error('TRADE_INSERT', e); return False, None
     finally: release_db_connection(conn)
 
-
-def update_trade_state(trade_id,new_status,exit_price=None,realized_r=None,slippage=None):
-    if new_status not in {'TP1_HIT','TP2_HIT','SL_HIT'}: return False
-    conn=get_db_connection(); changed=False; final_status=new_status in {'TP2_HIT','SL_HIT'}
+def update_trade_state(trade_id, new_status, exit_price=None, realized_r=None, slippage=None):
+    if new_status not in {'TP1_HIT', 'TP2_HIT', 'SL_HIT'}: return False
+    conn = get_db_connection(); changed = False; final_status = new_status in {'TP2_HIT', 'SL_HIT'}
     try:
-        cur=conn.cursor(); is_pg=is_postgres() and isinstance(conn,psycopg2.extensions.connection); ph='%s' if is_pg else '?'; cur.execute(f"SELECT signal_type,entry_price,sl,tp1,tp2,trade_status FROM trades WHERE id={ph}",(trade_id,)); row=cur.fetchone()
+        cur = conn.cursor(); is_pg = is_postgres() and isinstance(conn, psycopg2.extensions.connection); ph = '%s' if is_pg else '?'; cur.execute(f"SELECT signal_type,entry_price,sl,tp1,tp2,trade_status FROM trades WHERE id={ph}", (trade_id,)); row = cur.fetchone()
         if not row: return False
-        signal_type,entry,sl,tp1,tp2,current_status=row; current_status=str(current_status or 'OPEN')
-        if new_status=='TP1_HIT' and current_status!='OPEN': return False
-        if final_status and current_status not in {'OPEN','TP1_HIT'}: return False
-        now=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-        if new_status=='TP1_HIT': sql=f"UPDATE trades SET trade_status={ph},tp1_hit_at={ph},slippage=NULL WHERE id={ph} AND trade_status='OPEN' AND outcome IS NULL"; params=(new_status,now,trade_id)
+        signal_type, entry, sl, tp1, tp2, current_status = row; current_status = str(current_status or 'OPEN')
+        if new_status == 'TP1_HIT' and current_status != 'OPEN': return False
+        if final_status and current_status not in {'OPEN', 'TP1_HIT'}: return False
+        now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        if new_status == 'TP1_HIT': sql = f"UPDATE trades SET trade_status={ph},tp1_hit_at={ph},slippage=NULL WHERE id={ph} AND trade_status='OPEN' AND outcome IS NULL"; params = (new_status, now, trade_id)
         else:
-            if exit_price is None: exit_price=tp2 if new_status=='TP2_HIT' else sl
-            final_r=_calculate_realized_r(signal_type,entry,sl,exit_price)
+            if exit_price is None: exit_price = tp2 if new_status == 'TP2_HIT' else sl
+            final_r = _calculate_realized_r(signal_type, entry, sl, exit_price)
             if final_r is None: return False
-            outcome=1 if new_status=='TP2_HIT' else 0
-            if new_status=='TP2_HIT': sql=f"UPDATE trades SET trade_status={ph},tp2_hit_at={ph},tp1_hit_at=COALESCE(tp1_hit_at,{ph}),exit_price={ph},realized_r={ph},slippage=NULL,outcome={ph} WHERE id={ph} AND trade_status IN ('OPEN','TP1_HIT') AND outcome IS NULL"; params=(new_status,now,now,exit_price,final_r,outcome,trade_id)
-            else: sql=f"UPDATE trades SET trade_status={ph},sl_hit_at={ph},exit_price={ph},realized_r={ph},slippage=NULL,outcome={ph} WHERE id={ph} AND trade_status IN ('OPEN','TP1_HIT') AND outcome IS NULL"; params=(new_status,now,exit_price,final_r,outcome,trade_id)
-        cur.execute(sql,params); changed=cur.rowcount==1; conn.commit()
+            outcome = 1 if new_status == 'TP2_HIT' else 0
+            if new_status == 'TP2_HIT': sql = f"UPDATE trades SET trade_status={ph},tp2_hit_at={ph},tp1_hit_at=COALESCE(tp1_hit_at,{ph}),exit_price={ph},realized_r={ph},slippage=NULL,outcome={ph} WHERE id={ph} AND trade_status IN ('OPEN','TP1_HIT') AND outcome IS NULL"; params = (new_status, now, now, exit_price, final_r, outcome, trade_id)
+            else: sql = f"UPDATE trades SET trade_status={ph},sl_hit_at={ph},exit_price={ph},realized_r={ph},slippage=NULL,outcome={ph} WHERE id={ph} AND trade_status IN ('OPEN','TP1_HIT') AND outcome IS NULL"; params = (new_status, now, exit_price, final_r, outcome, trade_id)
+        cur.execute(sql, params); changed = cur.rowcount == 1; conn.commit()
     except Exception as e:
         try: conn.rollback()
         except Exception: pass
-        system_monitor.record_error('TRADE_STATE',e); return False
+        system_monitor.record_error('TRADE_STATE', e); return False
     finally: release_db_connection(conn)
     if changed and final_status:
-        payload=_build_trade_learning_payload(trade_id,new_status)
-        if payload: enqueue_learning_event('TRADE_OUTCOME',f'trade_outcome:{trade_id}',payload,priority=1 if new_status=='SL_HIT' else 3)
+        payload = _build_trade_learning_payload(trade_id, new_status)
+        if payload: enqueue_learning_event('TRADE_OUTCOME', f'trade_outcome:{trade_id}', payload, priority=1 if new_status == 'SL_HIT' else 3)
     return changed
-
 
 def _build_trade_learning_payload(trade_id, outcome_status):
     conn = get_db_connection()
@@ -947,17 +851,17 @@ def _build_trade_learning_payload(trade_id, outcome_status):
         row = cur.fetchone()
         if not row:
             return None
-        keys = ['trade_id','direction','entry_price','sl','tp1','tp2','rsi','dxy_corr','macd_diff','stoch_k','volatility_ratio','confidence','realized_r','exit_price','slippage','feature_version','strategy_version','model_version','signal_score','ai_score']
-        d = dict(zip(keys,row))
+        keys = ['trade_id', 'direction', 'entry_price', 'sl', 'tp1', 'tp2', 'rsi', 'dxy_corr', 'macd_diff', 'stoch_k', 'volatility_ratio', 'confidence', 'realized_r', 'exit_price', 'slippage', 'feature_version', 'strategy_version', 'model_version', 'signal_score', 'ai_score']
+        d = dict(zip(keys, row))
         return {
-            'trade_id': d['trade_id'], 'symbol':'XAUUSD', 'direction':d['direction'],
-            'entry_price':d['entry_price'], 'outcome':'LOSS' if outcome_status=='SL_HIT' else outcome_status,
-            'realized_r':d['realized_r'], 'exit_price':d['exit_price'], 'slippage':d['slippage'],
-            'features': {'rsi':d['rsi'],'dxy_corr':d['dxy_corr'],'macd_diff':d['macd_diff'],'stoch_k':d['stoch_k'],'volatility_ratio':d['volatility_ratio'],'confidence':d['confidence'],'signal_score':d['signal_score'],'ai_score':d['ai_score']},
-            'versions': {'feature_version':d['feature_version'] or FEATURE_VERSION,'strategy_version':d['strategy_version'] or STRATEGY_VERSION,'model_version':d['model_version'] or MODEL_VERSION}
+            'trade_id': d['trade_id'], 'symbol': 'XAUUSD', 'direction': d['direction'],
+            'entry_price': d['entry_price'], 'outcome': 'LOSS' if outcome_status == 'SL_HIT' else outcome_status,
+            'realized_r': d['realized_r'], 'exit_price': d['exit_price'], 'slippage': d['slippage'],
+            'features': {'rsi': d['rsi'], 'dxy_corr': d['dxy_corr'], 'macd_diff': d['macd_diff'], 'stoch_k': d['stoch_k'], 'volatility_ratio': d['volatility_ratio'], 'confidence': d['confidence'], 'signal_score': d['signal_score'], 'ai_score': d['ai_score']},
+            'versions': {'feature_version': d['feature_version'] or FEATURE_VERSION, 'strategy_version': d['strategy_version'] or STRATEGY_VERSION, 'model_version': d['model_version'] or MODEL_VERSION}
         }
     except Exception as e:
-        system_monitor.record_error('LEARNING_PAYLOAD',e)
+        system_monitor.record_error('LEARNING_PAYLOAD', e)
         return None
     finally:
         release_db_connection(conn)
@@ -965,111 +869,111 @@ def _build_trade_learning_payload(trade_id, outcome_status):
 def enqueue_learning_event(event_type, event_key, payload_dict, priority=3):
     conn = get_db_connection()
     try:
-        cur = conn.cursor(); now=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-        is_pg=is_postgres() and isinstance(conn, psycopg2.extensions.connection)
-        payload=PGJson(payload_dict) if is_pg else json.dumps(payload_dict,ensure_ascii=False)
+        cur = conn.cursor(); now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        is_pg = is_postgres() and isinstance(conn, psycopg2.extensions.connection)
+        payload = PGJson(payload_dict) if is_pg else json.dumps(payload_dict, ensure_ascii=False)
         if is_pg:
             cur.execute("""INSERT INTO learning_events (event_type,event_key,priority,status,payload,created_at,updated_at)
-                           VALUES (%s,%s,%s,'PENDING',%s,%s,%s) ON CONFLICT (event_key) DO NOTHING""",(event_type,event_key,int(priority),payload,now,now))
+                           VALUES (%s,%s,%s,'PENDING',%s,%s,%s) ON CONFLICT (event_key) DO NOTHING""", (event_type, event_key, int(priority), payload, now, now))
         else:
             cur.execute("""INSERT OR IGNORE INTO learning_events (event_type,event_key,priority,status,payload,created_at,updated_at)
-                           VALUES (?,?,?,?,?,?,?)""",(event_type,event_key,int(priority),'PENDING',payload,now,now))
-        inserted=cur.rowcount==1; conn.commit(); return inserted
+                           VALUES (?,?,?,?,?,?,?)""", (event_type, event_key, int(priority), 'PENDING', payload, now, now))
+        inserted = cur.rowcount == 1; conn.commit(); return inserted
     except Exception as e:
         try: conn.rollback()
         except Exception: pass
-        system_monitor.record_error('QUEUE_ENQUEUE',e); return False
+        system_monitor.record_error('QUEUE_ENQUEUE', e); return False
     finally:
         release_db_connection(conn)
 
 def recover_interrupted_learning_events():
-    conn=get_db_connection()
+    conn = get_db_connection()
     try:
-        cur=conn.cursor(); is_pg=is_postgres() and isinstance(conn,psycopg2.extensions.connection); ph='%s' if is_pg else '?'
-        now=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-        cur.execute(f"UPDATE learning_events SET status='PENDING',updated_at={ph} WHERE status='PROCESSING'",(now,)); n=cur.rowcount; conn.commit()
-        if n: logger.info('[AI RECOVERY] تم استرداد %s أحداث تعلم عالقة.',n)
+        cur = conn.cursor(); is_pg = is_postgres() and isinstance(conn, psycopg2.extensions.connection); ph = '%s' if is_pg else '?'
+        now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        cur.execute(f"UPDATE learning_events SET status='PENDING',updated_at={ph} WHERE status='PROCESSING'", (now,)); n = cur.rowcount; conn.commit()
+        if n: logger.info('[AI RECOVERY] تم استرداد %s أحداث تعلم عالقة.', n)
     except Exception as e:
         try: conn.rollback()
         except Exception: pass
-        system_monitor.record_error('AI_RECOVERY',e)
+        system_monitor.record_error('AI_RECOVERY', e)
     finally:
         release_db_connection(conn)
 
 def claim_learning_batch(limit=5):
-    limit=max(1,min(int(limit),LEARNING_BATCH_SIZE)); conn=get_db_connection(); claimed=[]
+    limit = max(1, min(int(limit), LEARNING_BATCH_SIZE)); conn = get_db_connection(); claimed = []
     try:
-        cur=conn.cursor(); is_pg=is_postgres() and isinstance(conn,psycopg2.extensions.connection); now=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        cur = conn.cursor(); is_pg = is_postgres() and isinstance(conn, psycopg2.extensions.connection); now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         if is_pg:
             cur.execute("""SELECT id,event_type,event_key,priority,payload,retry_count FROM learning_events
                            WHERE status IN ('PENDING','DEFERRED') AND next_retry_at <= CURRENT_TIMESTAMP
-                           ORDER BY priority ASC,created_at ASC LIMIT %s FOR UPDATE SKIP LOCKED""",(limit,))
+                           ORDER BY priority ASC,created_at ASC LIMIT %s FOR UPDATE SKIP LOCKED""", (limit,))
         else:
             cur.execute('BEGIN IMMEDIATE')
             cur.execute("""SELECT id,event_type,event_key,priority,payload,retry_count FROM learning_events
                            WHERE status IN ('PENDING','DEFERRED') AND datetime(next_retry_at) <= datetime('now')
-                           ORDER BY priority ASC,datetime(created_at) ASC LIMIT ?""",(limit,))
-        rows=cur.fetchall(); ph='%s' if is_pg else '?'
+                           ORDER BY priority ASC,datetime(created_at) ASC LIMIT ?""", (limit,))
+        rows = cur.fetchall(); ph = '%s' if is_pg else '?'
         for row in rows:
-            eid,etype,ekey,priority,payload,retry=row
-            cur.execute(f"UPDATE learning_events SET status='PROCESSING',updated_at={ph} WHERE id={ph} AND status IN ('PENDING','DEFERRED')",(now,eid))
-            if cur.rowcount==1:
-                if isinstance(payload,str): payload=json.loads(payload)
-                claimed.append({'id':eid,'event_type':etype,'event_key':ekey,'priority':priority,'payload':payload,'retry_count':retry})
+            eid, etype, ekey, priority, payload, retry = row
+            cur.execute(f"UPDATE learning_events SET status='PROCESSING',updated_at={ph} WHERE id={ph} AND status IN ('PENDING','DEFERRED')", (now, eid))
+            if cur.rowcount == 1:
+                if isinstance(payload, str): payload = json.loads(payload)
+                claimed.append({'id': eid, 'event_type': etype, 'event_key': ekey, 'priority': priority, 'payload': payload, 'retry_count': retry})
         conn.commit(); return claimed
     except Exception as e:
         try: conn.rollback()
         except Exception: pass
-        system_monitor.record_error('QUEUE_CLAIM',e); return []
+        system_monitor.record_error('QUEUE_CLAIM', e); return []
     finally:
         release_db_connection(conn)
 
 def mark_learning_completed(event_id):
-    conn=get_db_connection()
+    conn = get_db_connection()
     try:
-        cur=conn.cursor(); is_pg=is_postgres() and isinstance(conn,psycopg2.extensions.connection); ph='%s' if is_pg else '?'
-        cur.execute(f"UPDATE learning_events SET status='COMPLETED',updated_at={ph} WHERE id={ph}",(datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),event_id)); conn.commit()
+        cur = conn.cursor(); is_pg = is_postgres() and isinstance(conn, psycopg2.extensions.connection); ph = '%s' if is_pg else '?'
+        cur.execute(f"UPDATE learning_events SET status='COMPLETED',updated_at={ph} WHERE id={ph}", (datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), event_id)); conn.commit()
     except Exception as e:
         try: conn.rollback()
         except Exception: pass
-        system_monitor.record_error('QUEUE_COMPLETE',e)
+        system_monitor.record_error('QUEUE_COMPLETE', e)
     finally: release_db_connection(conn)
 
-def mark_learning_deferred(event_id,error,retry_count):
-    conn=get_db_connection()
+def mark_learning_deferred(event_id, error, retry_count):
+    conn = get_db_connection()
     try:
-        retry_count=int(retry_count)+1; delay=min(3600,(2**min(retry_count,8))*5)+(hash(str(event_id))%7); next_at=datetime.now(timezone.utc)+timedelta(seconds=delay)
-        status='FAILED' if retry_count>=MAX_LEARNING_RETRIES else 'DEFERRED'; cur=conn.cursor(); is_pg=is_postgres() and isinstance(conn,psycopg2.extensions.connection); ph='%s' if is_pg else '?'
-        cur.execute(f"UPDATE learning_events SET status={ph},retry_count={ph},next_retry_at={ph},last_error={ph},updated_at={ph} WHERE id={ph}",(status,retry_count,next_at.strftime('%Y-%m-%d %H:%M:%S'),str(error)[:1000],datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),event_id)); conn.commit()
+        retry_count = int(retry_count) + 1; delay = min(3600, (2**min(retry_count, 8)) * 5) + (hash(str(event_id)) % 7); next_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+        status = 'FAILED' if retry_count >= MAX_LEARNING_RETRIES else 'DEFERRED'; cur = conn.cursor(); is_pg = is_postgres() and isinstance(conn, psycopg2.extensions.connection); ph = '%s' if is_pg else '?'
+        cur.execute(f"UPDATE learning_events SET status={ph},retry_count={ph},next_retry_at={ph},last_error={ph},updated_at={ph} WHERE id={ph}", (status, retry_count, next_at.strftime('%Y-%m-%d %H:%M:%S'), str(error)[:1000], datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), event_id)); conn.commit()
     except Exception as e:
         try: conn.rollback()
         except Exception: pass
-        system_monitor.record_error('QUEUE_RETRY',e)
+        system_monitor.record_error('QUEUE_RETRY', e)
     finally: release_db_connection(conn)
 
 class CircuitBreaker:
-    def __init__(self,failure_threshold=3,cooldown_seconds=120): self.failure_threshold=failure_threshold; self.cooldown_seconds=cooldown_seconds; self.failures=0; self.opened_at=None; self.lock=threading.Lock()
+    def __init__(self, failure_threshold=3, cooldown_seconds=120): self.failure_threshold = failure_threshold; self.cooldown_seconds = cooldown_seconds; self.failures = 0; self.opened_at = None; self.lock = threading.Lock()
     def allow(self):
         with self.lock:
-            return self.opened_at is None or time.monotonic()-self.opened_at>=self.cooldown_seconds
+            return self.opened_at is None or time.monotonic() - self.opened_at >= self.cooldown_seconds
     def success(self):
-        with self.lock: self.failures=0; self.opened_at=None
+        with self.lock: self.failures = 0; self.opened_at = None
     def failure(self):
         with self.lock:
-            self.failures+=1
-            if self.failures>=self.failure_threshold: self.opened_at=time.monotonic()
+            self.failures += 1
+            if self.failures >= self.failure_threshold: self.opened_at = time.monotonic()
 
-learning_circuit=CircuitBreaker()
+learning_circuit = CircuitBreaker()
 
 def process_learning_batch(events):
     if not events: return True
     if not gemini_client: raise RuntimeError('خدمة Gemini غير مفعلة حالياً')
     if not learning_circuit.allow(): raise RuntimeError('قاطع دائرة Gemini مفتوح مؤقتاً')
-    lines=[]
+    lines = []
     for e in events:
-        p=e['payload']; f=p.get('features',{})
+        p = e['payload']; f = p.get('features', {})
         lines.append(f"ID:{p.get('trade_id')} | {p.get('direction')} | outcome:{p.get('outcome')} | R:{p.get('realized_r')} | RSI:{f.get('rsi')} | DXY:{f.get('dxy_corr')} | MACD:{f.get('macd_diff')} | Stoch:{f.get('stoch_k')} | Vol:{f.get('volatility_ratio')} | Conf:{f.get('confidence')} | Score:{f.get('signal_score')} | AI:{f.get('ai_score')} | Versions:{p.get('versions')}")
-    prompt=f"""
+    prompt = f"""
 أنت مستشار تعلم ذاتي لنظام تداول كمي للذهب XAUUSD.
 حلل دفعة نتائج مغلقة لاكتشاف الأنماط المتكررة، بدون تعديل الاستراتيجية مباشرة.
 ميّز بين الضوضاء والنمط المتكرر، وأعد JSON فقط:
@@ -1102,48 +1006,48 @@ def process_learning_batch(events):
         raise RuntimeError(e or 'فشل تحليل دفعة التعلم')
 
 class LearningQueueManager:
-    def __init__(self,maxsize=50): self.maxsize=maxsize; self.queue=None; self.enqueued_ids=set()
+    def __init__(self, maxsize=50): self.maxsize = maxsize; self.queue = None; self.enqueued_ids = set()
     def initialize(self):
-        if self.queue is None: self.queue=asyncio.PriorityQueue(maxsize=self.maxsize)
+        if self.queue is None: self.queue = asyncio.PriorityQueue(maxsize=self.maxsize)
     async def fill_from_db(self):
         self.initialize()
         if self.queue.full(): return
-        conn=get_db_connection()
+        conn = get_db_connection()
         try:
-            cur=conn.cursor(); is_pg=is_postgres() and isinstance(conn,psycopg2.extensions.connection); ph='%s' if is_pg else '?'
-            cur.execute(f"SELECT id,priority,created_at FROM learning_events WHERE status IN ('PENDING','DEFERRED') AND next_retry_at <= CURRENT_TIMESTAMP ORDER BY priority ASC,created_at ASC LIMIT {ph}",(self.maxsize,))
-            rows=cur.fetchall()
+            cur = conn.cursor(); is_pg = is_postgres() and isinstance(conn, psycopg2.extensions.connection); ph = '%s' if is_pg else '?'
+            cur.execute(f"SELECT id,priority,created_at FROM learning_events WHERE status IN ('PENDING','DEFERRED') AND next_retry_at <= CURRENT_TIMESTAMP ORDER BY priority ASC,created_at ASC LIMIT {ph}", (self.maxsize,))
+            rows = cur.fetchall()
         except Exception as e:
-            system_monitor.record_error('QUEUE_FILL',e); rows=[]
+            system_monitor.record_error('QUEUE_FILL', e); rows = []
         finally: release_db_connection(conn)
-        for eid,priority,created_at in rows:
+        for eid, priority, created_at in rows:
             if eid in self.enqueued_ids or self.queue.full(): continue
-            try: await self.queue.put((int(priority or 3),str(created_at),int(eid))); self.enqueued_ids.add(eid)
+            try: await self.queue.put((int(priority or 3), str(created_at), int(eid))); self.enqueued_ids.add(eid)
             except asyncio.QueueFull: break
-    async def worker_loop(self,stop_event):
+    async def worker_loop(self, stop_event):
         self.initialize()
         while not stop_event.is_set():
             try:
                 await self.fill_from_db()
                 if self.queue.empty(): await asyncio.sleep(5); continue
-                heavy,tier,mb=system_monitor.defer_heavy_tasks()
-                if heavy: logger.warning('[HEALTH] تأجيل التعلم بسبب RAM %.1fMB (%s).',mb,tier); await asyncio.sleep(15); continue
-                take=min(LEARNING_BATCH_SIZE,self.queue.qsize())
+                heavy, tier, mb = system_monitor.defer_heavy_tasks()
+                if heavy: logger.warning('[HEALTH] تأجيل التعلم بسبب RAM %.1fMB (%s).', mb, tier); await asyncio.sleep(15); continue
+                take = min(LEARNING_BATCH_SIZE, self.queue.qsize())
                 for _ in range(take):
-                    _,_,eid=await self.queue.get(); self.enqueued_ids.discard(eid); self.queue.task_done()
-                events=await asyncio.to_thread(claim_learning_batch,take)
+                    _, _, eid = await self.queue.get(); self.enqueued_ids.discard(eid); self.queue.task_done()
+                events = await asyncio.to_thread(claim_learning_batch, take)
                 if not events: await asyncio.sleep(1); continue
                 try:
-                    await asyncio.to_thread(process_learning_batch,events)
-                    for e in events: await asyncio.to_thread(mark_learning_completed,e['id'])
+                    await asyncio.to_thread(process_learning_batch, events)
+                    for e in events: await asyncio.to_thread(mark_learning_completed, e['id'])
                 except Exception as e:
-                    for ev in events: await asyncio.to_thread(mark_learning_deferred,ev['id'],e,ev.get('retry_count',0))
-                    system_monitor.record_error('AI_WORKER',e); await asyncio.sleep(2)
+                    for ev in events: await asyncio.to_thread(mark_learning_deferred, ev['id'], e, ev.get('retry_count', 0))
+                    system_monitor.record_error('AI_WORKER', e); await asyncio.sleep(2)
             except asyncio.CancelledError: break
-            except Exception as e: system_monitor.record_error('LEARNING_WORKER',e); await asyncio.sleep(5)
+            except Exception as e: system_monitor.record_error('LEARNING_WORKER', e); await asyncio.sleep(5)
 
-learning_manager=LearningQueueManager(MAX_LEARNING_QUEUE)
-LEARNING_STOP_EVENT=threading.Event()
+learning_manager = LearningQueueManager(MAX_LEARNING_QUEUE)
+LEARNING_STOP_EVENT = threading.Event()
 
 def monitor_open_trades():
     conn = get_db_connection()
@@ -1167,12 +1071,10 @@ def monitor_open_trades():
             if exit_price is None:
                 continue
             for event_status, event_price in evaluate_trade_lifecycle(sig_type, status, entry, sl, tp1, tp2, price=exit_price):
-                if update_trade_state(trade_id, event_status, event_price) and event_status in {'TP2_HIT','SL_HIT'}:
+                if update_trade_state(trade_id, event_status, event_price) and event_status in {'TP2_HIT', 'SL_HIT'}:
                     break
         except Exception as e:
             print(f"⚠️ خطأ في دورة حياة الصفقة {trade_id}: {e}")
-
-
 
 # ------------------------------------
 # 🧠 محرك ذكاء GEMINI لتفريغ أسباب الخسارة وتدقيق الفرص اللحظية
@@ -1236,29 +1138,28 @@ def gemini_verify_signal(signal_data, market_summary):
 
 def update_open_trades_outcome_historical(df_m15):
     if df_m15 is None or df_m15.empty: return
-    conn=get_db_connection()
-    try: cur=conn.cursor(); cur.execute("SELECT id,timestamp,signal_type,entry_price,sl,tp1,tp2,trade_status FROM trades WHERE outcome IS NULL AND trade_status IN ('OPEN','TP1_HIT')"); open_trades=cur.fetchall()
-    except Exception as e: print(f"خطأ تحميل الصفقات المفتوحة للتقييم التاريخي: {e}"); open_trades=[]
+    conn = get_db_connection()
+    try: cur = conn.cursor(); cur.execute("SELECT id,timestamp,signal_type,entry_price,sl,tp1,tp2,trade_status FROM trades WHERE outcome IS NULL AND trade_status IN ('OPEN','TP1_HIT')"); open_trades = cur.fetchall()
+    except Exception as e: print(f"خطأ تحميل الصفقات المفتوحة للتقييم التاريخي: {e}"); open_trades = []
     finally: release_db_connection(conn)
-    df_clean=clean_df_columns(df_m15.copy())
+    df_clean = clean_df_columns(df_m15.copy())
     if df_clean.empty: return
-    if not isinstance(df_clean.index,pd.DatetimeIndex): df_clean.index=pd.to_datetime(df_clean.index,utc=True)
-    elif df_clean.index.tz is None: df_clean.index=df_clean.index.tz_localize(timezone.utc)
-    else: df_clean.index=df_clean.index.tz_convert(timezone.utc)
-    df_clean=df_clean[~df_clean.index.duplicated(keep='first')].sort_index()
-    for trade_id,trade_time_str,sig_type,entry,sl,tp1,tp2,status in open_trades:
+    if not isinstance(df_clean.index, pd.DatetimeIndex): df_clean.index = pd.to_datetime(df_clean.index, utc=True)
+    elif df_clean.index.tz is None: df_clean.index = df_clean.index.tz_localize(timezone.utc)
+    else: df_clean.index = df_clean.index.tz_convert(timezone.utc)
+    df_clean = df_clean[~df_clean.index.duplicated(keep='first')].sort_index()
+    for trade_id, trade_time_str, sig_type, entry, sl, tp1, tp2, status in open_trades:
         try:
-            if isinstance(trade_time_str,datetime): trade_time=trade_time_str if trade_time_str.tzinfo else trade_time_str.replace(tzinfo=timezone.utc)
-            else: trade_time=datetime.strptime(str(trade_time_str)[:19],'%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
-            current_status=status if status in {'OPEN','TP1_HIT'} else 'OPEN'
-            for _,bar in df_clean[df_clean.index>=trade_time].iterrows():
-                events=evaluate_trade_lifecycle(sig_type,current_status,entry,sl,tp1,tp2,bar_open=float(bar['Open']),bar_high=float(bar['High']),bar_low=float(bar['Low']))
-                for event_status,event_price in events:
-                    if update_trade_state(trade_id,event_status,event_price): current_status=event_status
-                    if event_status in {'TP2_HIT','SL_HIT'}: break
-                if current_status in {'TP2_HIT','SL_HIT'}: break
+            if isinstance(trade_time_str, datetime): trade_time = trade_time_str if trade_time_str.tzinfo else trade_time_str.replace(tzinfo=timezone.utc)
+            else: trade_time = datetime.strptime(str(trade_time_str)[:19], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+            current_status = status if status in {'OPEN', 'TP1_HIT'} else 'OPEN'
+            for _, bar in df_clean[df_clean.index >= trade_time].iterrows():
+                events = evaluate_trade_lifecycle(sig_type, current_status, entry, sl, tp1, tp2, bar_open=float(bar['Open']), bar_high=float(bar['High']), bar_low=float(bar['Low']))
+                for event_status, event_price in events:
+                    if update_trade_state(trade_id, event_status, event_price): current_status = event_status
+                    if event_status in {'TP2_HIT', 'SL_HIT'}: break
+                if current_status in {'TP2_HIT', 'SL_HIT'}: break
         except Exception as e: print(f"خطأ في تقييم lifecycle التاريخي للصفقة {trade_id}: {e}")
-
 
 def build_historic_market_features():
     cache = get_chart_data_cached()
@@ -1397,10 +1298,6 @@ def _save_model_evaluation(meta, promoted):
         release_db_connection(conn)
 
 def _run_walk_forward_validation(df, feature_cols, n_splits=4):
-    """
-    محرك التحقق الزمني المتقدم Walk-Forward Validation (Expanding Windows).
-    الماضي -> التدريب | المستقبل الحصري -> تقييم OOS (بدون أي تسريب مستقبلي).
-    """
     n_samples = len(df)
     min_train_size = int(n_samples * 0.40)
     remaining_samples = n_samples - min_train_size
@@ -1444,7 +1341,6 @@ def _run_walk_forward_validation(df, feature_cols, n_splits=4):
         
     oos_metrics = _financial_metrics(all_oos_selected_r)
     
-    # تدريب النموذج المتحدي النهائي (Challenger) على كامل التاريخ المرتب زمنياً
     challenger_model = RandomForestClassifier(
         n_estimators=50,
         max_depth=3,
@@ -1458,7 +1354,6 @@ def _run_walk_forward_validation(df, feature_cols, n_splits=4):
     return challenger_model, oos_metrics
 
 def train_self_learning_model():
-    """Champion-Challenger: تدريب Walk-Forward زمني صارم وترقية إحصائية موثقة"""
     global CACHED_MODEL, CACHED_MODEL_META, LAST_TRAIN_TIME
     now = datetime.now(timezone.utc)
     with MODEL_LOCK:
@@ -1469,7 +1364,6 @@ def train_self_learning_model():
         df = None
         try:
             limit = int(max(100, min(MODEL_TRAIN_LIMIT, 1000)))
-            # 🔴 الترتيب الزمني الصارم: جلب أحدث limit صفقة مع ترتيبها تصاعدياً (الأقدم أولاً -> الأحدث آخراً)
             if is_postgres() and isinstance(conn, psycopg2.extensions.connection):
                 query = f"""
                     SELECT rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, outcome, realized_r, id
@@ -1616,11 +1510,8 @@ def detect_smc_setup(df):
     }
 
 # ------------------------------------
-# 4. محرك بيانات XAU/USD المعزول: Live Spot vs Historical OHLC
+# 4. محرك بيانات XAU/USD المعزول: Yahoo Finance Spot
 # ------------------------------------
-
-
-
 
 def _parse_price_feed_timestamp(value):
     if value is None:
@@ -1628,180 +1519,141 @@ def _parse_price_feed_timestamp(value):
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
     try:
-        raw=str(value).strip()
+        raw = str(value).strip()
         if not raw:
             return None
-        return datetime.fromtimestamp(float(raw),tz=timezone.utc) if raw.isdigit() else datetime.fromisoformat(raw.replace('Z','+00:00')).astimezone(timezone.utc)
-    except (TypeError,ValueError,OverflowError):
+        return datetime.fromtimestamp(float(raw), tz=timezone.utc) if raw.isdigit() else datetime.fromisoformat(raw.replace('Z', '+00:00')).astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
         return None
 
 def _finite_positive(value):
     try:
-        value=float(value)
-        return value if math.isfinite(value) and value>0 else None
-    except (TypeError,ValueError):
+        value = float(value)
+        return value if math.isfinite(value) and value > 0 else None
+    except (TypeError, ValueError):
         return None
 
 def _build_missing_yahoo_feed(error_type='missing', error_message='No live XAUUSD Spot data available.'):
-    now=datetime.now(timezone.utc)
-    return {'symbol':'XAUUSD','provider':'Yahoo Finance','status':'MISSING','bid':None,'ask':None,'mid':None,'spot':None,'source_timestamp':None,'timestamp':None,'fetched_timestamp':now.isoformat(),'source_fetched_timestamp':None,'age_seconds':None,'error_type':str(error_type),'error_message':str(error_message or '')[:300],'spread_available':False}
+    now = datetime.now(timezone.utc)
+    return {
+        'symbol': 'XAUUSD',
+        'provider': 'Yahoo Finance',
+        'status': 'MISSING',
+        'bid': None,
+        'ask': None,
+        'mid': None,
+        'spot': None,
+        'source_timestamp': None,
+        'timestamp': None,
+        'fetched_timestamp': now.isoformat(),
+        'source_fetched_timestamp': None,
+        'age_seconds': None,
+        'error_type': str(error_type),
+        'error_message': str(error_message or '')[:300],
+        'spread_available': False
+    }
 
-def _yahoo_live_error_message(response):
-    try:
-        payload=response.json(); chart=payload.get('chart') or {}; err=chart.get('error')
-        if isinstance(err,dict): return str(err.get('description') or err.get('code') or '')[:300]
-    except Exception:
-        pass
-    try: return str(response.text or '')[:300]
-    except Exception: return ''
-
-def _log_yahoo_live_failure(error_type,http_status=None,message=''):
-    logger.warning('[XAUUSD_FEED] Yahoo Spot failure type=%s http_status=%s message=%s',error_type,http_status,str(message or '')[:300])
-
-def _build_yahoo_live_feed(payload,*,fetched_at=None):
-    now=fetched_at or datetime.now(timezone.utc)
-    if not isinstance(payload,dict): return _build_missing_yahoo_feed('malformed_payload','Yahoo returned a non-object payload.')
-    result=((payload.get('chart') or {}).get('result') or [])
-    if not result or not isinstance(result[0],dict): return _build_missing_yahoo_feed('missing_result','Yahoo response does not contain chart.result.')
-    meta=result[0].get('meta') or {}
-    price=_finite_positive(meta.get('regularMarketPrice'))
-    if price is None or price <= 1000: return _build_missing_yahoo_feed('missing_price','Yahoo XAUUSD=X regularMarketPrice is missing or invalid.')
-    try: source_ts=datetime.fromtimestamp(float(meta.get('regularMarketTime')),tz=timezone.utc)
-    except (TypeError,ValueError,OverflowError): source_ts=None
-    if source_ts is None: return _build_missing_yahoo_feed('missing_timestamp','Yahoo XAUUSD=X regularMarketTime is missing or invalid.')
-    age=max(0.0,(now-source_ts).total_seconds())
-    bid=_finite_positive(meta.get('bid')); ask=_finite_positive(meta.get('ask'))
-    spread_available=bid is not None and ask is not None
-    if not spread_available: bid=price; ask=price
-    mid=(bid+ask)/2.0
-    return {'symbol':'XAUUSD','provider':'Yahoo Finance','status':'STALE' if age>PRICE_FEED_STALE_SECONDS else 'ACTIVE','bid':round(bid,6),'ask':round(ask,6),'mid':round(mid,6),'spot':round(price,6),'source_timestamp':source_ts.isoformat(),'timestamp':source_ts.isoformat(),'fetched_timestamp':now.isoformat(),'source_fetched_timestamp':None,'age_seconds':round(age,3),'error_type':None,'error_message':None,'spread_available':spread_available}
+def _build_yahoo_live_feed(payload, *, fetched_at=None):
+    now = fetched_at or datetime.now(timezone.utc)
+    if not isinstance(payload, dict): return _build_missing_yahoo_feed('malformed_payload', 'Yahoo returned a non-object payload.')
+    result = ((payload.get('chart') or {}).get('result') or [])
+    if not result or not isinstance(result[0], dict): return _build_missing_yahoo_feed('missing_result', 'Yahoo response does not contain chart.result.')
+    meta = result[0].get('meta') or {}
+    price = _finite_positive(meta.get('regularMarketPrice'))
+    if price is None or price <= 1000: return _build_missing_yahoo_feed('missing_price', 'Yahoo XAUUSD=X regularMarketPrice is missing or invalid.')
+    try: source_ts = datetime.fromtimestamp(float(meta.get('regularMarketTime')), tz=timezone.utc)
+    except (TypeError, ValueError, OverflowError): source_ts = None
+    if source_ts is None: return _build_missing_yahoo_feed('missing_timestamp', 'Yahoo XAUUSD=X regularMarketTime is missing or invalid.')
+    age = max(0.0, (now - source_ts).total_seconds())
+    bid = _finite_positive(meta.get('bid'))
+    ask = _finite_positive(meta.get('ask'))
+    spread_available = bid is not None and ask is not None
+    if not spread_available: bid = price; ask = price
+    mid = (bid + ask) / 2.0
+    return {
+        'symbol': 'XAUUSD',
+        'provider': 'Yahoo Finance',
+        'status': 'STALE' if age > PRICE_FEED_STALE_SECONDS else 'ACTIVE',
+        'bid': round(bid, 6),
+        'ask': round(ask, 6),
+        'mid': round(mid, 6),
+        'spot': round(price, 6),
+        'source_timestamp': source_ts.isoformat(),
+        'timestamp': source_ts.isoformat(),
+        'fetched_timestamp': now.isoformat(),
+        'source_fetched_timestamp': None,
+        'age_seconds': round(age, 3),
+        'error_type': None,
+        'error_message': None,
+        'spread_available': spread_available
+    }
 
 def _refresh_cached_feed_status(feed):
     if not feed:
-        return _build_missing_yahoo_feed('no_cached_feed','Yahoo XAUUSD Spot cache is empty and no fresh live quote is available.')
-    refreshed=dict(feed)
-    if refreshed.get('status')=='MISSING':
-        refreshed['error_type']=refreshed.get('error_type') or 'missing'
-        refreshed['error_message']=refreshed.get('error_message') or 'Yahoo XAUUSD Spot quote is unavailable.'
+        return _build_missing_yahoo_feed('no_cached_feed', 'Yahoo XAUUSD Spot cache is empty.')
+    refreshed = dict(feed)
+    if refreshed.get('status') == 'MISSING':
         return refreshed
-    source_ts=_parse_price_feed_timestamp(refreshed.get('source_timestamp'))
+    source_ts = _parse_price_feed_timestamp(refreshed.get('source_timestamp'))
     if source_ts is None or refreshed.get('mid') is None:
-        refreshed['status']='MISSING'; refreshed['age_seconds']=None
-        refreshed['error_type']=refreshed.get('error_type') or 'missing_timestamp'
-        refreshed['error_message']=refreshed.get('error_message') or 'Yahoo XAUUSD Spot timestamp/price is missing.'
+        refreshed['status'] = 'MISSING'
         return refreshed
-    age=max(0.0,(datetime.now(timezone.utc)-source_ts).total_seconds())
-    refreshed['age_seconds']=round(age,3)
-    refreshed['status']='STALE' if refreshed.get('status')=='STALE' or age>PRICE_FEED_STALE_SECONDS else 'ACTIVE'
+    age = max(0.0, (datetime.now(timezone.utc) - source_ts).total_seconds())
+    refreshed['age_seconds'] = round(age, 3)
+    refreshed['status'] = 'STALE' if age > PRICE_FEED_STALE_SECONDS else 'ACTIVE'
     return refreshed
 
 def _set_yahoo_historical_cooldown(error_type, error_message):
     with YAHOO_HISTORICAL_STATE_LOCK:
-        YAHOO_HISTORICAL_FEED_STATE['blocked_until']=time.monotonic()+max(1,YAHOO_HISTORICAL_COOLDOWN_SECONDS)
-        YAHOO_HISTORICAL_FEED_STATE['error_type']=str(error_type)
-        YAHOO_HISTORICAL_FEED_STATE['error_message']=str(error_message or '')[:300]
-    logger.warning('[MARKET_DATA] Yahoo historical cooldown type=%s seconds=%s message=%s',error_type,YAHOO_HISTORICAL_COOLDOWN_SECONDS,str(error_message or '')[:300])
+        YAHOO_HISTORICAL_FEED_STATE['blocked_until'] = time.monotonic() + max(1, YAHOO_HISTORICAL_COOLDOWN_SECONDS)
+        YAHOO_HISTORICAL_FEED_STATE['error_type'] = str(error_type)
+        YAHOO_HISTORICAL_FEED_STATE['error_message'] = str(error_message or '')[:300]
+    logger.warning('[MARKET_DATA] Yahoo historical cooldown type=%s seconds=%s message=%s', error_type, YAHOO_HISTORICAL_COOLDOWN_SECONDS, str(error_message or '')[:300])
 
 def _yahoo_historical_cooldown_active():
     with YAHOO_HISTORICAL_STATE_LOCK:
-        return time.monotonic()<float(YAHOO_HISTORICAL_FEED_STATE.get('blocked_until',0.0) or 0.0)
+        return time.monotonic() < float(YAHOO_HISTORICAL_FEED_STATE.get('blocked_until', 0.0) or 0.0)
 
 def _set_yahoo_live_cooldown(error_type, error_message):
     with YAHOO_LIVE_STATE_LOCK:
-        YAHOO_LIVE_FEED_STATE['blocked_until']=time.monotonic()+max(1,YAHOO_LIVE_COOLDOWN_SECONDS)
-        YAHOO_LIVE_FEED_STATE['error_type']=str(error_type)
-        YAHOO_LIVE_FEED_STATE['error_message']=str(error_message or '')[:300]
-    logger.warning('[XAUUSD_FEED] Yahoo Spot cooldown type=%s seconds=%s message=%s',error_type,YAHOO_LIVE_COOLDOWN_SECONDS,str(error_message or '')[:300])
+        YAHOO_LIVE_FEED_STATE['blocked_until'] = time.monotonic() + max(1, YAHOO_LIVE_COOLDOWN_SECONDS)
+        YAHOO_LIVE_FEED_STATE['error_type'] = str(error_type)
+        YAHOO_LIVE_FEED_STATE['error_message'] = str(error_message or '')[:300]
+    logger.warning('[XAUUSD_FEED] Yahoo Spot cooldown type=%s seconds=%s message=%s', error_type, YAHOO_LIVE_COOLDOWN_SECONDS, str(error_message or '')[:300])
 
 def _yahoo_live_cooldown_active():
     with YAHOO_LIVE_STATE_LOCK:
-        return time.monotonic()<float(YAHOO_LIVE_FEED_STATE.get('blocked_until',0.0) or 0.0)
+        return time.monotonic() < float(YAHOO_LIVE_FEED_STATE.get('blocked_until', 0.0) or 0.0)
 
 def http_get_yahoo(url, timeout=8):
-    """Yahoo JSON fetch with clean Chrome impersonation and structured diagnostics."""
-    for host in ('query1.finance.yahoo.com','query2.finance.yahoo.com'):
-        target=url.replace('query1.finance.yahoo.com',host).replace('query2.finance.yahoo.com',host)
+    """جلب مباشر من Yahoo Finance مع محاكاة متصفح Chrome النظيفة لتجاوز حظر السيرفرات"""
+    for host in ('query1.finance.yahoo.com', 'query2.finance.yahoo.com'):
+        target = url.replace('query1.finance.yahoo.com', host).replace('query2.finance.yahoo.com', host)
         if HAS_CURL_CFFI:
             try:
-                r=curl_requests.get(target, impersonate='chrome124', timeout=timeout, verify=True)
-                status=int(getattr(r,'status_code',0) or 0)
-                if status==200:
-                    try:
-                        data=r.json()
-                        if isinstance(data,dict) and (data.get('chart') or {}).get('result'):
-                            return data
-                        logger.warning('[YAHOO_HTTP] host=%s transport=curl_cffi status=200 error=missing_chart_result',host)
-                    except Exception as exc:
-                        logger.warning('[YAHOO_HTTP] host=%s transport=curl_cffi status=200 error=invalid_json message=%s',host,str(exc)[:200])
-                else:
-                    logger.warning('[YAHOO_HTTP] host=%s transport=curl_cffi status=%s message=%s',host,status,str(getattr(r,'text','') or '')[:200])
-            except Exception as exc:
-                logger.warning('[YAHOO_HTTP] host=%s transport=curl_cffi error_type=%s message=%s',host,type(exc).__name__,str(exc)[:250])
-        try:
-            r=requests.get(target,headers={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36','Accept':'application/json'},timeout=timeout)
-            status=int(getattr(r,'status_code',0) or 0)
-            if status==200:
-                try:
-                    data=r.json()
-                    if isinstance(data,dict) and (data.get('chart') or {}).get('result'):
+                r = curl_requests.get(target, impersonate='chrome124', timeout=timeout, verify=True)
+                if r.status_code == 200:
+                    data = r.json()
+                    if isinstance(data, dict) and (data.get('chart') or {}).get('result'):
                         return data
-                    logger.warning('[YAHOO_HTTP] host=%s transport=requests status=200 error=missing_chart_result',host)
-                except Exception as exc:
-                    logger.warning('[YAHOO_HTTP] host=%s transport=requests status=200 error=invalid_json message=%s',host,str(exc)[:200])
-            else:
-                logger.warning('[YAHOO_HTTP] host=%s transport=requests status=%s message=%s',host,status,str(getattr(r,'text','') or '')[:200])
+            except Exception as exc:
+                logger.debug('[YAHOO_HTTP] curl_cffi error host=%s: %s', host, exc)
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36',
+                'Accept': 'application/json'
+            }
+            r = requests.get(target, headers=headers, timeout=timeout)
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, dict) and (data.get('chart') or {}).get('result'):
+                    return data
         except Exception as exc:
-            logger.warning('[YAHOO_HTTP] host=%s transport=requests error_type=%s message=%s',host,type(exc).__name__,str(exc)[:250])
+            logger.debug('[YAHOO_HTTP] requests error host=%s: %s', host, exc)
     return None
 
 def fetch_yahoo_direct(symbol, range_str='10d', interval_str='15m'):
-    """Fetch historical OHLC. XAU/USD uses Twelve Data; DXY/US10Y remain on Yahoo."""
-    if symbol == 'XAUUSD=X':
-        if not TWELVE_DATA_API_KEY:
-            logger.warning('[XAUUSD_FEED] Twelve Data API key is missing; historical %s is unavailable.', interval_str)
-            return pd.DataFrame()
-        td_interval = '15min' if interval_str == '15m' else ('1h' if interval_str == '1h' else interval_str)
-        params = {
-            'symbol': 'XAU/USD',
-            'interval': td_interval,
-            'outputsize': 500,
-            'apikey': TWELVE_DATA_API_KEY,
-            'order': 'asc',
-        }
-        try:
-            r = requests.get('https://api.twelvedata.com/time_series', params=params, timeout=8)
-            status = int(getattr(r, 'status_code', 0) or 0)
-            data = r.json() if status == 200 else None
-            if status != 200:
-                logger.warning('[XAUUSD_FEED] Twelve Data historical status=%s interval=%s message=%s', status, interval_str, str(getattr(r, 'text', '') or '')[:250])
-                return pd.DataFrame()
-            if not isinstance(data, dict) or data.get('status') != 'ok':
-                logger.warning('[XAUUSD_FEED] Twelve Data historical invalid_response interval=%s message=%s', interval_str, str(data.get('message', '') if isinstance(data, dict) else '')[:250])
-                return pd.DataFrame()
-            values = data.get('values') or []
-            if not values:
-                return pd.DataFrame()
-            rows = []
-            for item in values:
-                try:
-                    rows.append({
-                        'datetime': pd.to_datetime(item.get('datetime'), utc=True),
-                        'Open': float(item['open']),
-                        'High': float(item['high']),
-                        'Low': float(item['low']),
-                        'Close': float(item['close']),
-                        'Volume': float(item.get('volume') or 0),
-                    })
-                except (TypeError, ValueError, KeyError):
-                    continue
-            if not rows:
-                return pd.DataFrame()
-            df = pd.DataFrame(rows).set_index('datetime').sort_index()
-            return df
-        except Exception as exc:
-            logger.warning('[XAUUSD_FEED] Twelve Data historical error_type=%s interval=%s message=%s', type(exc).__name__, interval_str, str(exc)[:250])
-            return pd.DataFrame()
-
+    """جلب الشموع التاريخية من Yahoo Finance لجميع الرموز (XAUUSD=X, DX-Y.NYB, ^TNX)"""
     if _yahoo_historical_cooldown_active():
         return pd.DataFrame()
     url = f'https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval={interval_str}&range={range_str}'
@@ -1826,7 +1678,7 @@ def fetch_yahoo_direct(symbol, range_str='10d', interval_str='15m'):
             'Low': q.get('low', []),
             'Close': q.get('close', []),
             'Volume': q.get('volume', [0] * len(timestamps)),
-        }, index=pd.to_datetime(timestamps, unit='s', utc=True)).dropna(subset=['Open','High','Low','Close'])
+        }, index=pd.to_datetime(timestamps, unit='s', utc=True)).dropna(subset=['Open', 'High', 'Low', 'Close'])
         if df.empty:
             _set_yahoo_historical_cooldown('empty_ohlc', f'Yahoo {symbol} returned an empty OHLC frame.')
             return pd.DataFrame()
@@ -1837,74 +1689,44 @@ def fetch_yahoo_direct(symbol, range_str='10d', interval_str='15m'):
         return df
     except Exception as exc:
         msg = f'{type(exc).__name__}: {exc}'[:300]
-        kind = 'rate_limited' if any(x in msg.lower() for x in ('429','too many requests','rate limit','yfratelimiterror')) else ('timeout' if 'timeout' in msg.lower() else 'network_or_response')
+        kind = 'rate_limited' if any(x in msg.lower() for x in ('429', 'too many requests', 'rate limit')) else 'network_or_response'
         _set_yahoo_historical_cooldown(kind, msg)
         return pd.DataFrame()
 
 def fetch_canonical_xauusd_feed():
-    """Canonical live XAU/USD Spot from Twelve Data only; never use historical Close as live."""
+    """جلب السعر الفوري اللحظي XAUUSD Spot من Yahoo Finance XAUUSD=X حصراً"""
     now_m = time.monotonic()
     with PRICE_FEED_LOCK:
         cached = CANONICAL_XAUUSD_FEED_CACHE.get('feed')
         last = float(CANONICAL_XAUUSD_FEED_CACHE.get('last_request_monotonic', 0.0) or 0.0)
-        if now_m - last < max(1, TWELVE_DATA_LIVE_INTERVAL_SECONDS):
+        if now_m - last < PRICE_FEED_MIN_REQUEST_INTERVAL and cached:
             return _refresh_cached_feed_status(cached)
         CANONICAL_XAUUSD_FEED_CACHE['last_request_monotonic'] = now_m
 
-    if not TWELVE_DATA_API_KEY:
-        feed = _build_missing_yahoo_feed('missing_api_key', 'TWELVE_DATA_API_KEY is not configured.')
-        feed['provider'] = 'Twelve Data'
-        feed['symbol'] = 'XAU/USD'
-        feed['error_message'] = 'TWELVE_DATA_API_KEY is not configured.'
-        CANONICAL_XAUUSD_FEED_CACHE['feed'] = feed
-        logger.warning('[XAUUSD_FEED] Twelve Data missing API key')
-        return feed
+    if _yahoo_live_cooldown_active():
+        return _refresh_cached_feed_status(CANONICAL_XAUUSD_FEED_CACHE.get('feed'))
 
+    url = "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval=1m&range=1d"
     try:
-        r = requests.get(
-            'https://api.twelvedata.com/quote',
-            params={'symbol': 'XAU/USD', 'apikey': TWELVE_DATA_API_KEY},
-            timeout=8,
-        )
-        status = int(getattr(r, 'status_code', 0) or 0)
-        data = r.json() if status == 200 else {}
-        if status != 200:
-            msg = str(getattr(r, 'text', '') or '')[:300]
-            logger.warning('[XAUUSD_FEED] Twelve Data Live status=%s message=%s', status, msg)
-            return _build_missing_yahoo_feed(f'http_{status}', msg)
-        if not isinstance(data, dict) or data.get('status') == 'error':
-            msg = str(data.get('message', 'invalid_response'))[:300] if isinstance(data, dict) else 'invalid_response'
-            logger.warning('[XAUUSD_FEED] Twelve Data Live error=%s', msg)
-            return _build_missing_yahoo_feed('provider_error', msg)
-        price = _finite_positive(data.get('close') or data.get('price'))
-        if price is None or price <= 1000:
-            return _build_missing_yahoo_feed('missing_price', 'Twelve Data XAU/USD quote did not contain a valid price.')
-        ts_raw = data.get('timestamp') or data.get('last_quote_at')
-        source_ts = _parse_price_feed_timestamp(ts_raw) if ts_raw is not None else datetime.now(timezone.utc)
-        age = max(0.0, (datetime.now(timezone.utc) - source_ts).total_seconds()) if source_ts else None
-        feed = {
-            'symbol': 'XAU/USD',
-            'provider': 'Twelve Data',
-            'status': 'STALE' if age is not None and age > PRICE_FEED_STALE_SECONDS else 'ACTIVE',
-            'bid': round(price, 6),
-            'ask': round(price, 6),
-            'mid': round(price, 6),
-            'spot': round(price, 6),
-            'source_timestamp': source_ts.isoformat() if source_ts else None,
-            'timestamp': source_ts.isoformat() if source_ts else None,
-            'fetched_timestamp': datetime.now(timezone.utc).isoformat(),
-            'source_fetched_timestamp': source_ts.isoformat() if source_ts else None,
-            'age_seconds': round(age, 3) if age is not None else None,
-            'error_type': None,
-            'error_message': None,
-            'spread_available': False,
-        }
-        CANONICAL_XAUUSD_FEED_CACHE['feed'] = feed
-        return feed
+        payload = http_get_yahoo(url, timeout=6)
+        if not payload:
+            _set_yahoo_live_cooldown('network_error', 'Yahoo XAUUSD=X live quote request failed.')
+            return _refresh_cached_feed_status(CANONICAL_XAUUSD_FEED_CACHE.get('feed'))
+        feed = _build_yahoo_live_feed(payload)
+        if feed.get('status') in {'ACTIVE', 'STALE'}:
+            with YAHOO_LIVE_STATE_LOCK:
+                YAHOO_LIVE_FEED_STATE['blocked_until'] = 0.0
+                YAHOO_LIVE_FEED_STATE['error_type'] = None
+                YAHOO_LIVE_FEED_STATE['error_message'] = None
+            CANONICAL_XAUUSD_FEED_CACHE['feed'] = feed
+            return feed
+        else:
+            _set_yahoo_live_cooldown(feed.get('error_type', 'invalid_quote'), feed.get('error_message', 'Invalid price'))
+            return _refresh_cached_feed_status(CANONICAL_XAUUSD_FEED_CACHE.get('feed'))
     except Exception as exc:
         msg = f'{type(exc).__name__}: {exc}'[:300]
-        logger.warning('[XAUUSD_FEED] Twelve Data Live error_type=%s message=%s', type(exc).__name__, msg)
-        return _build_missing_yahoo_feed(type(exc).__name__, msg)
+        _set_yahoo_live_cooldown('exception', msg)
+        return _refresh_cached_feed_status(CANONICAL_XAUUSD_FEED_CACHE.get('feed'))
 
 def get_xauusd_execution_price(feed, direction, role):
     direction = str(direction).upper()
@@ -1917,15 +1739,18 @@ def get_xauusd_execution_price(feed, direction, role):
         return feed.get('bid') if direction == 'BUY' else feed.get('ask')
     return feed.get('mid') or feed.get('spot')
 
-
 def fetch_live_spot_gold():
-    """Return live Spot XAU/USD from Yahoo XAUUSD=X only; never use historical Close as live."""
+    """إرجاع سعر الذهب الفوري اللحظي XAU/USD من Yahoo XAUUSD=X فقط"""
     feed = fetch_canonical_xauusd_feed()
-    return float(feed['mid']) if feed.get('status') == 'ACTIVE' and feed.get('mid') else 0.0
+    if feed and feed.get('status') == 'ACTIVE' and feed.get('mid'):
+        return float(feed['mid'])
+    if feed and feed.get('spot') and float(feed['spot']) > 1000:
+        return float(feed['spot'])
+    return 0.0
 
 def get_market_data():
     feed = fetch_canonical_xauusd_feed()
-    spot = feed.get('mid') if feed.get('status') == 'ACTIVE' else 0.0
+    spot = feed.get('mid') or feed.get('spot') or 0.0
     with cache_lock:
         snapshot = dict(GLOBAL_CACHE.get('market_data') or {})
     return {
@@ -1936,10 +1761,10 @@ def get_market_data():
     }
 
 def fetch_and_update_cache():
-    """Refresh live Spot and supporting Yahoo snapshots without hardcoded market prices."""
+    """تحديث الكاش بالخلفية لأسعار الذهب الفورية ومؤشر الدولار وعوائد السندات"""
     try:
         feed = fetch_canonical_xauusd_feed()
-        gold = feed.get('mid') if feed.get('status') == 'ACTIVE' else 0.0
+        gold = feed.get('mid') or feed.get('spot') or 0.0
 
         dxy = None
         data_dxy = http_get_yahoo('https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB?interval=1m&range=1d', timeout=4)
@@ -1975,7 +1800,6 @@ def fetch_and_update_cache():
         logger.warning('[MARKET_DATA] cache refresh failure type=%s message=%s', type(exc).__name__, str(exc)[:300])
 
 def get_chart_data_cached():
-    """Historical cache freshness is updated only after at least one gold timeframe succeeds."""
     now = datetime.now(timezone.utc)
     with cache_lock:
         last = MARKET_DATA_CACHE['last_fetch']
@@ -2002,7 +1826,6 @@ def get_chart_data_cached():
             logger.warning('[MARKET_DATA] historical fetch failure type=%s message=%s', type(exc).__name__, str(exc)[:300])
     with cache_lock:
         return MARKET_DATA_CACHE.copy()
-
 
 def get_verified_closed_m15(df):
     if df is None or df.empty:
@@ -2128,7 +1951,7 @@ def generate_quant_signal():
         h4_trend, state = data["h4_trend"], data["state_label"]
         df, dxy_corr, smc, current_price = data["df_m15"], data["dxy_corr"], data["smc"], data["last_price"]
         price_feed = data.get("price_feed") or {}
-        close, high, low = map(lambda c: to_1d_series(df[c]), ['Close','High','Low'])
+        close, high, low = map(lambda c: to_1d_series(df[c]), ['Close', 'High', 'Low'])
         rsi = float(ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1])
         atr = float(ta.volatility.AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1])
         ema_fast = float(ta.trend.EMAIndicator(close, window=9).ema_indicator().iloc[-1])
@@ -2136,21 +1959,21 @@ def generate_quant_signal():
         macd_diff = float(ta.trend.MACD(close).macd_diff().iloc[-1])
         stoch_k = float(ta.momentum.StochasticOscillator(high, low, close).stoch().iloc[-1])
         if not np.isfinite(atr) or atr <= 0 or current_price <= 0:
-            return {"status":"WAIT","reason":"بيانات ATR/السعر غير صالحة حالياً.","price":current_price}
+            return {"status": "WAIT", "reason": "بيانات ATR/السعر غير صالحة حالياً.", "price": current_price}
 
-        volatility_ratio = round((atr/current_price)*100,4)
+        volatility_ratio = round((atr / current_price) * 100, 4)
         if volatility_ratio < 0.012:
-            return {"status":"WAIT","reason":"التذبذب الحالي منخفض جداً ولا يكفي لإدارة صفقة بكفاءة.","price":current_price}
+            return {"status": "WAIT", "reason": "التذبذب الحالي منخفض جداً ولا يكفي لإدارة صفقة بكفاءة.", "price": current_price}
 
         clf = train_self_learning_model()
         confidence = 0.60
         if clf:
             try:
-                feat = pd.DataFrame([[rsi,dxy_corr,macd_diff,stoch_k,volatility_ratio]], columns=['rsi','dxy_corr','macd_diff','stoch_k','volatility_ratio'])
+                feat = pd.DataFrame([[rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio]], columns=['rsi', 'dxy_corr', 'macd_diff', 'stoch_k', 'volatility_ratio'])
                 probs = clf.predict_proba(feat)[0]
                 classes = list(clf.classes_)
                 if 1 in classes:
-                    confidence = round(float(probs[classes.index(1)]),2)
+                    confidence = round(float(probs[classes.index(1)]), 2)
             except Exception:
                 confidence = 0.60
 
@@ -2178,46 +2001,46 @@ def generate_quant_signal():
         elif bear_score >= 4.0 and bear_score - bull_score >= 0.75:
             signal_type = 'SELL'
         else:
-            return {"status":"WAIT","reason":f"لم يكتمل ترجيح كافٍ بعد. صاعد={bull_score:.1f} | هابط={bear_score:.1f} | ثقة التعلم={int(confidence*100)}%.","price":current_price}
+            return {"status": "WAIT", "reason": f"لم يكتمل ترجيح كافٍ بعد. صاعد={bull_score:.1f} | هابط={bear_score:.1f} | ثقة التعلم={int(confidence*100)}%.", "price": current_price}
 
         if has_active_open_trade(signal_type):
-            return {"status":"WAIT","reason":f"توجد صفقة {('شراء' if signal_type=='BUY' else 'بيع')} مفتوحة بالفعل؛ لن نكررها قبل حسم الصفقة الحالية.","price":current_price}
+            return {"status": "WAIT", "reason": f"توجد صفقة {('شراء' if signal_type=='BUY' else 'بيع')} مفتوحة بالفعل؛ لن نكررها قبل حسم الصفقة الحالية.", "price": current_price}
 
         entry_price = get_xauusd_execution_price(price_feed, signal_type, 'ENTRY')
         if entry_price is None:
-            return {"status":"WAIT", "reason":f"سعر XAUUSD التنفيذي غير متاح: {price_feed.get('status', 'MISSING')}", "price":current_price}
+            return {"status": "WAIT", "reason": f"سعر XAUUSD التنفيذي غير متاح: {price_feed.get('status', 'MISSING')}", "price": current_price}
 
         if signal_type == 'BUY':
-            sl = round(entry_price - atr*1.25,2); tp1 = round(entry_price + atr*1.6,2); tp2 = round(entry_price + atr*2.8,2)
+            sl = round(entry_price - atr * 1.25, 2); tp1 = round(entry_price + atr * 1.6, 2); tp2 = round(entry_price + atr * 2.8, 2)
             smc_note = 'تأكيد صاعد من السيولة/FVG' if reasons_bull else 'تأكيد من الزخم والاتجاه'
         else:
-            sl = round(entry_price + atr*1.25,2); tp1 = round(entry_price - atr*1.6,2); tp2 = round(entry_price - atr*2.8,2)
+            sl = round(entry_price + atr * 1.25, 2); tp1 = round(entry_price - atr * 1.6, 2); tp2 = round(entry_price - atr * 2.8, 2)
             smc_note = 'تأكيد هابط من السيولة/FVG' if reasons_bear else 'تأكيد من الزخم والاتجاه'
 
         is_valid, validation_reason = validate_trade_levels(signal_type, entry_price, sl, tp1, tp2)
         if not is_valid:
-            return {'status':'WAIT','reason':f'مستويات Entry/SL/TP غير صالحة: {validation_reason}','price':current_price}
+            return {'status': 'WAIT', 'reason': f'مستويات Entry/SL/TP غير صالحة: {validation_reason}', 'price': current_price}
 
         candle_timestamp = pd.Timestamp(df.index[-1]).isoformat()
         candle_id = f"XAUUSD_M15_{pd.Timestamp(df.index[-1]).strftime('%Y%m%d_%H%M')}"
         candidate_signal = {
-            'status':'SIGNAL','type':'🟢 شراء مرن' if signal_type=='BUY' else '🔴 بيع مرن',
-            'entry':round(entry_price,2),'sl':sl,'tp1':tp1,'tp2':tp2,'rr':'1:2.2',
-            'rsi':round(rsi,1),'dxy_corr':round(dxy_corr,2),'confidence':int(confidence*100),
-            'risk':'1% مبدئياً (تُراجع حسب الثقة والتذبذب)','smc_note':smc_note,
-            'candle_id':candle_id,'signal_candle_close':round(float(close.iloc[-1]),2),
-            'signal_candle_time':candle_timestamp,'score_bull':round(bull_score,2),'score_bear':round(bear_score,2)
+            'status': 'SIGNAL', 'type': '🟢 شراء مرن' if signal_type == 'BUY' else '🔴 بيع مرن',
+            'entry': round(entry_price, 2), 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'rr': '1:2.2',
+            'rsi': round(rsi, 1), 'dxy_corr': round(dxy_corr, 2), 'confidence': int(confidence * 100),
+            'risk': '1% مبدئياً (تُراجع حسب الثقة والتذبذب)', 'smc_note': smc_note,
+            'candle_id': candle_id, 'signal_candle_close': round(float(close.iloc[-1]), 2),
+            'signal_candle_time': candle_timestamp, 'score_bull': round(bull_score, 2), 'score_bear': round(bear_score, 2)
         }
 
-        gemini_eval = gemini_verify_signal(candidate_signal, {'h4_trend':h4_trend,'state_label':state})
-        candidate_signal['gemini_note'] = gemini_eval.get('reason','تمت المراجعة بواسطة Gemini')
+        gemini_eval = gemini_verify_signal(candidate_signal, {'h4_trend': h4_trend, 'state_label': state})
+        candidate_signal['gemini_note'] = gemini_eval.get('reason', 'تمت المراجعة بواسطة Gemini')
         candidate_signal['ai_score'] = 1.0 if gemini_eval.get('approved', True) else 0.0
-        if not gemini_eval.get('approved', True) and confidence < 0.55 and max(bull_score,bear_score) < 5.0:
-            return {'status':'WAIT','reason':f"مراجعة Gemini أوصت بالانتظار: {gemini_eval.get('reason','مخاطرة مرتفعة')}", 'price':current_price}
+        if not gemini_eval.get('approved', True) and confidence < 0.55 and max(bull_score, bear_score) < 5.0:
+            return {'status': 'WAIT', 'reason': f"مراجعة Gemini أوصت بالانتظار: {gemini_eval.get('reason','مخاطرة مرتفعة')}", 'price': current_price}
 
-        inserted, trade_id = log_trade(signal_type, entry_price, sl, tp1, tp2, round(rsi,1), dxy_corr, round(macd_diff,3), round(stoch_k,1), volatility_ratio, confidence, candle_id=candle_id, signal_score=max(bull_score,bear_score), ai_score=candidate_signal.get('ai_score'))
+        inserted, trade_id = log_trade(signal_type, entry_price, sl, tp1, tp2, round(rsi, 1), dxy_corr, round(macd_diff, 3), round(stoch_k, 1), volatility_ratio, confidence, candle_id=candle_id, signal_score=max(bull_score, bear_score), ai_score=candidate_signal.get('ai_score'))
         if not inserted:
-            return {'status':'WAIT','reason':'تمت معالجة هذه الشمعة مسبقاً؛ تم منع الإشعار المكرر.', 'price':current_price, 'candle_id':candle_id}
+            return {'status': 'WAIT', 'reason': 'تمت معالجة هذه الشمعة مسبقاً؛ تم منع الإشعار المكرر.', 'price': current_price, 'candle_id': candle_id}
         candidate_signal['trade_id'] = trade_id
         LAST_SCANNER_CANDLE = candle_id
         return candidate_signal
@@ -2480,16 +2303,15 @@ async def daily_telemetry_worker(app):
     while True:
         try:
             await asyncio.sleep(86400)
-            summary=system_monitor.summary()
-            msg=(f"🩺 **تقرير صحة النظام اليومي**\nالذاكرة: {summary['ram_mb']}MB | المستوى: {summary['tier']}\nمدة التشغيل: {summary['uptime_min']} دقيقة\nأخطاء مسجلة: {summary['errors'] or 'لا يوجد'}")
+            summary = system_monitor.summary()
+            msg = (f"🩺 **تقرير صحة النظام اليومي**\nالذاكرة: {summary['ram_mb']}MB | المستوى: {summary['tier']}\nمدة التشغيل: {summary['uptime_min']} دقيقة\nأخطاء مسجلة: {summary['errors'] or 'لا يوجد'}")
             if ADMIN_CHAT_ID: await safe_send_message(app.bot, chat_id=ADMIN_CHAT_ID, text=msg, parse_mode='Markdown')
         except asyncio.CancelledError: break
-        except Exception as e: system_monitor.record_error('DAILY_TELEMETRY',e)
+        except Exception as e: system_monitor.record_error('DAILY_TELEMETRY', e)
 
 async def post_init(app):
     recover_interrupted_learning_events()
     learning_manager.initialize()
-    # استكشاف الموديلات المتاحة عند بدء التشغيل
     if gemini_client:
         try:
             await asyncio.to_thread(discover_available_models, True)
@@ -2539,7 +2361,7 @@ async def reset_all_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
         release_db_connection(conn)
 
     with cache_lock:
-        GLOBAL_CACHE["market_data"] = {"gold": 0.0, "dxy": 99.85, "us10y": 4.63, "price_feed": {"symbol":"XAUUSD","provider":"Yahoo Finance","status":"MISSING","spot":None,"mid":None,"bid":None,"ask":None,"timestamp":None,"age_seconds":None}}
+        GLOBAL_CACHE["market_data"] = {"gold": 0.0, "dxy": 99.85, "us10y": 4.63, "price_feed": {"symbol": "XAUUSD", "provider": "Yahoo Finance", "status": "MISSING", "spot": None, "mid": None, "bid": None, "ask": None, "timestamp": None, "age_seconds": None}}
         GLOBAL_CACHE["analysis"] = None
         GLOBAL_CACHE["last_updated"] = None
 
@@ -2560,7 +2382,7 @@ async def reset_all_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await safe_reply_text(
         update,
-        "🧹 **تم مسح كافة البيانات السابقة وتفرغ الذاكرة العشوائية بنجاح!**\n"
+        "🧹 **تم مسح كافة البيانات السابقة وتفريغ الذاكرة العشوائية بنجاح!**\n"
         "يمكنك الآن البدء بحساب جديد وقاعدة بيانات نظيفة 100% 🚀",
         reply_markup=get_main_keyboard(),
         parse_mode='Markdown'
@@ -2580,9 +2402,9 @@ async def system_health_check(update: Update, context: ContextTypes.DEFAULT_TYPE
     report_lines = []
     issues_found = []
 
-    resource_summary=system_monitor.summary()
+    resource_summary = system_monitor.summary()
     report_lines.append(f"🛡️ **حارس الموارد:** RAM={resource_summary['ram_mb']}MB | المستوى={resource_summary['tier']}")
-    if resource_summary['tier'] in {'DEFERRED','EMERGENCY'}:
+    if resource_summary['tier'] in {'DEFERRED', 'EMERGENCY'}:
         report_lines.append("  ⚠️ تم تأجيل مهام التعلم الثقيلة لحماية مسار التداول.")
 
     report_lines.append("⚙️ **1. فحص متغيرات البيئة والإعدادات:**")
@@ -2687,7 +2509,7 @@ async def system_health_check(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         is_high, news_info, is_fail = await asyncio.to_thread(fetch_live_economic_news_alert)
         if not is_fail:
-            report_lines.append(f"  ✅ الاتصال بمصادر الأخبار ومطابقة البيانات: ناجح وموثق.")
+            report_lines.append("  ✅ الاتصال بمصادر الأخبار ومطابقة البيانات: ناجح وموثق.")
         else:
             report_lines.append(f"  ⚠️ تعذر الاتصال بمصادر الأخبار: {news_info}")
             issues_found.append("سيرفرات الأخبار الخارجية حظرت الاتصال أو متوقفة.")
@@ -2797,9 +2619,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     add_subscriber(chat_id)
     await safe_reply_text(
         update,
-        f"أهلاً بك مجدداً! 🚀\n"
-        f"حسابك موثق ومفعل في **البوت الكمي الهجين المدعوم بالذكاء الاصطناعي**.\n\n"
-        f"💡 اضغط على الأزرار أدناه لتنفيذ ما تريد:",
+        "أهلاً بك مجدداً! 🚀\n"
+        "حسابك موثق ومفعل في **البوت الكمي الهجين المدعوم بالذكاء الاصطناعي**.\n\n"
+        "💡 اضغط على الأزرار أدناه لتنفيذ ما تريد:",
         reply_markup=get_main_keyboard(),
         parse_mode='Markdown'
     )
@@ -2817,6 +2639,8 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     age = f"{float(feed['age_seconds']):.1f} sec" if feed.get('age_seconds') is not None else "N/A"
     reason = feed.get('error_message') or feed.get('error_type') if feed.get('status') == 'MISSING' else None
     timestamp = feed.get('timestamp') or feed.get('source_timestamp') or 'N/A'
+    
+    us10y_str = f"{data['us10y']:.2f}%" if data.get('us10y') is not None else "N/A"
     msg = (
         "📊 **XAUUSD Live Price Feed**\n"
         f"Provider: {feed.get('provider', 'Yahoo Finance')}\n"
@@ -2828,10 +2652,9 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Age: {age}\n"
         f"Reason: {reason or 'N/A'}\n"
         f"💵 مؤشر الدولار: {data['dxy'] if data.get('dxy') is not None else 'N/A'}\n"
-        f"📈 عوائد السندات: {f"{data['us10y']:.2f}%" if data.get('us10y') is not None else 'N/A'}"
+        f"📈 عوائد السندات: {us10y_str}"
     )
     await safe_reply_text(update, msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
-
 
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -2888,7 +2711,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
-        
         is_pg = is_postgres() and isinstance(conn, psycopg2.extensions.connection)
         
         cursor.execute("SELECT COUNT(*), SUM(CASE WHEN outcome = 1 THEN 1 ELSE 0 END) FROM trades WHERE outcome IS NOT NULL")
@@ -2928,11 +2750,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sell_rate = round((sell_wins / sell_total * 100), 1) if sell_total > 0 else 0
 
         db_type_str = "Supabase PostgreSQL (سحابية دائمية مع Connection Pool)" if is_pg else "SQLite (محلية / احتياطية)"
-        cursor.execute("SELECT COUNT(*) FROM learning_events WHERE status IN ('PENDING','DEFERRED')")
-        learning_pending=cursor.fetchone()[0] or 0
-        cursor.execute("SELECT COUNT(*) FROM learning_events WHERE status='FAILED'")
-        learning_failed=cursor.fetchone()[0] or 0
-        resource_summary=system_monitor.summary()
+        resource_summary = system_monitor.summary()
         
         msg = (
             f"📊 **تقرير أداء المحرك الكمي التفصيلي**\n"
