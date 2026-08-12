@@ -17,7 +17,7 @@ jobs:
           fetch-depth: 0
 
       - name: Patch and test bot.py
-        run: python3 .github/patch_yahoo_feed.py
+        run: python3 .github/patch_yahoo_feed_v2.py
 
       - name: Verify diff and source policy
         run: |
@@ -38,6 +38,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add bot.py
-          git rm -f .github/patch_yahoo_feed.py
+          git rm -f .github/patch_yahoo_feed.py .github/patch_yahoo_feed_v2.py
           git commit -m "fix: harden Yahoo XAUUSD spot feed"
           git push origin main
