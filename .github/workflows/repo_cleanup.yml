@@ -1,0 +1,122 @@
+name: repository-cleanup
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clean and repair repository
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import shutil
+          import subprocess
+
+          bot = Path('bot.py')
+          text = bot.read_text(encoding='utf-8')
+
+          replacements = {
+              "outcome = 0 if abs(f_open - sl) < abs(open_val - tp) else 1":
+                  "outcome = 0 if abs(f_open - sl) < abs(f_open - tp) else 1",
+              'cursor.execute("SELECT COUNT(*) FROM trades WHERE outcome IS NOT NULL")\n        pending_trades = cursor.fetchone()[0] or 0':
+                  'cursor.execute("SELECT COUNT(*) FROM trades WHERE outcome IS NULL AND trade_status IN (\'OPEN\', \'TP1_HIT\')")\n        pending_trades = cursor.fetchone()[0] or 0',
+              '"provider":"legacy provider"':
+                  '"provider":"Yahoo Finance"',
+              'return False, "الظروف الإخبارية مستقرة", False':
+                  'return False, "مصدر الأخبار اللحظية غير مفعّل في هذه النسخة.", True',
+              '"market_data": {"gold": 0.0, "dxy": 99.85, "us10y": 4.63}':
+                  '"market_data": {"gold": 0.0, "dxy": None, "us10y": None}',
+              """def get_market_data():
+    feed = fetch_canonical_xauusd_feed()
+    spot = feed.get('mid') if feed.get('status') == 'ACTIVE' else 0.0
+    return {
+        'gold': round(float(spot), 2) if spot else 0.0,
+        'dxy': 99.85,
+        'us10y': 4.63,
+        'price_feed': feed,
+    }
+""":
+              """def get_market_data():
+    feed = fetch_canonical_xauusd_feed()
+    spot = feed.get('mid') if feed.get('status') == 'ACTIVE' else 0.0
+    with cache_lock:
+        snapshot = GLOBAL_CACHE.get('market_data') or {}
+    return {
+        'gold': round(float(spot), 2) if spot else 0.0,
+        'dxy': snapshot.get('dxy'),
+        'us10y': snapshot.get('us10y'),
+        'price_feed': feed,
+    }
+""",
+          }
+
+          for old, new in replacements.items():
+              if old not in text:
+                  raise SystemExit(f'missing repair anchor: {old[:100]}')
+              text = text.replace(old, new, 1)
+
+          # Keep the DXY / US10Y snapshot tied to successful Yahoo historical data.
+          old = """                if not df_us10y_m15.empty: MARKET_DATA_CACHE['df_us10y_m15'] = df_us10y_m15
+                if not df_gold_h1.empty or not df_gold_m15.empty:
+                    MARKET_DATA_CACHE['last_fetch'] = now
+"""
+          new = """                if not df_us10y_m15.empty: MARKET_DATA_CACHE['df_us10y_m15'] = df_us10y_m15
+                previous = GLOBAL_CACHE.get('market_data') or {}
+                dxy_value = previous.get('dxy')
+                us10y_value = previous.get('us10y')
+                if not df_dxy_m15.empty:
+                    dxy_value = float(to_1d_series(df_dxy_m15['Close']).iloc[-1])
+                if not df_us10y_m15.empty:
+                    us10y_value = float(to_1d_series(df_us10y_m15['Close']).iloc[-1])
+                GLOBAL_CACHE['market_data']['dxy'] = dxy_value
+                GLOBAL_CACHE['market_data']['us10y'] = us10y_value
+                if not df_gold_h1.empty or not df_gold_m15.empty:
+                    MARKET_DATA_CACHE['last_fetch'] = now
+"""
+          if old not in text:
+              raise SystemExit('historical snapshot anchor not found')
+          text = text.replace(old, new, 1)
+          bot.write_text(text, encoding='utf-8')
+
+          # Delete generated artifacts and the obsolete one-off marker.
+          for p in Path('.').rglob('__pycache__'):
+              if p.is_dir(): shutil.rmtree(p)
+          for p in Path('.').rglob('*.pyc'):
+              if p.is_file(): p.unlink()
+          marker = Path('.github/YAHOO_HARDENING_TRIGGER.txt')
+          if marker.exists(): marker.unlink()
+
+          Path('.gitignore').write_text('''# Python\n__pycache__/\n*.py[cod]\n*.pyo\n.pytest_cache/\n.mypy_cache/\n.ruff_cache/\n\n# Local runtime state\ntrades.db\n*.sqlite\n*.sqlite3\n*.db-wal\n*.db-shm\n*.log\n\n# Secrets / local configuration\n.env\n.env.*\n!.env.example\n''', encoding='utf-8')
+
+          Path('README.md').write_text('''# Gold Quant Bot\n\nبوت تداول كمي للذهب XAUUSD يعمل عبر Telegram، مع تحليل السوق، إدارة دورة حياة الصفقة، تعلم آلي، ومراجعة Gemini عند تفعيلها.\n\n## بنية المشروع\n\n- `bot.py` — التطبيق الرئيسي ومحركات السوق والصفقات والتعلم.\n- `tests/` — اختبارات regression.\n- `.github/workflows/` — CI دائم فقط؛ الإصلاحات لمرة واحدة لا تبقى كـworkflow.\n- `requirements.txt` — اعتماديات التشغيل.\n\n## بيانات السوق\n\nYahoo Finance هو المصدر الأساسي: `XAUUSD=X` للسعر الفوري وM15/H1، و`DX-Y.NYB` لمؤشر الدولار، و`^TNX` لعوائد السندات. لا يوجد fallback سعري إلى Futures أو Crypto أو scraping أو ArgentAPI.\n\n## التشغيل\n\nالمتغيرات الأساسية: `TELEGRAM_TOKEN` و`BOT_PASSWORD`. عند استخدام PostgreSQL اضبط `DATABASE_URL`. فعّل Gemini عبر `GEMINI_API_KEY` عند الحاجة.\n\n## التحقق\n\n`python3 -m py_compile bot.py` ثم `python3 tests/test_market_provider_hygiene.py` و`python3 tests/test_repo_regressions.py`.\n''', encoding='utf-8')
+
+          Path('tests/test_repo_regressions.py').write_text('''from pathlib import Path\ntext = Path("bot.py").read_text(encoding="utf-8")\nassert "open_val" not in text\nassert "WHERE outcome IS NULL AND trade_status IN ('OPEN','TP1_HIT')" in text\nassert '"provider":"legacy provider"' not in text\nassert '"provider":"Yahoo Finance"' in text\nassert 'الظروف الإخبارية مستقرة' not in text\nassert 'dxy": 99.85' not in text\nassert 'us10y": 4.63' not in text\nprint("REPO_REGRESSIONS_OK")\n''', encoding='utf-8')
+          PY
+
+          python3 -m py_compile bot.py
+          python3 tests/test_market_provider_hygiene.py
+          python3 tests/test_repo_regressions.py
+          git diff --check
+
+      - name: Commit cleanup and remove this workflow
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm -f .github/workflows/repo_cleanup.yml
+          git add -A
+          git diff --cached --check
+          git commit -m "chore: clean repository and fix runtime regressions"
+          git push origin main
