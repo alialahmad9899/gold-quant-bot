@@ -26,7 +26,7 @@ jobs:
           if needle not in s:
               raise SystemExit('test-runner insertion point not found')
           s = s.replace(needle, insert, 1)
-          s = s.replace("ns = {'np': FakeNP}", "ns = {'np': FakeNP, 'math': math}")
+          s = s.replace("ns = {'np': FakeNP}", "ns = {'np': FakeNP, 'math': math, 'datetime': datetime, 'timezone': timezone, 'timedelta': timedelta}")
           p.write_text(s, encoding='utf-8')
           PY
       - name: Ensure runtime helper imports
