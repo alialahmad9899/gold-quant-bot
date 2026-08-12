@@ -1,0 +1,236 @@
+name: fix-yahoo-market-data
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: RED regression
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          text=Path('bot.py').read_text(encoding='utf-8')
+          assert 'YAHOO_HISTORICAL_FEED_STATE' in text, 'expected RED: historical state is not yet separated'
+          assert '_yahoo_historical_cooldown_active' in text, 'expected RED: historical cooldown helper is missing'
+          PY
+      - name: Apply Yahoo separation patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import ast
+          import re
+          import textwrap
+          p=Path('bot.py')
+          text=p.read_text(encoding='utf-8')
+          old="""YAHOO_COOLDOWN_SECONDS = int(os.getenv('YAHOO_COOLDOWN_SECONDS', '1800'))\nYAHOO_FETCH_INTERVAL_SECONDS = int(os.getenv('YAHOO_FETCH_INTERVAL_SECONDS', '900'))\nYAHOO_FEED_STATE = {'blocked_until': 0.0, 'error_type': None, 'error_message': None}\nYAHOO_STATE_LOCK = threading.Lock()\n"""
+          new="""YAHOO_LIVE_COOLDOWN_SECONDS = int(os.getenv('YAHOO_LIVE_COOLDOWN_SECONDS', '900'))\nYAHOO_HISTORICAL_COOLDOWN_SECONDS = int(os.getenv('YAHOO_HISTORICAL_COOLDOWN_SECONDS', '1800'))\nYAHOO_HISTORICAL_FETCH_INTERVAL_SECONDS = int(os.getenv('YAHOO_HISTORICAL_FETCH_INTERVAL_SECONDS', '900'))\nYAHOO_LIVE_FEED_STATE = {'blocked_until': 0.0, 'error_type': None, 'error_message': None}\nYAHOO_HISTORICAL_FEED_STATE = {'blocked_until': 0.0, 'error_type': None, 'error_message': None}\nYAHOO_LIVE_STATE_LOCK = threading.Lock()\nYAHOO_HISTORICAL_STATE_LOCK = threading.Lock()\n"""
+          if old not in text: raise SystemExit('settings anchor not found')
+          text=text.replace(old,new,1)
+
+          def replace_function(src,name,replacement):
+              pat=re.compile(rf'^def {re.escape(name)}\\(.*?(?=^def |^class |\\Z)',re.M|re.S)
+              m=pat.search(src)
+              if not m: raise SystemExit(f'function not found: {name}')
+              return src[:m.start()]+textwrap.dedent(replacement).strip()+"\\n\\n"+src[m.end():].lstrip('\\n')
+
+          text=replace_function(text,'_set_yahoo_cooldown',r'''
+          def _set_yahoo_historical_cooldown(error_type, error_message):
+              with YAHOO_HISTORICAL_STATE_LOCK:
+                  YAHOO_HISTORICAL_FEED_STATE['blocked_until'] = time.monotonic() + max(1, YAHOO_HISTORICAL_COOLDOWN_SECONDS)
+                  YAHOO_HISTORICAL_FEED_STATE['error_type'] = str(error_type)
+                  YAHOO_HISTORICAL_FEED_STATE['error_message'] = str(error_message or '')[:300]
+              logger.warning('[MARKET_DATA] Yahoo historical cooldown type=%s seconds=%s message=%s', error_type, YAHOO_HISTORICAL_COOLDOWN_SECONDS, str(error_message or '')[:300])
+
+          def _yahoo_historical_cooldown_active():
+              with YAHOO_HISTORICAL_STATE_LOCK:
+                  return time.monotonic() < float(YAHOO_HISTORICAL_FEED_STATE.get('blocked_until', 0.0) or 0.0)
+
+          def _set_yahoo_live_cooldown(error_type, error_message):
+              with YAHOO_LIVE_STATE_LOCK:
+                  YAHOO_LIVE_FEED_STATE['blocked_until'] = time.monotonic() + max(1, YAHOO_LIVE_COOLDOWN_SECONDS)
+                  YAHOO_LIVE_FEED_STATE['error_type'] = str(error_type)
+                  YAHOO_LIVE_FEED_STATE['error_message'] = str(error_message or '')[:300]
+              logger.warning('[XAUUSD_FEED] Yahoo Spot cooldown type=%s seconds=%s message=%s', error_type, YAHOO_LIVE_COOLDOWN_SECONDS, str(error_message or '')[:300])
+
+          def _yahoo_live_cooldown_active():
+              with YAHOO_LIVE_STATE_LOCK:
+                  return time.monotonic() < float(YAHOO_LIVE_FEED_STATE.get('blocked_until', 0.0) or 0.0)
+          ''')
+
+          text=replace_function(text,'fetch_yahoo_direct',r'''
+          def fetch_yahoo_direct(symbol, range_str="10d", interval_str="15m"):
+              """Historical Yahoo chart fetch only; live Spot has its own independent state."""
+              if _yahoo_historical_cooldown_active():
+                  return pd.DataFrame()
+              headers={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36','Accept':'application/json,text/html,application/xhtml+xml','Referer':'https://finance.yahoo.com/'}
+              url=f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval={interval_str}&range={range_str}"
+              try:
+                  response=requests.get(url,headers=headers,timeout=5)
+                  status=int(getattr(response,'status_code',0) or 0)
+                  if status==429:
+                      _set_yahoo_historical_cooldown('rate_limited','Yahoo historical HTTP 429 rate limit.'); return pd.DataFrame()
+                  if status!=200:
+                      if status>=500: _set_yahoo_historical_cooldown('server_error',f'Yahoo historical HTTP {status}')
+                      return pd.DataFrame()
+                  data=response.json(); result=data.get('chart',{}).get('result') or []
+                  if not result or not isinstance(result[0],dict):
+                      _set_yahoo_historical_cooldown('malformed_payload','Yahoo historical response missing chart.result.')
+                      return pd.DataFrame()
+                  timestamps=result[0].get('timestamp') or []
+                  quote=(result[0].get('indicators') or {}).get('quote') or []
+                  if not quote or not timestamps:
+                      _set_yahoo_historical_cooldown('missing_ohlc','Yahoo historical response missing OHLC arrays.')
+                      return pd.DataFrame()
+                  q=quote[0]
+                  df=pd.DataFrame({'Open':q.get('open'),'High':q.get('high'),'Low':q.get('low'),'Close':q.get('close'),'Volume':q.get('volume',[0]*len(timestamps))},index=pd.to_datetime(timestamps,unit='s',utc=True)).dropna(subset=['Open','High','Low','Close'])
+                  return df if not df.empty else pd.DataFrame()
+              except requests.Timeout as exc:
+                  _set_yahoo_historical_cooldown('timeout',str(exc)[:300]); return pd.DataFrame()
+              except requests.RequestException as exc:
+                  _set_yahoo_historical_cooldown('network',str(exc)[:300]); return pd.DataFrame()
+              except Exception as exc:
+                  msg=f'{type(exc).__name__}: {exc}'
+                  if any(t in msg.lower() for t in ('yfratelimiterror','too many requests','http 429','429')):
+                      _set_yahoo_historical_cooldown('rate_limited',msg)
+                  else:
+                      _set_yahoo_historical_cooldown('historical_error',msg)
+                  return pd.DataFrame()
+          ''')
+
+          text=replace_function(text,'_refresh_cached_feed_status',r'''
+          def _refresh_cached_feed_status(feed):
+              if not feed:
+                  return _build_missing_yahoo_feed('no_cached_feed','Yahoo XAUUSD Spot cache is empty and no fresh live quote is available.')
+              refreshed=dict(feed)
+              if refreshed.get('status')=='MISSING':
+                  refreshed['error_type']=refreshed.get('error_type') or 'missing'
+                  refreshed['error_message']=refreshed.get('error_message') or 'Yahoo XAUUSD Spot quote is unavailable.'
+                  return refreshed
+              source_ts=_parse_price_feed_timestamp(refreshed.get('source_timestamp'))
+              if source_ts is None or refreshed.get('mid') is None:
+                  refreshed['status']='MISSING'; refreshed['age_seconds']=None
+                  refreshed['error_type']=refreshed.get('error_type') or 'missing_timestamp'
+                  refreshed['error_message']=refreshed.get('error_message') or 'Yahoo XAUUSD Spot timestamp/price is missing.'
+                  return refreshed
+              age=max(0.0,(datetime.now(timezone.utc)-source_ts).total_seconds())
+              refreshed['age_seconds']=round(age,3)
+              refreshed['status']='STALE' if refreshed.get('status')=='STALE' or age>PRICE_FEED_STALE_SECONDS else 'ACTIVE'
+              return refreshed
+          ''')
+
+          text=replace_function(text,'fetch_canonical_xauusd_feed',r'''
+          def fetch_canonical_xauusd_feed():
+              """Canonical live XAUUSD Spot from Yahoo XAUUSD=X only; live state is isolated from historical state."""
+              now_m=time.monotonic()
+              with PRICE_FEED_LOCK:
+                  cached=CANONICAL_XAUUSD_FEED_CACHE.get('feed')
+                  last=float(CANONICAL_XAUUSD_FEED_CACHE.get('last_request_monotonic',0.0) or 0.0)
+                  if now_m-last<PRICE_FEED_MIN_REQUEST_INTERVAL:
+                      return _refresh_cached_feed_status(cached)
+                  if _yahoo_live_cooldown_active():
+                      if cached:
+                          return _refresh_cached_feed_status(cached)
+                      return _build_missing_yahoo_feed(YAHOO_LIVE_FEED_STATE.get('error_type') or 'cooldown',YAHOO_LIVE_FEED_STATE.get('error_message') or 'Yahoo live Spot cooldown is active.')
+                  CANONICAL_XAUUSD_FEED_CACHE['last_request_monotonic']=now_m
+              headers={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36','Accept':'application/json','Referer':'https://finance.yahoo.com/'}
+              try:
+                  response=requests.get('https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X',params={'interval':'1m','range':'1d'},headers=headers,timeout=5)
+              except requests.Timeout as exc:
+                  msg=str(exc)[:300]; _set_yahoo_live_cooldown('timeout',msg); _log_yahoo_live_failure('timeout',None,msg); return _refresh_cached_feed_status(cached) if cached else _build_missing_yahoo_feed('timeout',msg)
+              except requests.RequestException as exc:
+                  msg=str(exc)[:300]; _set_yahoo_live_cooldown('network',msg); _log_yahoo_live_failure('network',None,msg); return _refresh_cached_feed_status(cached) if cached else _build_missing_yahoo_feed('network',msg)
+              except Exception as exc:
+                  msg=str(exc)[:300]; _set_yahoo_live_cooldown('network',msg); _log_yahoo_live_failure('network',None,msg); return _refresh_cached_feed_status(cached) if cached else _build_missing_yahoo_feed('network',msg)
+              code=int(getattr(response,'status_code',0) or 0)
+              if code==429:
+                  msg=_yahoo_live_error_message(response) or 'Yahoo live HTTP 429 rate limit.'; _set_yahoo_live_cooldown('rate_limited',msg); _log_yahoo_live_failure('rate_limited',code,msg); return _refresh_cached_feed_status(cached) if cached else _build_missing_yahoo_feed('rate_limited',msg)
+              if 500<=code<=599:
+                  msg=_yahoo_live_error_message(response) or f'Yahoo live HTTP {code}.'; _set_yahoo_live_cooldown('server_error',msg); _log_yahoo_live_failure('server_error',code,msg); return _refresh_cached_feed_status(cached) if cached else _build_missing_yahoo_feed('server_error',msg)
+              if code!=200:
+                  msg=_yahoo_live_error_message(response) or f'Yahoo live HTTP {code}.'; _log_yahoo_live_failure('http_error',code,msg); return _refresh_cached_feed_status(cached) if cached else _build_missing_yahoo_feed('http_error',msg)
+              try:
+                  payload=response.json()
+              except Exception as exc:
+                  msg=str(exc)[:300]; _set_yahoo_live_cooldown('malformed_json',msg); _log_yahoo_live_failure('malformed_json',code,msg); return _refresh_cached_feed_status(cached) if cached else _build_missing_yahoo_feed('malformed_json',msg)
+              feed=_build_yahoo_live_feed(payload,fetched_at=datetime.now(timezone.utc))
+              if feed.get('status')=='MISSING':
+                  msg=feed.get('error_message') or 'Yahoo live Spot payload did not contain a valid quote.'
+                  _set_yahoo_live_cooldown(feed.get('error_type') or 'invalid_data',msg); CANONICAL_XAUUSD_FEED_CACHE['feed']=feed; _log_yahoo_live_failure(feed.get('error_type'),code,msg); return feed
+              with YAHOO_LIVE_STATE_LOCK:
+                  YAHOO_LIVE_FEED_STATE['blocked_until']=0.0; YAHOO_LIVE_FEED_STATE['error_type']=None; YAHOO_LIVE_FEED_STATE['error_message']=None
+              CANONICAL_XAUUSD_FEED_CACHE['feed']=feed
+              return feed
+          ''')
+
+          text=text.replace("(now-last).total_seconds()<YAHOO_FETCH_INTERVAL_SECONDS","(now-last).total_seconds()<YAHOO_HISTORICAL_FETCH_INTERVAL_SECONDS")
+          text=text.replace("if _yahoo_cooldown_active():","if _yahoo_historical_cooldown_active():",1)
+          text=text.replace("provider_fetched = _parse_price_feed_timestamp(payload.get('fetchedAt'))","provider_fetched = None")
+          text=text.replace("age_ms = _finite_positive(payload.get('ageMs'))","age_ms = None")
+          text=text.replace("'source_timestamp': None, 'fetched_timestamp': now.isoformat(),\n            'source_fetched_timestamp': None, 'age_seconds': None,","'source_timestamp': None, 'timestamp': None, 'fetched_timestamp': now.isoformat(),\n            'source_fetched_timestamp': None, 'age_seconds': None, 'error_type':'missing_price_data', 'error_message':'Yahoo XAUUSD Spot quote is missing.' ,",1)
+          text=text.replace("reason = feed.get('error_message') if feed.get('status') == 'MISSING' else None","reason = feed.get('error_message') or feed.get('error_type') if feed.get('status') == 'MISSING' else None",1)
+          text=text.replace("ARGENT_AUTH_COOLDOWN_SECONDS = int(os.getenv('ARGENT_AUTH_COOLDOWN_SECONDS', '600'))\nARGENT_TRANSIENT_COOLDOWN_SECONDS = int(os.getenv('ARGENT_TRANSIENT_COOLDOWN_SECONDS', '300'))\nARGENT_FEED_STATE = {'blocked_until': 0.0, 'error_type': None, 'error_message': None}\n",'',1)
+          text=text.replace("'provider':'legacy provider'","'provider':'Yahoo Finance'",1)
+          p.write_text(text,encoding='utf-8')
+          ast.parse(text)
+          PY
+      - name: GREEN validation
+        run: |
+          python3 -m py_compile bot.py
+          git diff --check
+          python3 - <<'PY'
+          from pathlib import Path
+          import ast
+          t=Path('bot.py').read_text(encoding='utf-8')
+          assert 'XAUUSD=X' in t
+          assert 'GC=F' not in t
+          assert 'PAXGUSDT' not in t
+          assert 'ifcmarkets.net' not in t.lower()
+          assert 'metals.dev' not in t.lower()
+          assert 'api.argentapi.com' not in t.lower()
+          assert 'YAHOO_LIVE_FEED_STATE' in t and 'YAHOO_HISTORICAL_FEED_STATE' in t
+          assert '_yahoo_live_cooldown_active' in t and '_yahoo_historical_cooldown_active' in t
+          ast.parse(t)
+          print('SPOT_SOURCE_AND_SEPARATION_OK')
+          PY
+      - name: Phase1 regression
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import ast, math
+          t=Path('bot.py').read_text(encoding='utf-8')
+          tree=ast.parse(t)
+          names={'validate_trade_levels','_calculate_realized_r','evaluate_trade_lifecycle'}
+          nodes=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in names]
+          ns={'np':type('N',(),{'isfinite':staticmethod(math.isfinite)}),'math':math}
+          exec(compile(ast.Module(body=nodes,type_ignores=[]),'bot.py','exec'),ns)
+          v=ns['validate_trade_levels']; r=ns['_calculate_realized_r']
+          assert v('BUY',100,95,110,120)[0]
+          assert v('SELL',100,105,90,80)[0]
+          assert not v('BUY',100,105,110,120)[0]
+          assert not v('SELL',100,95,90,80)[0]
+          assert math.isclose(r('BUY',100,120,95),-0.0 if False else -0.25)
+          assert math.isclose(r('SELL',100,80,105),-0.25)
+          ev=ns['evaluate_trade_lifecycle']
+          assert ev('BUY','OPEN',100,95,110,120,price=110)==[('TP1_HIT',110.0)]
+          assert ev('BUY','OPEN',100,95,110,120,price=120)==[('TP1_HIT',110.0),('TP2_HIT',120.0)]
+          assert ev('SELL','OPEN',100,105,90,80,price=90)==[('TP1_HIT',90.0)]
+          assert ev('SELL','OPEN',100,105,90,80,price=80)==[('TP1_HIT',90.0),('TP2_HIT',80.0)]
+          print('PHASE1_OK')
+          PY
+      - name: Commit and self-clean workflow
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bot.py
+          git rm -f .github/workflows/fix_yahoo_market_data.yml
+          git diff --cached --check
+          git diff --cached --stat
+          git commit -m "fix: isolate Yahoo live and historical market data"
+          git push origin main
