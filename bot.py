@@ -322,7 +322,6 @@ logger = logging.getLogger('xau_quant_bot')
 FEATURE_VERSION = os.getenv('FEATURE_VERSION', 'v2.8-features-1')
 STRATEGY_VERSION = os.getenv('STRATEGY_VERSION', 'v2.8-flexible')
 MODEL_VERSION = os.getenv('MODEL_VERSION', 'rf-v1')
-ARGENT_API_KEY = os.getenv('ARGENT_API_KEY', '').strip()
 PRICE_FEED_STALE_SECONDS = int(os.getenv('PRICE_FEED_STALE_SECONDS', '90'))
 PRICE_FEED_MIN_REQUEST_INTERVAL = 60.0
 PRICE_FEED_LOCK = threading.Lock()
@@ -1651,7 +1650,7 @@ def _parse_price_feed_timestamp(value):
         if not raw:
             return None
         if raw.isdigit():
-            # ArgentAPI fetchedAt is milliseconds, while some feeds use seconds.
+            # Yahoo Finance fetchedAt is milliseconds, while some feeds use seconds.
             numeric = float(raw)
             if numeric > 1_000_000_000_000:
                 numeric /= 1000.0
@@ -1678,7 +1677,7 @@ def _build_canonical_xauusd_feed(payload, *, fetched_at=None, stale_hint=False):
     now = fetched_at or datetime.now(timezone.utc)
     if not isinstance(payload, dict):
         return {
-            'symbol': 'XAUUSD', 'provider': 'ArgentAPI', 'status': 'MISSING',
+            'symbol': 'XAUUSD', 'provider': 'Yahoo Finance', 'status': 'MISSING',
             'bid': None, 'ask': None, 'mid': None, 'spot': None,
             'source_timestamp': None, 'fetched_timestamp': now.isoformat(),
             'source_fetched_timestamp': None, 'age_seconds': None,
@@ -1708,7 +1707,7 @@ def _build_canonical_xauusd_feed(payload, *, fetched_at=None, stale_hint=False):
     spot = price if price is not None else mid
     if mid is None or source_ts is None:
         return {
-            'symbol': 'XAUUSD', 'provider': 'ArgentAPI', 'status': 'MISSING',
+            'symbol': 'XAUUSD', 'provider': 'Yahoo Finance', 'status': 'MISSING',
             'bid': bid, 'ask': ask, 'mid': mid, 'spot': spot,
             'source_timestamp': source_ts.isoformat() if source_ts else None,
             'fetched_timestamp': now.isoformat(),
@@ -1724,7 +1723,7 @@ def _build_canonical_xauusd_feed(payload, *, fetched_at=None, stale_hint=False):
 
     return {
         'symbol': 'XAUUSD',
-        'provider': 'ArgentAPI',
+        'provider': 'Yahoo Finance',
         'status': status,
         'bid': round(bid, 6) if bid is not None else None,
         'ask': round(ask, 6) if ask is not None else None,
@@ -1741,7 +1740,7 @@ def _build_canonical_xauusd_feed(payload, *, fetched_at=None, stale_hint=False):
 def _refresh_cached_feed_status(feed):
     if not feed:
         return {
-            'symbol': 'XAUUSD', 'provider': 'ArgentAPI', 'status': 'MISSING',
+            'symbol': 'XAUUSD', 'provider': 'Yahoo Finance', 'status': 'MISSING',
             'bid': None, 'ask': None, 'mid': None, 'spot': None,
             'source_timestamp': None, 'fetched_timestamp': datetime.now(timezone.utc).isoformat(),
             'source_fetched_timestamp': None, 'age_seconds': None,
@@ -1759,94 +1758,92 @@ def _refresh_cached_feed_status(feed):
     return refreshed
 
 
-def _sanitize_feed_error(message):
-    text = str(message or '')[:300]
-    if ARGENT_API_KEY:
-        text = text.replace(ARGENT_API_KEY, '[REDACTED]')
-    return text
-
-def _set_argent_cooldown(seconds, error_type=None, error_message=None):
-    ARGENT_FEED_STATE['blocked_until'] = time.monotonic() + max(0.0, float(seconds))
-    ARGENT_FEED_STATE['error_type'] = error_type
-    ARGENT_FEED_STATE['error_message'] = _sanitize_feed_error(error_message)
-
-def _argent_cooldown_active():
-    return time.monotonic() < float(ARGENT_FEED_STATE.get('blocked_until', 0.0) or 0.0)
-
-def _build_missing_argent_feed(error_type='missing', error_message='No live XAUUSD data available.'):
+def _build_missing_yahoo_feed(error_type='missing', error_message='No live XAUUSD Spot data available.'):
     now = datetime.now(timezone.utc)
-    return {
-        'symbol': 'XAUUSD', 'provider': 'ArgentAPI', 'status': 'MISSING',
-        'bid': None, 'ask': None, 'mid': None, 'spot': None,
-        'source_timestamp': None, 'timestamp': None,
-        'fetched_timestamp': now.isoformat(), 'source_fetched_timestamp': None,
-        'age_seconds': None, 'error_type': str(error_type),
-        'error_message': _sanitize_feed_error(error_message),
-    }
+    return {'symbol':'XAUUSD','provider':'Yahoo Finance','status':'MISSING','bid':None,'ask':None,'mid':None,'spot':None,'source_timestamp':None,'timestamp':None,'fetched_timestamp':now.isoformat(),'source_fetched_timestamp':None,'age_seconds':None,'error_type':str(error_type),'error_message':str(error_message or '')[:300],'spread_available':False}
 
-def _argentapi_error_message(response):
+
+def _yahoo_live_error_message(response):
     try:
-        payload = response.json()
-        if isinstance(payload, dict):
-            for key in ('error', 'message', 'detail'):
-                if payload.get(key): return _sanitize_feed_error(payload[key])
+        payload = response.json(); chart = payload.get('chart') or {}; err = chart.get('error')
+        if isinstance(err, dict): return str(err.get('description') or err.get('code') or '')[:300]
     except Exception: pass
-    try: return _sanitize_feed_error(response.text or '')
+    try: return str(response.text or '')[:300]
     except Exception: return ''
 
-def _log_argentapi_failure(error_type, http_status=None, message=''):
-    logger.warning('[XAUUSD_FEED] ArgentAPI failure type=%s http_status=%s message=%s', error_type, http_status, _sanitize_feed_error(message))
+
+def _log_yahoo_live_failure(error_type, http_status=None, message=''):
+    logger.warning('[XAUUSD_FEED] Yahoo Spot failure type=%s http_status=%s message=%s', error_type, http_status, str(message or '')[:300])
+
+
+def _set_yahoo_live_cooldown(error_type, error_message):
+    with YAHOO_STATE_LOCK:
+        YAHOO_FEED_STATE['blocked_until'] = time.monotonic() + max(1, YAHOO_COOLDOWN_SECONDS)
+        YAHOO_FEED_STATE['error_type'] = str(error_type); YAHOO_FEED_STATE['error_message'] = str(error_message or '')[:300]
+    logger.warning('[XAUUSD_FEED] Yahoo Spot cooldown type=%s seconds=%s message=%s', error_type, YAHOO_COOLDOWN_SECONDS, str(error_message or '')[:300])
+
+
+def _yahoo_live_cooldown_active():
+    with YAHOO_STATE_LOCK: return time.monotonic() < float(YAHOO_FEED_STATE.get('blocked_until', 0.0) or 0.0)
+
+
+def _build_yahoo_live_feed(payload, *, fetched_at=None):
+    now = fetched_at or datetime.now(timezone.utc)
+    if not isinstance(payload, dict): return _build_missing_yahoo_feed('malformed_payload','Yahoo returned a non-object payload.')
+    result = ((payload.get('chart') or {}).get('result') or [])
+    if not result or not isinstance(result[0], dict): return _build_missing_yahoo_feed('missing_result','Yahoo response does not contain chart.result.')
+    meta = result[0].get('meta') or {}
+    try: price = float(meta.get('regularMarketPrice'))
+    except (TypeError,ValueError): price = None
+    if price is None or not math.isfinite(price) or price <= 1000: return _build_missing_yahoo_feed('missing_price','Yahoo XAUUSD=X regularMarketPrice is missing or invalid.')
+    try: source_ts = datetime.fromtimestamp(float(meta.get('regularMarketTime')), tz=timezone.utc)
+    except (TypeError,ValueError,OverflowError): source_ts = None
+    if source_ts is None: return _build_missing_yahoo_feed('missing_timestamp','Yahoo XAUUSD=X regularMarketTime is missing or invalid.')
+    age = max(0.0,(now-source_ts).total_seconds())
+    def finite_side(v):
+        try:
+            x=float(v); return x if math.isfinite(x) and x>1000 else None
+        except (TypeError,ValueError): return None
+    bid, ask = finite_side(meta.get('bid')), finite_side(meta.get('ask'))
+    spread_available = bid is not None and ask is not None
+    if not spread_available: bid = ask = price
+    mid = (bid + ask) / 2.0
+    return {'symbol':'XAUUSD','provider':'Yahoo Finance','status':'STALE' if age>PRICE_FEED_STALE_SECONDS else 'ACTIVE','bid':round(bid,6),'ask':round(ask,6),'mid':round(mid,6),'spot':round(price,6),'source_timestamp':source_ts.isoformat(),'timestamp':source_ts.isoformat(),'fetched_timestamp':now.isoformat(),'source_fetched_timestamp':None,'age_seconds':round(age,3),'error_type':None,'error_message':None,'spread_available':spread_available}
+
 
 def fetch_canonical_xauusd_feed():
-    """Canonical live XAUUSD feed backed only by ArgentAPI with a 60s request gate."""
-    now_monotonic = time.monotonic()
+    """Canonical live XAUUSD Spot from Yahoo XAUUSD=X only; no futures/crypto/scraping fallback."""
+    now_m = time.monotonic()
     with PRICE_FEED_LOCK:
-        cached = CANONICAL_XAUUSD_FEED_CACHE.get('feed')
-        last_request = float(CANONICAL_XAUUSD_FEED_CACHE.get('last_request_monotonic', 0.0) or 0.0)
-        if now_monotonic - last_request < PRICE_FEED_MIN_REQUEST_INTERVAL:
-            return _refresh_cached_feed_status(cached)
-        if _argent_cooldown_active():
-            if cached: return _refresh_cached_feed_status(cached)
-            return _build_missing_argent_feed(ARGENT_FEED_STATE.get('error_type') or 'cooldown', ARGENT_FEED_STATE.get('error_message') or 'ArgentAPI request cooldown is active.')
-        if not ARGENT_API_KEY:
-            feed = _build_missing_argent_feed('missing_api_key', 'ARGENT_API_KEY is not configured.')
-            _set_argent_cooldown(ARGENT_AUTH_COOLDOWN_SECONDS, 'missing_api_key', feed['error_message'])
-            CANONICAL_XAUUSD_FEED_CACHE['feed'] = feed
-            _log_argentapi_failure(feed['error_type'], None, feed['error_message'])
-            return feed
-        CANONICAL_XAUUSD_FEED_CACHE['last_request_monotonic'] = now_monotonic
+        cached = CANONICAL_XAUUSD_FEED_CACHE.get('feed'); last = float(CANONICAL_XAUUSD_FEED_CACHE.get('last_request_monotonic',0.0) or 0.0)
+        if now_m-last < PRICE_FEED_MIN_REQUEST_INTERVAL: return _refresh_cached_feed_status(cached)
+        if _yahoo_live_cooldown_active(): return _refresh_cached_feed_status(cached) if cached else _build_missing_yahoo_feed(YAHOO_FEED_STATE.get('error_type') or 'cooldown', YAHOO_FEED_STATE.get('error_message') or 'Yahoo Spot cooldown is active.')
+        CANONICAL_XAUUSD_FEED_CACHE['last_request_monotonic'] = now_m
+        headers={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36','Accept':'application/json','Referer':'https://finance.yahoo.com/'}
         try:
-            response = requests.get('https://api.argentapi.com/v1/spot/gold', headers={'X-API-Key': ARGENT_API_KEY, 'Accept': 'application/json'}, timeout=5)
+            response=requests.get('https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X',params={'interval':'1m','range':'1d'},headers=headers,timeout=5)
         except requests.Timeout as exc:
-            message = _sanitize_feed_error(exc); _set_argent_cooldown(ARGENT_TRANSIENT_COOLDOWN_SECONDS, 'timeout', message); _log_argentapi_failure('timeout', None, message)
-            return _refresh_cached_feed_status(cached) if cached else _build_missing_argent_feed('timeout', message)
+            msg=str(exc)[:300]; _set_yahoo_live_cooldown('timeout',msg); _log_yahoo_live_failure('timeout',None,msg); return _refresh_cached_feed_status(cached) if cached else _build_missing_yahoo_feed('timeout',msg)
         except requests.RequestException as exc:
-            message = _sanitize_feed_error(exc); _set_argent_cooldown(ARGENT_TRANSIENT_COOLDOWN_SECONDS, 'network', message); _log_argentapi_failure('network', None, message)
-            return _refresh_cached_feed_status(cached) if cached else _build_missing_argent_feed('network', message)
+            msg=str(exc)[:300]; _set_yahoo_live_cooldown('network',msg); _log_yahoo_live_failure('network',None,msg); return _refresh_cached_feed_status(cached) if cached else _build_missing_yahoo_feed('network',msg)
         except Exception as exc:
-            message = _sanitize_feed_error(exc); _set_argent_cooldown(ARGENT_TRANSIENT_COOLDOWN_SECONDS, 'network', message); _log_argentapi_failure('network', None, message)
-            return _refresh_cached_feed_status(cached) if cached else _build_missing_argent_feed('network', message)
-        status_code = int(getattr(response, 'status_code', 0) or 0)
-        if status_code in (401, 403):
-            message = _argentapi_error_message(response) or 'ArgentAPI authentication/authorization failed.'; _set_argent_cooldown(ARGENT_AUTH_COOLDOWN_SECONDS, 'authentication', message)
-            feed = _build_missing_argent_feed('authentication', message); CANONICAL_XAUUSD_FEED_CACHE['feed'] = feed; _log_argentapi_failure('authentication', status_code, message); return feed
-        if status_code == 429:
-            message = _argentapi_error_message(response) or 'ArgentAPI rate limit reached.'; _set_argent_cooldown(ARGENT_TRANSIENT_COOLDOWN_SECONDS, 'rate_limited', message); _log_argentapi_failure('rate_limited', status_code, message)
-            return _refresh_cached_feed_status(cached) if cached else _build_missing_argent_feed('rate_limited', message)
-        if 500 <= status_code <= 599:
-            message = _argentapi_error_message(response) or 'ArgentAPI server error.'; _set_argent_cooldown(ARGENT_TRANSIENT_COOLDOWN_SECONDS, 'server_error', message); _log_argentapi_failure('server_error', status_code, message)
-            return _refresh_cached_feed_status(cached) if cached else _build_missing_argent_feed('server_error', message)
-        if status_code != 200:
-            message = _argentapi_error_message(response) or f'Unexpected HTTP status {status_code}.'; _set_argent_cooldown(ARGENT_TRANSIENT_COOLDOWN_SECONDS, 'http_error', message); _log_argentapi_failure('http_error', status_code, message)
-            return _refresh_cached_feed_status(cached) if cached else _build_missing_argent_feed('http_error', message)
-        try: payload = response.json()
+            msg=str(exc)[:300]; _set_yahoo_live_cooldown('network',msg); _log_yahoo_live_failure('network',None,msg); return _refresh_cached_feed_status(cached) if cached else _build_missing_yahoo_feed('network',msg)
+        code=int(getattr(response,'status_code',0) or 0)
+        if code==429:
+            msg=_yahoo_live_error_message(response) or 'Yahoo HTTP 429 rate limit.'; _set_yahoo_live_cooldown('rate_limited',msg); _log_yahoo_live_failure('rate_limited',code,msg); return _refresh_cached_feed_status(cached) if cached else _build_missing_yahoo_feed('rate_limited',msg)
+        if 500<=code<=599:
+            msg=_yahoo_live_error_message(response) or f'Yahoo HTTP {code}.'; _set_yahoo_live_cooldown('server_error',msg); _log_yahoo_live_failure('server_error',code,msg); return _refresh_cached_feed_status(cached) if cached else _build_missing_yahoo_feed('server_error',msg)
+        if code!=200:
+            msg=_yahoo_live_error_message(response) or f'Yahoo HTTP {code}.'; _log_yahoo_live_failure('http_error',code,msg); return _refresh_cached_feed_status(cached) if cached else _build_missing_yahoo_feed('http_error',msg)
+        try: payload=response.json()
         except Exception as exc:
-            message = _sanitize_feed_error(exc); _set_argent_cooldown(ARGENT_TRANSIENT_COOLDOWN_SECONDS, 'malformed_json', message); _log_argentapi_failure('malformed_json', status_code, message)
-            return _refresh_cached_feed_status(cached) if cached else _build_missing_argent_feed('malformed_json', message)
-        feed = _build_canonical_xauusd_feed(payload, fetched_at=datetime.now(timezone.utc)); feed['error_type']=None; feed['error_message']=None
-        if feed.get('status') != 'MISSING':
-            ARGENT_FEED_STATE['blocked_until']=0.0; ARGENT_FEED_STATE['error_type']=None; ARGENT_FEED_STATE['error_message']=None; CANONICAL_XAUUSD_FEED_CACHE['feed']=feed; return feed
-        message='required live price/timestamp fields are missing or invalid.'; _set_argent_cooldown(ARGENT_TRANSIENT_COOLDOWN_SECONDS, 'missing_fields', message); feed=_build_missing_argent_feed('missing_fields', message); CANONICAL_XAUUSD_FEED_CACHE['feed']=feed; _log_argentapi_failure('missing_fields', status_code, message); return feed
+            msg=str(exc)[:300]; _set_yahoo_live_cooldown('malformed_json',msg); _log_yahoo_live_failure('malformed_json',code,msg); return _refresh_cached_feed_status(cached) if cached else _build_missing_yahoo_feed('malformed_json',msg)
+        feed=_build_yahoo_live_feed(payload,fetched_at=datetime.now(timezone.utc))
+        if feed.get('status')=='MISSING':
+            _set_yahoo_live_cooldown(feed.get('error_type') or 'invalid_data',feed.get('error_message') or 'Yahoo live data is invalid.'); CANONICAL_XAUUSD_FEED_CACHE['feed']=feed; _log_yahoo_live_failure(feed.get('error_type'),code,feed.get('error_message')); return feed
+        with YAHOO_STATE_LOCK:
+            YAHOO_FEED_STATE['blocked_until']=0.0; YAHOO_FEED_STATE['error_type']=None; YAHOO_FEED_STATE['error_message']=None
+        CANONICAL_XAUUSD_FEED_CACHE['feed']=feed; return feed
 
 def get_xauusd_execution_price(feed, direction, role):
     direction = str(direction).upper()
@@ -2734,7 +2731,7 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     timestamp = feed.get('timestamp') or feed.get('source_timestamp') or 'N/A'
     msg = (
         "📊 **XAUUSD Live Price Feed**\n"
-        f"Provider: {feed.get('provider', 'ArgentAPI')}\n"
+        f"Provider: {feed.get('provider', 'Yahoo Finance')}\n"
         f"Status: {feed.get('status', 'MISSING')}\n"
         f"Bid: {fmt(feed.get('bid'))}\n"
         f"Ask: {fmt(feed.get('ask'))}\n"
