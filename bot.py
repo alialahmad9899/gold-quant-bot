@@ -303,12 +303,12 @@ FEATURE_VERSION = os.getenv('FEATURE_VERSION', 'v2.8-features-1')
 STRATEGY_VERSION = os.getenv('STRATEGY_VERSION', 'v2.8-flexible')
 MODEL_VERSION = os.getenv('MODEL_VERSION', 'rf-v1')
 PRICE_FEED_STALE_SECONDS = int(os.getenv('PRICE_FEED_STALE_SECONDS', '90'))
-PRICE_FEED_MIN_REQUEST_INTERVAL = 3.0
+PRICE_FEED_MIN_REQUEST_INTERVAL = 2.0
 PRICE_FEED_LOCK = threading.Lock()
 CANONICAL_XAUUSD_FEED_CACHE = {'feed': None, 'last_request_monotonic': 0.0}
 
-YAHOO_LIVE_COOLDOWN_SECONDS = int(os.getenv('YAHOO_LIVE_COOLDOWN_SECONDS', '15'))
-YAHOO_HISTORICAL_COOLDOWN_SECONDS = int(os.getenv('YAHOO_HISTORICAL_COOLDOWN_SECONDS', '30'))
+YAHOO_LIVE_COOLDOWN_SECONDS = int(os.getenv('YAHOO_LIVE_COOLDOWN_SECONDS', '5'))
+YAHOO_HISTORICAL_COOLDOWN_SECONDS = int(os.getenv('YAHOO_HISTORICAL_COOLDOWN_SECONDS', '10'))
 YAHOO_HISTORICAL_FETCH_INTERVAL_SECONDS = int(os.getenv('YAHOO_HISTORICAL_FETCH_INTERVAL_SECONDS', '300'))
 YAHOO_LIVE_FEED_STATE = {'blocked_until': 0.0, 'error_type': None, 'error_message': None}
 YAHOO_HISTORICAL_FEED_STATE = {'blocked_until': 0.0, 'error_type': None, 'error_message': None}
@@ -1560,9 +1560,22 @@ def _build_yahoo_live_feed(payload, *, fetched_at=None):
     if not result or not isinstance(result[0], dict): return _build_missing_yahoo_feed('missing_result', 'Yahoo response does not contain chart.result.')
     meta = result[0].get('meta') or {}
     price = _finite_positive(meta.get('regularMarketPrice'))
+    
+    # بديل فوري إذا كان regularMarketPrice غير متاح لحظياً
+    if price is None or price <= 1000:
+        indicators = result[0].get('indicators', {})
+        quotes = indicators.get('quote', [{}])[0]
+        closes = [c for c in quotes.get('close', []) if c is not None]
+        if closes:
+            price = _finite_positive(closes[-1])
+            
     if price is None or price <= 1000: return _build_missing_yahoo_feed('missing_price', 'Yahoo XAUUSD=X regularMarketPrice is missing or invalid.')
+    
     try: source_ts = datetime.fromtimestamp(float(meta.get('regularMarketTime')), tz=timezone.utc)
-    except (TypeError, ValueError, OverflowError): source_ts = None
+    except (TypeError, ValueError, OverflowError): 
+        timestamps = result[0].get('timestamp', [])
+        source_ts = datetime.fromtimestamp(float(timestamps[-1]), tz=timezone.utc) if timestamps else now
+        
     if source_ts is None: return _build_missing_yahoo_feed('missing_timestamp', 'Yahoo XAUUSD=X regularMarketTime is missing or invalid.')
     age = max(0.0, (now - source_ts).total_seconds())
     bid = _finite_positive(meta.get('bid'))
@@ -1626,12 +1639,27 @@ def _yahoo_live_cooldown_active():
         return time.monotonic() < float(YAHOO_LIVE_FEED_STATE.get('blocked_until', 0.0) or 0.0)
 
 def http_get_yahoo(url, timeout=8):
-    """جلب مباشر من Yahoo Finance مع محاكاة متصفح Chrome النظيفة لتجاوز حظر السيرفرات"""
-    for host in ('query1.finance.yahoo.com', 'query2.finance.yahoo.com'):
+    """جلب مباشر مع التبديل التلقائي بين خوادم ياهو ومحاكاة بصمة متصفح كاملة"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,application/json,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Ch-Ua": '"Not-A.Brand";v="99", "Chromium";v="124", "Google Chrome";v="124"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1"
+    }
+
+    # البدء بخادم query2 لأنه الأكثر استقراراً للسيرفرات السحابية
+    for host in ('query2.finance.yahoo.com', 'query1.finance.yahoo.com'):
         target = url.replace('query1.finance.yahoo.com', host).replace('query2.finance.yahoo.com', host)
         if HAS_CURL_CFFI:
             try:
-                r = curl_requests.get(target, impersonate='chrome124', timeout=timeout, verify=True)
+                r = curl_requests.get(target, headers=headers, impersonate='chrome120', timeout=timeout, verify=True)
                 if r.status_code == 200:
                     data = r.json()
                     if isinstance(data, dict) and (data.get('chart') or {}).get('result'):
@@ -1639,10 +1667,6 @@ def http_get_yahoo(url, timeout=8):
             except Exception as exc:
                 logger.debug('[YAHOO_HTTP] curl_cffi error host=%s: %s', host, exc)
         try:
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36',
-                'Accept': 'application/json'
-            }
             r = requests.get(target, headers=headers, timeout=timeout)
             if r.status_code == 200:
                 data = r.json()
@@ -1656,7 +1680,7 @@ def fetch_yahoo_direct(symbol, range_str='10d', interval_str='15m'):
     """جلب الشموع التاريخية من Yahoo Finance لجميع الرموز (XAUUSD=X, DX-Y.NYB, ^TNX)"""
     if _yahoo_historical_cooldown_active():
         return pd.DataFrame()
-    url = f'https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval={interval_str}&range={range_str}'
+    url = f'https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?interval={interval_str}&range={range_str}'
     try:
         data = http_get_yahoo(url, timeout=8)
         if not data:
@@ -1706,7 +1730,7 @@ def fetch_canonical_xauusd_feed():
     if _yahoo_live_cooldown_active():
         return _refresh_cached_feed_status(CANONICAL_XAUUSD_FEED_CACHE.get('feed'))
 
-    url = "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval=1m&range=1d"
+    url = "https://query2.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval=1m&range=1d"
     try:
         payload = http_get_yahoo(url, timeout=6)
         if not payload:
@@ -1767,7 +1791,7 @@ def fetch_and_update_cache():
         gold = feed.get('mid') or feed.get('spot') or 0.0
 
         dxy = None
-        data_dxy = http_get_yahoo('https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB?interval=1m&range=1d', timeout=4)
+        data_dxy = http_get_yahoo('https://query2.finance.yahoo.com/v8/finance/chart/DX-Y.NYB?interval=1m&range=1d', timeout=4)
         if data_dxy:
             try:
                 meta = data_dxy['chart']['result'][0]['meta']
@@ -1777,7 +1801,7 @@ def fetch_and_update_cache():
                 dxy = None
 
         us10y = None
-        data_tnx = http_get_yahoo('https://query1.finance.yahoo.com/v8/finance/chart/^TNX?interval=1m&range=1d', timeout=4)
+        data_tnx = http_get_yahoo('https://query2.finance.yahoo.com/v8/finance/chart/^TNX?interval=1m&range=1d', timeout=4)
         if data_tnx:
             try:
                 meta = data_tnx['chart']['result'][0]['meta']
