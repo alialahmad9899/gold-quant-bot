@@ -825,74 +825,94 @@ def has_active_open_trade(signal_type):
     finally:
         release_db_connection(conn)
 
-def log_trade(signal_type, entry, sl, tp1, tp2, rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, confidence, candle_id=None, signal_score=None, ai_score=None):
-    conn = get_db_connection()
+def _trade_direction(signal_type):
+    raw=str(signal_type or '').upper()
+    if 'BUY' in raw or 'شراء' in raw: return 'BUY'
+    if 'SELL' in raw or 'بيع' in raw: return 'SELL'
+    return None
+
+def validate_trade_levels(signal_type,entry,sl,tp1,tp2):
+    direction=_trade_direction(signal_type)
+    try: entry_f,sl_f,tp1_f,tp2_f=[float(v) for v in (entry,sl,tp1,tp2)]
+    except (TypeError,ValueError): return False,'Entry/SL/TP must be numeric.'
+    if not all(np.isfinite(v) and v>0 for v in (entry_f,sl_f,tp1_f,tp2_f)): return False,'Entry/SL/TP must be finite positive prices.'
+    valid=(sl_f<entry_f<tp1_f<tp2_f) if direction=='BUY' else ((tp2_f<tp1_f<entry_f<sl_f) if direction=='SELL' else False)
+    return (True,'OK') if valid else (False,'Invalid BUY/SELL price ordering for Entry/SL/TP.')
+
+def _calculate_realized_r(signal_type,entry,sl,exit_price):
+    direction=_trade_direction(signal_type); risk=abs(float(entry)-float(sl)); exit_f=float(exit_price)
+    if direction not in {'BUY','SELL'} or risk<=0 or not np.isfinite(exit_f): return None
+    return (exit_f-float(entry))/risk if direction=='BUY' else (float(entry)-exit_f)/risk
+
+def evaluate_trade_lifecycle(signal_type,status,entry,sl,tp1,tp2,*,price=None,bar_open=None,bar_high=None,bar_low=None):
+    direction=_trade_direction(signal_type); valid,reason=validate_trade_levels(signal_type,entry,sl,tp1,tp2)
+    if not valid: raise ValueError(reason)
+    status=str(status or 'OPEN').upper(); events=[]
+    if price is not None:
+        price=float(price); milestone=status=='OPEN' and (price>=tp1 if direction=='BUY' else price<=tp1)
+        final='TP2_HIT' if ((direction=='BUY' and price>=tp2) or (direction=='SELL' and price<=tp2)) else ('SL_HIT' if ((direction=='BUY' and price<=sl) or (direction=='SELL' and price>=sl)) else None)
+        if milestone: events.append(('TP1_HIT',float(tp1)))
+        if final: events.append((final,price))
+        return events
+    if any(v is None for v in (bar_open,bar_high,bar_low)): return events
+    bar_open,bar_high,bar_low=map(float,(bar_open,bar_high,bar_low)); milestone=status=='OPEN' and (bar_high>=tp1 if direction=='BUY' else bar_low<=tp1)
+    sl_hit=(bar_low<=sl) if direction=='BUY' else (bar_high>=sl); tp2_hit=(bar_high>=tp2) if direction=='BUY' else (bar_low<=tp2)
+    if sl_hit and tp2_hit:
+        final='SL_HIT' if abs(bar_open-sl)<=abs(bar_open-tp2) else 'TP2_HIT'; final_price=sl if final=='SL_HIT' else tp2
+    elif sl_hit: final,final_price='SL_HIT',sl
+    elif tp2_hit: final,final_price='TP2_HIT',tp2
+    else: final,final_price=None,None
+    if milestone: events.append(('TP1_HIT',float(tp1)))
+    if final: events.append((final,float(final_price)))
+    return events
+
+def log_trade(signal_type,entry,sl,tp1,tp2,rsi,dxy_corr,macd_diff,stoch_k,volatility_ratio,confidence,candle_id=None,signal_score=None,ai_score=None):
+    ok,reason=validate_trade_levels(signal_type,entry,sl,tp1,tp2)
+    if not ok: logger.warning('[TRADE_VALIDATION] %s',reason); return False,None
+    conn=get_db_connection()
     try:
-        cursor = conn.cursor()
-        f_entry, f_sl, f_tp1, f_tp2 = map(float, (entry, sl, tp1, tp2))
-        f_rsi, f_dxy, f_macd, f_stoch, f_vol, f_conf = map(float, (rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, confidence))
-        candle_id = candle_id or datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
-        now_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-        is_pg = is_postgres() and isinstance(conn, psycopg2.extensions.connection)
-        params = (now_str, signal_type, f_entry, f_sl, f_tp1, f_tp2, f_rsi, f_dxy, f_macd, f_stoch, f_vol, f_conf, candle_id, FEATURE_VERSION, STRATEGY_VERSION, MODEL_VERSION, signal_score, ai_score)
-        if is_pg:
-            cursor.execute('''
-                INSERT INTO trades
-                (timestamp, signal_type, entry_price, sl, tp1, tp2, rsi, dxy_corr, macd_diff,
-                 stoch_k, volatility_ratio, outcome, confidence, candle_id, trade_status,
-                 feature_version, strategy_version, model_version, signal_score, ai_score)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NULL,%s,%s,'OPEN',%s,%s,%s,%s,%s)
-                ON CONFLICT (candle_id) DO NOTHING RETURNING id
-            ''', params)
-        else:
-            cursor.execute('''
-                INSERT OR IGNORE INTO trades
-                (timestamp, signal_type, entry_price, sl, tp1, tp2, rsi, dxy_corr, macd_diff,
-                 stoch_k, volatility_ratio, outcome, confidence, candle_id, trade_status,
-                 feature_version, strategy_version, model_version, signal_score, ai_score)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,?,?, 'OPEN',?,?,?,?,?)
-            ''', params)
-        inserted = cursor.rowcount == 1
-        trade_id = None
-        if inserted:
-            if is_pg:
-                row = cursor.fetchone(); trade_id = row[0] if row else None
-            else:
-                trade_id = cursor.lastrowid
-        conn.commit()
-        return inserted, trade_id
+        cur=conn.cursor(); f_entry,f_sl,f_tp1,f_tp2=map(float,(entry,sl,tp1,tp2)); f_rsi,f_dxy,f_macd,f_stoch,f_vol,f_conf=map(float,(rsi,dxy_corr,macd_diff,stoch_k,volatility_ratio,confidence)); candle_id=candle_id or datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S'); now=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'); is_pg=is_postgres() and isinstance(conn,psycopg2.extensions.connection); params=(now,signal_type,f_entry,f_sl,f_tp1,f_tp2,f_rsi,f_dxy,f_macd,f_stoch,f_vol,f_conf,candle_id,FEATURE_VERSION,STRATEGY_VERSION,MODEL_VERSION,signal_score,ai_score)
+        if is_pg: cur.execute("INSERT INTO trades (timestamp,signal_type,entry_price,sl,tp1,tp2,rsi,dxy_corr,macd_diff,stoch_k,volatility_ratio,outcome,confidence,candle_id,trade_status,feature_version,strategy_version,model_version,signal_score,ai_score,slippage) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NULL,%s,%s,'OPEN',%s,%s,%s,%s,%s,NULL) ON CONFLICT (candle_id) DO NOTHING RETURNING id",params)
+        else: cur.execute("INSERT OR IGNORE INTO trades (timestamp,signal_type,entry_price,sl,tp1,tp2,rsi,dxy_corr,macd_diff,stoch_k,volatility_ratio,outcome,confidence,candle_id,trade_status,feature_version,strategy_version,model_version,signal_score,ai_score,slippage) VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,?,?, 'OPEN',?,?,?,?,?,NULL)",params)
+        inserted=cur.rowcount==1; trade_id=None
+        if inserted: trade_id=cur.lastrowid if not is_pg else ((lambda r:r[0] if r else None)(cur.fetchone()))
+        conn.commit(); return inserted,trade_id
     except Exception as e:
         try: conn.rollback()
         except Exception: pass
-        system_monitor.record_error('TRADE_INSERT', e)
-        return False, None
-    finally:
-        release_db_connection(conn)
+        system_monitor.record_error('TRADE_INSERT',e); return False,None
+    finally: release_db_connection(conn)
 
-def update_trade_state(trade_id, new_status, exit_price=None, realized_r=None, slippage=None):
-    conn = get_db_connection()
+
+def update_trade_state(trade_id,new_status,exit_price=None,realized_r=None,slippage=None):
+    if new_status not in {'TP1_HIT','TP2_HIT','SL_HIT'}: return False
+    conn=get_db_connection(); changed=False; final_status=new_status in {'TP2_HIT','SL_HIT'}
     try:
-        cur = conn.cursor(); is_pg=is_postgres() and isinstance(conn, psycopg2.extensions.connection); ph='%s' if is_pg else '?'
+        cur=conn.cursor(); is_pg=is_postgres() and isinstance(conn,psycopg2.extensions.connection); ph='%s' if is_pg else '?'; cur.execute(f"SELECT signal_type,entry_price,sl,tp1,tp2,trade_status FROM trades WHERE id={ph}",(trade_id,)); row=cur.fetchone()
+        if not row: return False
+        signal_type,entry,sl,tp1,tp2,current_status=row; current_status=str(current_status or 'OPEN')
+        if new_status=='TP1_HIT' and current_status!='OPEN': return False
+        if final_status and current_status not in {'OPEN','TP1_HIT'}: return False
         now=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-        if new_status=='TP1_HIT':
-            sql=f"UPDATE trades SET trade_status={ph},tp1_hit_at={ph},exit_price={ph},realized_r={ph},slippage={ph} WHERE id={ph} AND trade_status='OPEN'"; params=(new_status,now,exit_price,realized_r,slippage,trade_id)
-        elif new_status=='TP2_HIT':
-            sql=f"UPDATE trades SET trade_status={ph},tp2_hit_at={ph},exit_price={ph},realized_r={ph},slippage={ph},outcome=1 WHERE id={ph} AND trade_status IN ('OPEN','TP1_HIT')"; params=(new_status,now,exit_price,realized_r,slippage,trade_id)
-        elif new_status=='SL_HIT':
-            sql=f"UPDATE trades SET trade_status={ph},sl_hit_at={ph},exit_price={ph},realized_r={ph},slippage={ph},outcome=0 WHERE id={ph} AND trade_status IN ('OPEN','TP1_HIT')"; params=(new_status,now,exit_price,realized_r,slippage,trade_id)
+        if new_status=='TP1_HIT': sql=f"UPDATE trades SET trade_status={ph},tp1_hit_at={ph},slippage=NULL WHERE id={ph} AND trade_status='OPEN' AND outcome IS NULL"; params=(new_status,now,trade_id)
         else:
-            sql=f"UPDATE trades SET trade_status={ph},exit_price={ph},realized_r={ph},slippage={ph} WHERE id={ph} AND trade_status IN ('OPEN','TP1_HIT')"; params=(new_status,exit_price,realized_r,slippage,trade_id)
+            if exit_price is None: exit_price=tp2 if new_status=='TP2_HIT' else sl
+            final_r=_calculate_realized_r(signal_type,entry,sl,exit_price)
+            if final_r is None: return False
+            outcome=1 if new_status=='TP2_HIT' else 0
+            if new_status=='TP2_HIT': sql=f"UPDATE trades SET trade_status={ph},tp2_hit_at={ph},tp1_hit_at=COALESCE(tp1_hit_at,{ph}),exit_price={ph},realized_r={ph},slippage=NULL,outcome={ph} WHERE id={ph} AND trade_status IN ('OPEN','TP1_HIT') AND outcome IS NULL"; params=(new_status,now,now,exit_price,final_r,outcome,trade_id)
+            else: sql=f"UPDATE trades SET trade_status={ph},sl_hit_at={ph},exit_price={ph},realized_r={ph},slippage=NULL,outcome={ph} WHERE id={ph} AND trade_status IN ('OPEN','TP1_HIT') AND outcome IS NULL"; params=(new_status,now,exit_price,final_r,outcome,trade_id)
         cur.execute(sql,params); changed=cur.rowcount==1; conn.commit()
     except Exception as e:
         try: conn.rollback()
         except Exception: pass
         system_monitor.record_error('TRADE_STATE',e); return False
     finally: release_db_connection(conn)
-    if changed and new_status in {'SL_HIT','TP2_HIT'}:
+    if changed and final_status:
         payload=_build_trade_learning_payload(trade_id,new_status)
-        if payload:
-            enqueue_learning_event('TRADE_OUTCOME',f'trade_outcome:{trade_id}:{new_status}',payload,priority=1 if new_status=='SL_HIT' else 3)
+        if payload: enqueue_learning_event('TRADE_OUTCOME',f'trade_outcome:{trade_id}',payload,priority=1 if new_status=='SL_HIT' else 3)
     return changed
+
 
 def _build_trade_learning_payload(trade_id, outcome_status):
     conn = get_db_connection()
@@ -1109,42 +1129,18 @@ learning_manager=LearningQueueManager(MAX_LEARNING_QUEUE)
 LEARNING_STOP_EVENT=threading.Event()
 
 def monitor_open_trades():
-    conn = get_db_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, signal_type, entry_price, sl, tp1, tp2, trade_status FROM trades WHERE outcome IS NULL AND trade_status IN ('OPEN','TP1_HIT')")
-        rows = cursor.fetchall()
-    except Exception as e:
-        print(f"⚠️ تعذر تحميل الصفقات المفتوحة: {e}")
-        rows = []
-    finally:
-        release_db_connection(conn)
-    price = get_market_data().get('gold', 0.0)
-    if price <= 0:
-        return
-    for row in rows:
-        trade_id, sig_type, entry, sl, tp1, tp2, status = row
+    conn=get_db_connection()
+    try: cur=conn.cursor(); cur.execute("SELECT id,signal_type,entry_price,sl,tp1,tp2,trade_status FROM trades WHERE outcome IS NULL AND trade_status IN ('OPEN','TP1_HIT')"); rows=cur.fetchall()
+    except Exception as e: print(f"⚠️ تعذر تحميل الصفقات المفتوحة: {e}"); rows=[]
+    finally: release_db_connection(conn)
+    price=get_market_data().get('gold',0.0)
+    if price<=0: return
+    for trade_id,sig_type,entry,sl,tp1,tp2,status in rows:
         try:
-            entry, sl, tp1, tp2 = map(float, (entry, sl, tp1, tp2))
-            is_buy = 'BUY' in str(sig_type) or 'شراء' in str(sig_type)
-            if is_buy:
-                risk = max(abs(entry-sl), 1e-9)
-                if price >= tp2:
-                    update_trade_state(trade_id, 'TP2_HIT', tp2, (tp2-entry)/risk, price-entry)
-                elif status == 'OPEN' and price >= tp1:
-                    update_trade_state(trade_id, 'TP1_HIT', tp1, (tp1-entry)/risk, price-entry)
-                elif price <= sl:
-                    update_trade_state(trade_id, 'SL_HIT', sl, (sl-entry)/risk, price-entry)
-            else:
-                risk = max(abs(sl-entry), 1e-9)
-                if price <= tp2:
-                    update_trade_state(trade_id, 'TP2_HIT', tp2, (entry-tp2)/risk, entry-price)
-                elif status == 'OPEN' and price <= tp1:
-                    update_trade_state(trade_id, 'TP1_HIT', tp1, (entry-tp1)/risk, entry-price)
-                elif price >= sl:
-                    update_trade_state(trade_id, 'SL_HIT', sl, (entry-sl)/risk, entry-price)
-        except Exception as e:
-            print(f"⚠️ خطأ في مراقبة الصفقة {trade_id}: {e}")
+            for event_status,event_price in evaluate_trade_lifecycle(sig_type,status,entry,sl,tp1,tp2,price=price):
+                if update_trade_state(trade_id,event_status,event_price) and event_status in {'TP2_HIT','SL_HIT'}: break
+        except Exception as e: print(f"⚠️ خطأ في دورة حياة الصفقة {trade_id}: {e}")
+
 
 # ------------------------------------
 # 🧠 محرك ذكاء GEMINI لتفريغ أسباب الخسارة وتدقيق الفرص اللحظية
@@ -1207,97 +1203,30 @@ def gemini_verify_signal(signal_data, market_summary):
         return {"approved": True, "reason": "اعتماد كمي تلقائي (خدمة الذكاء الاصطناعي غير متاحة مؤقتاً)"}
 
 def update_open_trades_outcome_historical(df_m15):
-    conn = get_db_connection()
-    resolved_ids = []
-    try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, timestamp, signal_type, sl, tp1 FROM trades WHERE outcome IS NULL")
-        open_trades = cursor.fetchall()
+    if df_m15 is None or df_m15.empty: return
+    conn=get_db_connection()
+    try: cur=conn.cursor(); cur.execute("SELECT id,timestamp,signal_type,entry_price,sl,tp1,tp2,trade_status FROM trades WHERE outcome IS NULL AND trade_status IN ('OPEN','TP1_HIT')"); open_trades=cur.fetchall()
+    except Exception as e: print(f"خطأ تحميل الصفقات المفتوحة للتقييم التاريخي: {e}"); open_trades=[]
+    finally: release_db_connection(conn)
+    df_clean=clean_df_columns(df_m15.copy())
+    if df_clean.empty: return
+    if not isinstance(df_clean.index,pd.DatetimeIndex): df_clean.index=pd.to_datetime(df_clean.index,utc=True)
+    elif df_clean.index.tz is None: df_clean.index=df_clean.index.tz_localize(timezone.utc)
+    else: df_clean.index=df_clean.index.tz_convert(timezone.utc)
+    df_clean=df_clean[~df_clean.index.duplicated(keep='first')].sort_index()
+    for trade_id,trade_time_str,sig_type,entry,sl,tp1,tp2,status in open_trades:
+        try:
+            if isinstance(trade_time_str,datetime): trade_time=trade_time_str if trade_time_str.tzinfo else trade_time_str.replace(tzinfo=timezone.utc)
+            else: trade_time=datetime.strptime(str(trade_time_str)[:19],'%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+            current_status=status if status in {'OPEN','TP1_HIT'} else 'OPEN'
+            for _,bar in df_clean[df_clean.index>=trade_time].iterrows():
+                events=evaluate_trade_lifecycle(sig_type,current_status,entry,sl,tp1,tp2,bar_open=float(bar['Open']),bar_high=float(bar['High']),bar_low=float(bar['Low']))
+                for event_status,event_price in events:
+                    if update_trade_state(trade_id,event_status,event_price): current_status=event_status
+                    if event_status in {'TP2_HIT','SL_HIT'}: break
+                if current_status in {'TP2_HIT','SL_HIT'}: break
+        except Exception as e: print(f"خطأ في تقييم lifecycle التاريخي للصفقة {trade_id}: {e}")
 
-        if not open_trades:
-            return
-
-        spot_data = get_market_data()
-        live_price = spot_data.get("gold", 0.0) if spot_data else 0.0
-
-        df_clean = clean_df_columns(df_m15.copy()) if df_m15 is not None and not df_m15.empty else pd.DataFrame()
-        if not df_clean.empty:
-            df_index = df_clean.index
-            if df_index.tz is None:
-                df_index = df_index.tz_localize(timezone.utc)
-            else:
-                df_index = df_index.tz_convert(timezone.utc)
-
-        ph = "%s" if is_postgres() and isinstance(conn, psycopg2.extensions.connection) else "?"
-
-        for trade_id, trade_time_str, sig_type, sl, tp1 in open_trades:
-            try:
-                outcome = None
-
-                if live_price > 1000:
-                    if "BUY" in sig_type or "شراء" in sig_type:
-                        if live_price >= tp1:
-                            outcome = 1
-                        elif live_price <= sl:
-                            outcome = 0
-                    elif "SELL" in sig_type or "بيع" in sig_type:
-                        if live_price <= tp1:
-                            outcome = 1
-                        elif live_price <= sl:
-                            outcome = 0
-
-                if outcome is None and not df_clean.empty:
-                    if isinstance(trade_time_str, datetime):
-                        trade_time = trade_time_str if trade_time_str.tzinfo else trade_time_str.replace(tzinfo=timezone.utc)
-                    else:
-                        trade_time = datetime.strptime(str(trade_time_str)[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                        
-                    sub_df = df_clean[df_index >= trade_time]
-                    if not sub_df.empty:
-                        for idx, row in sub_df.iterrows():
-                            open_val = float(row['Open'])
-                            high_val = float(row['High'])
-                            low_val = float(row['Low'])
-
-                            if "BUY" in sig_type or "شراء" in sig_type:
-                                if low_val <= sl and high_val >= tp1:
-                                    outcome = 0 if abs(open_val - sl) < abs(open_val - tp1) else 1
-                                    break
-                                elif low_val <= sl:
-                                    outcome = 0
-                                    break
-                                elif high_val >= tp1:
-                                    outcome = 1
-                                    break
-
-                            elif "SELL" in sig_type or "بيع" in sig_type:
-                                if high_val >= sl and low_val <= tp1:
-                                    outcome = 0 if abs(open_val - sl) < abs(open_val - tp1) else 1
-                                    break
-                                elif high_val >= sl:
-                                    outcome = 0
-                                    break
-                                elif low_val <= tp1:
-                                    outcome = 1
-                                    break
-
-                if outcome is not None:
-                    cursor.execute(f"UPDATE trades SET outcome = {outcome} WHERE id = {ph}", (trade_id,))
-                    resolved_ids.append((trade_id, outcome))
-                    print(f"🎯 [تحديث الصفقة] الصفقة رقم {trade_id} تم حسمها بالنتيجة: {'ربح ✅' if outcome == 1 else 'خسارة ❌'}")
-            except Exception as e:
-                print(f"خطأ في تقييم تتبع الصفقة رقم {trade_id}: {e}")
-
-        conn.commit()
-    except Exception as e:
-        print(f"خطأ تحديث نتائج الصفقات: {e}")
-    finally:
-        release_db_connection(conn)
-    for trade_id, outcome in resolved_ids:
-        status_for_learning='SL_HIT' if outcome==0 else 'TP2_HIT'
-        payload=_build_trade_learning_payload(trade_id,status_for_learning)
-        if payload:
-            enqueue_learning_event('TRADE_OUTCOME',f'trade_outcome:{trade_id}:{status_for_learning}',payload,priority=1 if outcome==0 else 3)
 
 def build_historic_market_features():
     cache = get_chart_data_cached()
@@ -2016,6 +1945,10 @@ def generate_quant_signal():
         else:
             sl = round(current_price + atr*1.25,2); tp1 = round(current_price - atr*1.6,2); tp2 = round(current_price - atr*2.8,2)
             smc_note = 'تأكيد هابط من السيولة/FVG' if reasons_bear else 'تأكيد من الزخم والاتجاه'
+
+        is_valid, validation_reason = validate_trade_levels(signal_type, current_price, sl, tp1, tp2)
+        if not is_valid:
+            return {'status':'WAIT','reason':f'مستويات Entry/SL/TP غير صالحة: {validation_reason}','price':current_price}
 
         candle_timestamp = pd.Timestamp(df.index[-1]).isoformat()
         candle_id = f"XAUUSD_M15_{pd.Timestamp(df.index[-1]).strftime('%Y%m%d_%H%M')}"
