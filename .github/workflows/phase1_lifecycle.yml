@@ -19,49 +19,40 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          import ast
-          import textwrap
-          import math
+          import ast, textwrap, math
 
-          p = Path('bot.py')
-          text = p.read_text(encoding='utf-8')
-          original = text
+          p=Path('bot.py'); text=p.read_text(encoding='utf-8'); original=text
+          def replace_def(src,name,replacement):
+              tree=ast.parse(src); node=next(n for n in tree.body if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name==name); lines=src.splitlines(True)
+              return ''.join(lines[:node.lineno-1]+[textwrap.dedent(replacement).strip()+'\n\n']+lines[node.end_lineno:])
 
-          def replace_def(src, name, replacement):
-              tree = ast.parse(src)
-              node = next(n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name)
-              lines = src.splitlines(True)
-              return ''.join(lines[:node.lineno-1] + [textwrap.dedent(replacement).strip()+'\n\n'] + lines[node.end_lineno:])
-
-          helpers = '''
+          helpers='''
           def _trade_direction(signal_type):
-              raw = str(signal_type or '').upper()
+              raw=str(signal_type or '').upper()
               if 'BUY' in raw or 'شراء' in raw: return 'BUY'
               if 'SELL' in raw or 'بيع' in raw: return 'SELL'
               return None
 
-          def validate_trade_levels(signal_type, entry, sl, tp1, tp2):
-              direction = _trade_direction(signal_type)
-              try: entry_f, sl_f, tp1_f, tp2_f = [float(v) for v in (entry, sl, tp1, tp2)]
-              except (TypeError, ValueError): return False, 'Entry/SL/TP must be numeric.'
-              if not all(np.isfinite(v) and v > 0 for v in (entry_f, sl_f, tp1_f, tp2_f)):
-                  return False, 'Entry/SL/TP must be finite positive prices.'
-              valid = (sl_f < entry_f < tp1_f < tp2_f) if direction == 'BUY' else ((tp2_f < tp1_f < entry_f < sl_f) if direction == 'SELL' else False)
-              return (True, 'OK') if valid else (False, 'Invalid BUY/SELL price ordering for Entry/SL/TP.')
+          def validate_trade_levels(signal_type,entry,sl,tp1,tp2):
+              direction=_trade_direction(signal_type)
+              try: entry_f,sl_f,tp1_f,tp2_f=[float(v) for v in (entry,sl,tp1,tp2)]
+              except (TypeError,ValueError): return False,'Entry/SL/TP must be numeric.'
+              if not all(np.isfinite(v) and v>0 for v in (entry_f,sl_f,tp1_f,tp2_f)): return False,'Entry/SL/TP must be finite positive prices.'
+              valid=(sl_f<entry_f<tp1_f<tp2_f) if direction=='BUY' else ((tp2_f<tp1_f<entry_f<sl_f) if direction=='SELL' else False)
+              return (True,'OK') if valid else (False,'Invalid BUY/SELL price ordering for Entry/SL/TP.')
 
-          def _calculate_realized_r(signal_type, entry, sl, exit_price):
-              direction = _trade_direction(signal_type); risk = abs(float(entry)-float(sl)); exit_f = float(exit_price)
-              if direction not in {'BUY','SELL'} or risk <= 0 or not np.isfinite(exit_f): return None
-              return (exit_f-float(entry))/risk if direction == 'BUY' else (float(entry)-exit_f)/risk
+          def _calculate_realized_r(signal_type,entry,sl,exit_price):
+              direction=_trade_direction(signal_type); risk=abs(float(entry)-float(sl)); exit_f=float(exit_price)
+              if direction not in {'BUY','SELL'} or risk<=0 or not np.isfinite(exit_f): return None
+              return (exit_f-float(entry))/risk if direction=='BUY' else (float(entry)-exit_f)/risk
 
-          def evaluate_trade_lifecycle(signal_type, status, entry, sl, tp1, tp2, *, price=None, bar_open=None, bar_high=None, bar_low=None):
-              direction = _trade_direction(signal_type)
-              valid, reason = validate_trade_levels(signal_type, entry, sl, tp1, tp2)
+          def evaluate_trade_lifecycle(signal_type,status,entry,sl,tp1,tp2,*,price=None,bar_open=None,bar_high=None,bar_low=None):
+              direction=_trade_direction(signal_type); valid,reason=validate_trade_levels(signal_type,entry,sl,tp1,tp2)
               if not valid: raise ValueError(reason)
-              status = str(status or 'OPEN').upper(); events = []
+              status=str(status or 'OPEN').upper(); events=[]
               if price is not None:
-                  price=float(price); milestone = status=='OPEN' and (price>=tp1 if direction=='BUY' else price<=tp1)
-                  final = 'TP2_HIT' if ((direction=='BUY' and price>=tp2) or (direction=='SELL' and price<=tp2)) else ('SL_HIT' if ((direction=='BUY' and price<=sl) or (direction=='SELL' and price>=sl)) else None)
+                  price=float(price); milestone=status=='OPEN' and (price>=tp1 if direction=='BUY' else price<=tp1)
+                  final='TP2_HIT' if ((direction=='BUY' and price>=tp2) or (direction=='SELL' and price<=tp2)) else ('SL_HIT' if ((direction=='BUY' and price<=sl) or (direction=='SELL' and price>=sl)) else None)
                   if milestone: events.append(('TP1_HIT',float(tp1)))
                   if final: events.append((final,price))
                   return events
@@ -77,16 +68,14 @@ jobs:
               if final: events.append((final,float(final_price)))
               return events
           '''
-          marker='def log_trade('
-          idx=text.find(marker)
+          marker='def log_trade('; idx=text.find(marker)
           if idx<0: raise RuntimeError('log_trade marker not found')
           if 'def _trade_direction(' not in text: text=text[:idx]+textwrap.dedent(helpers).strip()+'\n\n'+text[idx:]
 
-          new_log = '''
-          def log_trade(signal_type, entry, sl, tp1, tp2, rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio, confidence, candle_id=None, signal_score=None, ai_score=None):
-              ok, reason = validate_trade_levels(signal_type, entry, sl, tp1, tp2)
-              if not ok:
-                  logger.warning('[TRADE_VALIDATION] %s', reason); return False, None
+          new_log='''
+          def log_trade(signal_type,entry,sl,tp1,tp2,rsi,dxy_corr,macd_diff,stoch_k,volatility_ratio,confidence,candle_id=None,signal_score=None,ai_score=None):
+              ok,reason=validate_trade_levels(signal_type,entry,sl,tp1,tp2)
+              if not ok: logger.warning('[TRADE_VALIDATION] %s',reason); return False,None
               conn=get_db_connection()
               try:
                   cur=conn.cursor(); f_entry,f_sl,f_tp1,f_tp2=map(float,(entry,sl,tp1,tp2)); f_rsi,f_dxy,f_macd,f_stoch,f_vol,f_conf=map(float,(rsi,dxy_corr,macd_diff,stoch_k,volatility_ratio,confidence)); candle_id=candle_id or datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S'); now=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'); is_pg=is_postgres() and isinstance(conn,psycopg2.extensions.connection); params=(now,signal_type,f_entry,f_sl,f_tp1,f_tp2,f_rsi,f_dxy,f_macd,f_stoch,f_vol,f_conf,candle_id,FEATURE_VERSION,STRATEGY_VERSION,MODEL_VERSION,signal_score,ai_score)
@@ -103,7 +92,7 @@ jobs:
           '''
           text=replace_def(text,'log_trade',new_log)
 
-          new_update = '''
+          new_update='''
           def update_trade_state(trade_id,new_status,exit_price=None,realized_r=None,slippage=None):
               if new_status not in {'TP1_HIT','TP2_HIT','SL_HIT'}: return False
               conn=get_db_connection(); changed=False; final_status=new_status in {'TP2_HIT','SL_HIT'}
@@ -138,8 +127,7 @@ jobs:
           new_monitor='''
           def monitor_open_trades():
               conn=get_db_connection()
-              try:
-                  cur=conn.cursor(); cur.execute("SELECT id,signal_type,entry_price,sl,tp1,tp2,trade_status FROM trades WHERE outcome IS NULL AND trade_status IN ('OPEN','TP1_HIT')"); rows=cur.fetchall()
+              try: cur=conn.cursor(); cur.execute("SELECT id,signal_type,entry_price,sl,tp1,tp2,trade_status FROM trades WHERE outcome IS NULL AND trade_status IN ('OPEN','TP1_HIT')"); rows=cur.fetchall()
               except Exception as e: print(f"⚠️ تعذر تحميل الصفقات المفتوحة: {e}"); rows=[]
               finally: release_db_connection(conn)
               price=get_market_data().get('gold',0.0)
@@ -156,8 +144,7 @@ jobs:
           def update_open_trades_outcome_historical(df_m15):
               if df_m15 is None or df_m15.empty: return
               conn=get_db_connection()
-              try:
-                  cur=conn.cursor(); cur.execute("SELECT id,timestamp,signal_type,entry_price,sl,tp1,tp2,trade_status FROM trades WHERE outcome IS NULL AND trade_status IN ('OPEN','TP1_HIT')"); open_trades=cur.fetchall()
+              try: cur=conn.cursor(); cur.execute("SELECT id,timestamp,signal_type,entry_price,sl,tp1,tp2,trade_status FROM trades WHERE outcome IS NULL AND trade_status IN ('OPEN','TP1_HIT')"); open_trades=cur.fetchall()
               except Exception as e: print(f"خطأ تحميل الصفقات المفتوحة للتقييم التاريخي: {e}"); open_trades=[]
               finally: release_db_connection(conn)
               df_clean=clean_df_columns(df_m15.copy())
@@ -186,12 +173,11 @@ jobs:
               text=text.replace(target,"        is_valid, validation_reason = validate_trade_levels(signal_type, current_price, sl, tp1, tp2)\n        if not is_valid:\n            return {'status':'WAIT','reason':f'مستويات Entry/SL/TP غير صالحة: {validation_reason}','price':current_price}\n\n"+target,1)
 
           ast.parse(text)
-          class FakeNP:
-              isfinite = staticmethod(math.isfinite)
+          class FakeNP: isfinite=staticmethod(math.isfinite)
           tree=ast.parse(text); wanted={'_trade_direction','validate_trade_levels','_calculate_realized_r','evaluate_trade_lifecycle'}; nodes=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in wanted]; ns={'np':FakeNP}; exec(compile(ast.Module(body=nodes,type_ignores=[]),'bot.py','exec'),ns)
           validate=ns['validate_trade_levels']; calc_r=ns['_calculate_realized_r']; evaluate=ns['evaluate_trade_lifecycle']
-          assert validate('BUY',100,95,108,110)[0] and not validate('BUY',105,100,108,110)[0]
-          assert validate('SELL',100,105,92,90)[0] and not validate('SELL',95,100,92,90)[0]
+          assert validate('BUY',100,95,108,110)[0]; assert not validate('BUY',100,105,108,110)[0]
+          assert validate('SELL',100,105,92,90)[0]; assert not validate('SELL',100,95,92,97)[0]
           assert evaluate('BUY','OPEN',100,95,108,110,price=109)==[('TP1_HIT',108.0)]
           assert evaluate('BUY','TP1_HIT',100,95,108,110,price=111)==[('TP2_HIT',111.0)]
           assert evaluate('BUY','OPEN',100,95,108,110,price=94)==[('SL_HIT',94.0)]
@@ -200,7 +186,7 @@ jobs:
           assert evaluate('SELL','OPEN',100,105,92,90,price=106)==[('SL_HIT',106.0)]
           assert calc_r('BUY',100,95,110)==2.0 and calc_r('BUY',100,95,95)==-1.0
           assert calc_r('SELL',100,105,90)==2.0 and calc_r('SELL',100,105,105)==-1.0
-          assert text != original
+          assert text!=original
           p.write_text(text,encoding='utf-8')
           print('Phase 1 lifecycle tests passed.')
           PY
