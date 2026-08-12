@@ -287,7 +287,7 @@ def create_managed_task(coro):
     return task
 
 GLOBAL_CACHE = {
-    "market_data": {"gold": 0.0, "dxy": 99.85, "us10y": 4.63},
+    "market_data": {"gold": 0.0, "dxy": None, "us10y": None},
     "analysis": None,
     "last_updated": None
 }
@@ -328,9 +328,9 @@ PRICE_FEED_STALE_SECONDS = int(os.getenv('PRICE_FEED_STALE_SECONDS', '90'))
 PRICE_FEED_MIN_REQUEST_INTERVAL = 60.0
 PRICE_FEED_LOCK = threading.Lock()
 CANONICAL_XAUUSD_FEED_CACHE = {'feed': None, 'last_request_monotonic': 0.0}
-YAHOO_LIVE_COOLDOWN_SECONDS = int(os.getenv('YAHOO_LIVE_COOLDOWN_SECONDS', '900'))
-YAHOO_HISTORICAL_COOLDOWN_SECONDS = int(os.getenv('YAHOO_HISTORICAL_COOLDOWN_SECONDS', '1800'))
-YAHOO_HISTORICAL_FETCH_INTERVAL_SECONDS = int(os.getenv('YAHOO_HISTORICAL_FETCH_INTERVAL_SECONDS', '900'))
+YAHOO_LIVE_COOLDOWN_SECONDS = int(os.getenv('YAHOO_LIVE_COOLDOWN_SECONDS', '15'))
+YAHOO_HISTORICAL_COOLDOWN_SECONDS = int(os.getenv('YAHOO_HISTORICAL_COOLDOWN_SECONDS', '30'))
+YAHOO_HISTORICAL_FETCH_INTERVAL_SECONDS = int(os.getenv('YAHOO_HISTORICAL_FETCH_INTERVAL_SECONDS', '300'))
 YAHOO_LIVE_FEED_STATE = {'blocked_until': 0.0, 'error_type': None, 'error_message': None}
 YAHOO_HISTORICAL_FEED_STATE = {'blocked_until': 0.0, 'error_type': None, 'error_message': None}
 YAHOO_LIVE_STATE_LOCK = threading.Lock()
@@ -1712,30 +1712,41 @@ def _yahoo_live_cooldown_active():
     with YAHOO_LIVE_STATE_LOCK:
         return time.monotonic()<float(YAHOO_LIVE_FEED_STATE.get('blocked_until',0.0) or 0.0)
 
-def http_get_yahoo(url, timeout=6):
-    """Yahoo JSON fetch with browser impersonation and host fallback."""
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept': 'application/json,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Origin': 'https://finance.yahoo.com',
-        'Referer': 'https://finance.yahoo.com/',
-    }
-    for host in ('query1.finance.yahoo.com', 'query2.finance.yahoo.com'):
-        target = re.sub(r'https://query[12]\\.finance\\.yahoo\\.com', f'https://{host}', url, count=1)
+def http_get_yahoo(url, timeout=8):
+    """Yahoo JSON fetch with clean Chrome impersonation and structured diagnostics."""
+    for host in ('query1.finance.yahoo.com','query2.finance.yahoo.com'):
+        target=url.replace('query1.finance.yahoo.com',host).replace('query2.finance.yahoo.com',host)
         if HAS_CURL_CFFI:
             try:
-                response = curl_requests.get(target, headers=headers, impersonate='chrome124', timeout=timeout)
-                if response.status_code == 200:
-                    return response.json()
-            except Exception:
-                pass
+                r=curl_requests.get(target, impersonate='chrome124', timeout=timeout, verify=True)
+                status=int(getattr(r,'status_code',0) or 0)
+                if status==200:
+                    try:
+                        data=r.json()
+                        if isinstance(data,dict) and (data.get('chart') or {}).get('result'):
+                            return data
+                        logger.warning('[YAHOO_HTTP] host=%s transport=curl_cffi status=200 error=missing_chart_result',host)
+                    except Exception as exc:
+                        logger.warning('[YAHOO_HTTP] host=%s transport=curl_cffi status=200 error=invalid_json message=%s',host,str(exc)[:200])
+                else:
+                    logger.warning('[YAHOO_HTTP] host=%s transport=curl_cffi status=%s message=%s',host,status,str(getattr(r,'text','') or '')[:200])
+            except Exception as exc:
+                logger.warning('[YAHOO_HTTP] host=%s transport=curl_cffi error_type=%s message=%s',host,type(exc).__name__,str(exc)[:250])
         try:
-            response = requests.get(target, headers=headers, timeout=timeout)
-            if response.status_code == 200:
-                return response.json()
-        except Exception:
-            pass
+            r=requests.get(target,headers={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36','Accept':'application/json'},timeout=timeout)
+            status=int(getattr(r,'status_code',0) or 0)
+            if status==200:
+                try:
+                    data=r.json()
+                    if isinstance(data,dict) and (data.get('chart') or {}).get('result'):
+                        return data
+                    logger.warning('[YAHOO_HTTP] host=%s transport=requests status=200 error=missing_chart_result',host)
+                except Exception as exc:
+                    logger.warning('[YAHOO_HTTP] host=%s transport=requests status=200 error=invalid_json message=%s',host,str(exc)[:200])
+            else:
+                logger.warning('[YAHOO_HTTP] host=%s transport=requests status=%s message=%s',host,status,str(getattr(r,'text','') or '')[:200])
+        except Exception as exc:
+            logger.warning('[YAHOO_HTTP] host=%s transport=requests error_type=%s message=%s',host,type(exc).__name__,str(exc)[:250])
     return None
 
 def fetch_yahoo_direct(symbol, range_str='10d', interval_str='15m'):
@@ -1811,7 +1822,7 @@ def fetch_canonical_xauusd_feed():
         msg = feed.get('error_message') or 'Yahoo XAUUSD=X live payload did not contain a valid quote.'
         _set_yahoo_live_cooldown(feed.get('error_type') or 'invalid_data', msg)
         CANONICAL_XAUUSD_FEED_CACHE['feed'] = feed
-        _log_yahoo_live_failure(feed.get('error_type'), code, msg)
+        _log_yahoo_live_failure(feed.get('error_type') or 'invalid_data', None, msg)
         return feed
     with YAHOO_LIVE_STATE_LOCK:
         YAHOO_LIVE_FEED_STATE['blocked_until'] = 0.0
@@ -1844,8 +1855,8 @@ def get_market_data():
     spot = feed.get('mid') if feed.get('status') == 'ACTIVE' else 0.0
     return {
         'gold': round(float(spot), 2) if spot else 0.0,
-        'dxy': 99.85,
-        'us10y': 4.63,
+        'dxy': snapshot.get('dxy'),
+        'us10y': snapshot.get('us10y'),
         'price_feed': feed,
     }
 
@@ -1950,8 +1961,8 @@ def analyze_institutional_engine():
         close_h1 = to_1d_series(df_gold_h1['Close'])
         close_gold_m15 = to_1d_series(df_gold_m15['Close'])
         
-        close_dxy_m15 = to_1d_series(df_dxy_m15['Close']) if not df_dxy_m15.empty else pd.Series(99.85, index=df_gold_m15.index)
-        close_us10y_m15 = to_1d_series(df_us10y_m15['Close']) if not df_us10y_m15.empty else pd.Series(4.63, index=df_gold_m15.index)
+        close_dxy_m15 = to_1d_series(df_dxy_m15['Close']) if not df_dxy_m15.empty else None
+        close_us10y_m15 = to_1d_series(df_us10y_m15['Close']) if not df_us10y_m15.empty else None
 
         ema200 = ta.trend.EMAIndicator(close_h1, window=200).ema_indicator().dropna()
         ema500 = ta.trend.EMAIndicator(close_h1, window=500).ema_indicator().dropna()
@@ -1963,12 +1974,12 @@ def analyze_institutional_engine():
 
         returns_gold = np.log(close_gold_m15 / close_gold_m15.shift(1))
         
-        returns_dxy_aligned = np.log(close_dxy_m15 / close_dxy_m15.shift(1)).reindex(index=returns_gold.index).ffill().fillna(0)
+        returns_dxy_aligned = np.log(close_dxy_m15 / close_dxy_m15.shift(1)).reindex(index=returns_gold.index).ffill() if close_dxy_m15 is not None else pd.Series(np.nan, index=returns_gold.index)
         
-        aligned_returns = pd.DataFrame({'Gold': returns_gold, 'DXY': returns_dxy_aligned}).dropna()
+        aligned_returns = pd.DataFrame({'Gold': returns_gold, 'DXY': returns_dxy_aligned}).dropna() if close_dxy_m15 is not None else pd.DataFrame({'Gold': returns_gold}).dropna()
 
         rolling_corr = aligned_returns['Gold'].rolling(window=20).corr(aligned_returns['DXY']).dropna()
-        dxy_corr = round(float(rolling_corr.iloc[-1]), 2) if not rolling_corr.empty else 0.0
+        dxy_corr = round(float(rolling_corr.iloc[-1]), 2) if close_dxy_m15 is not None and not rolling_corr.empty else 0.0
 
         volatility = aligned_returns['Gold'].rolling(window=10).std().fillna(0)
         features = pd.DataFrame({'Returns': aligned_returns['Gold'], 'Volatility': volatility}).dropna()
@@ -2013,7 +2024,7 @@ def analyze_institutional_engine():
             "price_feed": price_feed,
             "df_m15": df_gold_m15,
             "dxy_corr": dxy_corr,
-            "us10y_trend": "DOWN" if (len(close_us10y_m15) >= 5 and close_us10y_m15.iloc[-1] < close_us10y_m15.iloc[-5]) else "UP",
+            "us10y_trend": ("DOWN" if (close_us10y_m15 is not None and len(close_us10y_m15) >= 5 and close_us10y_m15.iloc[-1] < close_us10y_m15.iloc[-5]) else ("UP" if close_us10y_m15 is not None and len(close_us10y_m15) >= 5 else "UNKNOWN")),
             "smc": smc
         }
 
