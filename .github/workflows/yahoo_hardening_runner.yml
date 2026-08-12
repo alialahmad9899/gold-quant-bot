@@ -1,0 +1,45 @@
+name: yahoo-hardening-runner
+on:
+  push:
+    branches:
+      - main
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply patch
+        run: python3 scripts/apply_yahoo_hardening.py
+      - name: Verify
+        run: |
+          python3 -m py_compile bot.py
+          git diff --check
+          python3 - <<'PY'
+          from pathlib import Path
+          import ast, re
+          t=Path('bot.py').read_text(encoding='utf-8')
+          r=Path('requirements.txt').read_text(encoding='utf-8')
+          ast.parse(t)
+          assert 'import yfinance as yf' not in t
+          assert re.search(r'^\s*yfinance\s*$', r, re.M) is None
+          assert "YAHOO_LIVE_COOLDOWN_SECONDS = int(os.getenv('YAHOO_LIVE_COOLDOWN_SECONDS', '60'))" in t
+          assert "YAHOO_HISTORICAL_COOLDOWN_SECONDS = int(os.getenv('YAHOO_HISTORICAL_COOLDOWN_SECONDS', '300'))" in t
+          assert 'YAHOO_LIVE_REQUEST_LOCK = threading.Lock()' in t
+          assert 'YAHOO_HISTORICAL_REQUEST_LOCK = threading.Lock()' in t
+          assert 'YAHOO_HTTP_DIAGNOSTIC' in t
+          assert 'XAUUSD=X?interval=1m&range=1d' in t
+          assert 'GC=F' not in t and 'PAXGUSDT' not in t and 'ifcmarkets' not in t.lower()
+          print('YAHOO_HARDENING_VERIFY_OK')
+          PY
+      - name: Commit production changes
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add bot.py requirements.txt
+          git commit -m "fix: centralize Yahoo access and stop rate-limit retries"
+          git push origin main
+      - name: Cleanup temporary files
+        run: |
+          git rm -f scripts/apply_yahoo_hardening.py .github/workflows/yahoo_hardening_runner.yml
+          git commit -m "chore: remove temporary Yahoo hardening runner"
+          git push origin main
