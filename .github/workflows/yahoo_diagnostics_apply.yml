@@ -1,0 +1,236 @@
+name: yahoo-diagnostics-apply
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Patch Yahoo diagnostics and cold-cache handling
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import ast
+          import re
+          import textwrap
+
+          path = Path('bot.py')
+          text = path.read_text(encoding='utf-8')
+          original = text
+
+          replacements = {
+              "YAHOO_LIVE_COOLDOWN_SECONDS = int(os.getenv('YAHOO_LIVE_COOLDOWN_SECONDS', '900'))": "YAHOO_LIVE_COOLDOWN_SECONDS = int(os.getenv('YAHOO_LIVE_COOLDOWN_SECONDS', '15'))",
+              "YAHOO_HISTORICAL_COOLDOWN_SECONDS = int(os.getenv('YAHOO_HISTORICAL_COOLDOWN_SECONDS', '1800'))": "YAHOO_HISTORICAL_COOLDOWN_SECONDS = int(os.getenv('YAHOO_HISTORICAL_COOLDOWN_SECONDS', '30'))",
+              "YAHOO_HISTORICAL_FETCH_INTERVAL_SECONDS = int(os.getenv('YAHOO_HISTORICAL_FETCH_INTERVAL_SECONDS', '900'))": "YAHOO_HISTORICAL_FETCH_INTERVAL_SECONDS = int(os.getenv('YAHOO_HISTORICAL_FETCH_INTERVAL_SECONDS', '300'))",
+              '"market_data": {"gold": 0.0, "dxy": 99.85, "us10y": 4.63}': '"market_data": {"gold": 0.0, "dxy": None, "us10y": None}',
+              'return feed.get(\'mid\') if feed.get(\'status\') == \'ACTIVE\' and feed.get(\'mid\') else 0.0': 'return float(feed.get(\'mid\')) if feed.get(\'status\') == \'ACTIVE\' and feed.get(\'mid\') else 0.0',
+              "_log_yahoo_live_failure(feed.get('error_type') or 'invalid_data', code, msg)": "_log_yahoo_live_failure(feed.get('error_type') or 'invalid_data', None, msg)",
+          }
+          for old, new in replacements.items():
+              if old not in text:
+                  raise SystemExit(f'missing anchor: {old}')
+              text = text.replace(old, new, 1)
+
+          old_http = '''def http_get_yahoo(url, timeout=6):
+    """Yahoo JSON fetch with browser impersonation and host fallback."""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'application/json,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Origin': 'https://finance.yahoo.com',
+        'Referer': 'https://finance.yahoo.com/',
+    }
+    for host in ('query1.finance.yahoo.com', 'query2.finance.yahoo.com'):
+        target = re.sub(r'https://query[12]\\.finance\\.yahoo\\.com', f'https://{host}', url, count=1)
+        if HAS_CURL_CFFI:
+            try:
+                response = curl_requests.get(target, headers=headers, impersonate='chrome124', timeout=timeout)
+                if response.status_code == 200:
+                    return response.json()
+            except Exception:
+                pass
+        try:
+            response = requests.get(target, headers=headers, timeout=timeout)
+            if response.status_code == 200:
+                return response.json()
+        except Exception:
+            pass
+    return None
+'''
+          new_http = '''def http_get_yahoo(url, timeout=8):
+    """Yahoo JSON fetch with Chrome impersonation, host fallback, and explicit diagnostics."""
+    for host in ('query1.finance.yahoo.com', 'query2.finance.yahoo.com'):
+        target = url.replace('query1.finance.yahoo.com', host).replace('query2.finance.yahoo.com', host)
+
+        if HAS_CURL_CFFI:
+            try:
+                response = curl_requests.get(
+                    target,
+                    impersonate='chrome124',
+                    timeout=timeout,
+                    verify=True,
+                )
+                status = int(getattr(response, 'status_code', 0) or 0)
+                if status == 200:
+                    try:
+                        data = response.json()
+                        if isinstance(data, dict) and (data.get('chart') or {}).get('result'):
+                            logger.debug('[YAHOO_HTTP] host=%s transport=curl_cffi status=200', host)
+                            return data
+                        logger.warning('[YAHOO_HTTP] host=%s transport=curl_cffi status=200 error=missing_chart_result', host)
+                    except Exception as exc:
+                        logger.warning('[YAHOO_HTTP] host=%s transport=curl_cffi status=200 error=invalid_json message=%s', host, str(exc)[:200])
+                else:
+                    logger.warning('[YAHOO_HTTP] host=%s transport=curl_cffi status=%s message=%s', host, status, str(getattr(response, 'text', '') or '')[:200])
+            except Exception as exc:
+                logger.warning('[YAHOO_HTTP] host=%s transport=curl_cffi error_type=%s message=%s', host, type(exc).__name__, str(exc)[:250])
+
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36',
+                'Accept': 'application/json',
+            }
+            response = requests.get(target, headers=headers, timeout=timeout)
+            status = int(getattr(response, 'status_code', 0) or 0)
+            if status == 200:
+                try:
+                    data = response.json()
+                    if isinstance(data, dict) and (data.get('chart') or {}).get('result'):
+                        logger.debug('[YAHOO_HTTP] host=%s transport=requests status=200', host)
+                        return data
+                    logger.warning('[YAHOO_HTTP] host=%s transport=requests status=200 error=missing_chart_result', host)
+                except Exception as exc:
+                    logger.warning('[YAHOO_HTTP] host=%s transport=requests status=200 error=invalid_json message=%s', host, str(exc)[:200])
+            else:
+                logger.warning('[YAHOO_HTTP] host=%s transport=requests status=%s message=%s', host, status, str(getattr(response, 'text', '') or '')[:200])
+        except Exception as exc:
+            logger.warning('[YAHOO_HTTP] host=%s transport=requests error_type=%s message=%s', host, type(exc).__name__, str(exc)[:250])
+
+    return None
+'''
+          if old_http not in text:
+              raise SystemExit('http_get_yahoo anchor not found')
+          text = text.replace(old_http, new_http, 1)
+
+          old_market = '''def get_market_data():
+    feed = fetch_canonical_xauusd_feed()
+    spot = feed.get('mid') if feed.get('status') == 'ACTIVE' else 0.0
+    return {
+        'gold': round(float(spot), 2) if spot else 0.0,
+        'dxy': 99.85,
+        'us10y': 4.63,
+        'price_feed': feed,
+    }
+'''
+          new_market = '''def get_market_data():
+    feed = fetch_canonical_xauusd_feed()
+    spot = feed.get('mid') if feed.get('status') == 'ACTIVE' else 0.0
+    with cache_lock:
+        snapshot = dict(GLOBAL_CACHE.get('market_data') or {})
+    return {
+        'gold': round(float(spot), 2) if spot else 0.0,
+        'dxy': snapshot.get('dxy'),
+        'us10y': snapshot.get('us10y'),
+        'price_feed': feed,
+    }
+'''
+          if old_market not in text:
+              raise SystemExit('get_market_data anchor not found')
+          text = text.replace(old_market, new_market, 1)
+
+          old_home = '''@web_app.route('/')
+def home():
+    now = datetime.now(timezone.utc)
+    with cache_lock:
+        last_market = GLOBAL_CACHE.get("last_updated")
+        gold = GLOBAL_CACHE.get("market_data", {}).get("gold", 0.0)
+    cache_age = (now - last_market).total_seconds() if last_market else None
+    healthy = bool(gold and gold > 1000)
+'''
+          new_home = '''@web_app.route('/')
+def home():
+    now = datetime.now(timezone.utc)
+    with cache_lock:
+        last_market = GLOBAL_CACHE.get("last_updated")
+        market_snapshot = dict(GLOBAL_CACHE.get("market_data") or {})
+        gold = market_snapshot.get("gold", 0.0)
+        feed = market_snapshot.get("price_feed") or {}
+    if not gold or feed.get("status") in {None, "MISSING", "STALE"}:
+        try:
+            live_feed = fetch_canonical_xauusd_feed()
+            with cache_lock:
+                GLOBAL_CACHE.setdefault("market_data", {})["price_feed"] = live_feed
+                if live_feed.get("status") == "ACTIVE" and live_feed.get("mid"):
+                    GLOBAL_CACHE["market_data"]["gold"] = round(float(live_feed["mid"]), 2)
+                    GLOBAL_CACHE["last_updated"] = now
+                    gold = GLOBAL_CACHE["market_data"]["gold"]
+                    feed = live_feed
+        except Exception as exc:
+            logger.warning('[HEALTH] live refresh failed type=%s message=%s', type(exc).__name__, str(exc)[:250])
+    cache_age = (now - last_market).total_seconds() if last_market else None
+    healthy = bool(gold and gold > 1000 and feed.get("status") == "ACTIVE")
+'''
+          if old_home not in text:
+              raise SystemExit('home anchor not found')
+          text = text.replace(old_home, new_home, 1)
+
+          # Add a structured warning to cold historical cache without using live price as OHLC fallback.
+          old_hist = """        try:\n            df_gold_h1 = fetch_yahoo_direct('XAUUSD=X', range_str='60d', interval_str='1h')\n"""
+          new_hist = """        try:\n            logger.info('[HISTORICAL_FETCH] starting XAUUSD H1/M15 refresh; cold_cache=%s', not bool(MARKET_DATA_CACHE.get('df_gold_m15') is not None and not MARKET_DATA_CACHE.get('df_gold_m15').empty))\n            df_gold_h1 = fetch_yahoo_direct('XAUUSD=X', range_str='60d', interval_str='1h')\n"""
+          if old_hist not in text:
+              raise SystemExit('historical start anchor not found')
+          text = text.replace(old_hist, new_hist, 1)
+
+          # Never print stale hardcoded market values in institutional analysis.
+          text = text.replace("close_dxy_m15 = to_1d_series(df_dxy_m15['Close']) if not df_dxy_m15.empty else pd.Series(99.85, index=df_gold_m15.index)", "close_dxy_m15 = to_1d_series(df_dxy_m15['Close']) if not df_dxy_m15.empty else None", 1)
+          text = text.replace("close_us10y_m15 = to_1d_series(df_us10y_m15['Close']) if not df_us10y_m15.empty else pd.Series(4.63, index=df_gold_m15.index)", "close_us10y_m15 = to_1d_series(df_us10y_m15['Close']) if not df_us10y_m15.empty else None", 1)
+          text = text.replace("returns_dxy_aligned = np.log(close_dxy_m15 / close_dxy_m15.shift(1)).reindex(index=returns_gold.index).ffill().fillna(0)", "returns_dxy_aligned = np.log(close_dxy_m15 / close_dxy_m15.shift(1)).reindex(index=returns_gold.index).ffill() if close_dxy_m15 is not None else pd.Series(np.nan, index=returns_gold.index)", 1)
+          text = text.replace("aligned_returns = pd.DataFrame({'Gold': returns_gold, 'DXY': returns_dxy_aligned}).dropna()", "aligned_returns = pd.DataFrame({'Gold': returns_gold, 'DXY': returns_dxy_aligned}).dropna() if close_dxy_m15 is not None else pd.DataFrame({'Gold': returns_gold}).dropna()", 1)
+          text = text.replace("dxy_corr = round(float(rolling_corr.iloc[-1]), 2) if not rolling_corr.empty else 0.0", "dxy_corr = round(float(rolling_corr.iloc[-1]), 2) if close_dxy_m15 is not None and not rolling_corr.empty else 0.0", 1)
+          text = text.replace("\"us10y_trend\": \"DOWN\" if (len(close_us10y_m15) >= 5 and close_us10y_m15.iloc[-1] < close_us10y_m15.iloc[-5]) else \"UP\"", "\"us10y_trend\": (\"DOWN\" if (close_us10y_m15 is not None and len(close_us10y_m15) >= 5 and close_us10y_m15.iloc[-1] < close_us10y_m15.iloc[-5]) else (\"UP\" if close_us10y_m15 is not None and len(close_us10y_m15) >= 5 else \"UNKNOWN\"))", 1)
+
+          ast.parse(text)
+          if text == original:
+              raise SystemExit('no changes produced')
+          path.write_text(text, encoding='utf-8')
+          print('PATCH_APPLIED')
+          PY
+
+      - name: Verify
+        run: |
+          python3 -m py_compile bot.py
+          python3 tests/test_market_provider_hygiene.py
+          python3 - <<'PY'
+          from pathlib import Path
+          text = Path('bot.py').read_text(encoding='utf-8')
+          assert "YAHOO_LIVE_COOLDOWN_SECONDS = int(os.getenv('YAHOO_LIVE_COOLDOWN_SECONDS', '15'))" in text
+          assert "YAHOO_HISTORICAL_COOLDOWN_SECONDS = int(os.getenv('YAHOO_HISTORICAL_COOLDOWN_SECONDS', '30'))" in text
+          assert 'code, msg' not in text
+          assert 'dxy\": 99.85' not in text
+          assert 'us10y\": 4.63' not in text
+          assert 'XAUUSD=X' in text
+          assert 'GC=F' not in text
+          assert 'PAXGUSDT' not in text
+          assert 'ifcmarkets.net' not in text.lower()
+          print('YAHOO_DIAGNOSTICS_OK')
+          PY
+          git diff --check
+
+      - name: Commit and remove one-time workflow
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm -f .github/workflows/yahoo_diagnostics_apply.yml
+          git add bot.py
+          git commit -m "fix: improve Yahoo feed diagnostics and cold start"
+          git push origin main
