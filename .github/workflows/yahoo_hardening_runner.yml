@@ -3,6 +3,8 @@ on:
   push:
     branches:
       - main
+permissions:
+  contents: write
 jobs:
   apply:
     runs-on: ubuntu-latest
@@ -31,12 +33,15 @@ jobs:
           assert 'GC=F' not in t and 'PAXGUSDT' not in t and 'ifcmarkets' not in t.lower()
           print('YAHOO_HARDENING_VERIFY_OK')
           PY
-      - name: Export verified files
-        uses: actions/upload-artifact@v4
-        with:
-          name: yahoo-hardening-verified
-          path: |
-            bot.py
-            requirements.txt
-      - name: Stop
-        run: echo 'Verified artifact exported; GitHub connector will publish it.'
+      - name: Commit production changes
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add bot.py requirements.txt
+          git commit -m "fix: centralize Yahoo access and stop rate-limit retries"
+          git push origin main
+      - name: Cleanup temporary files
+        run: |
+          git rm -f scripts/apply_yahoo_hardening.py .github/workflows/yahoo_hardening_runner.yml
+          git commit -m "chore: remove temporary Yahoo hardening runner"
+          git push origin main
