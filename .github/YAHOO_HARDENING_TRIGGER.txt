@@ -1,0 +1,1 @@
+temporary trigger for Yahoo XAUUSD feed hardening
