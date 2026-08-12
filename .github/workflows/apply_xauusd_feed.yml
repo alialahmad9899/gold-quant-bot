@@ -1,0 +1,393 @@
+name: Apply canonical XAUUSD price feed
+
+on:
+  push:
+    branches: [phase1-xauusd-canonical-feed]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: contains(github.event.head_commit.message, 'chore: prepare canonical XAUUSD feed patch')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Patch bot.py and run verification
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import ast
+          import textwrap
+
+          p = Path('bot.py')
+          text = p.read_text(encoding='utf-8')
+          original = text
+
+          def replace_def(src, name, replacement):
+              tree = ast.parse(src)
+              node = next(n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name)
+              lines = src.splitlines(True)
+              return ''.join(lines[:node.lineno-1] + [textwrap.dedent(replacement).strip() + '\n\n'] + lines[node.end_lineno:])
+
+          if 'from bs4 import BeautifulSoup\n' in text:
+              text = text.replace('from bs4 import BeautifulSoup\n', '', 1)
+
+          if 'METALS_DEV_API_KEY = os.getenv' not in text:
+              text = text.replace(
+                  "MODEL_VERSION = os.getenv('MODEL_VERSION', 'rf-v1')\n",
+                  "MODEL_VERSION = os.getenv('MODEL_VERSION', 'rf-v1')\n"
+                  "METALS_DEV_API_KEY = os.getenv('METALS_DEV_API_KEY', '').strip()\n"
+                  "PRICE_FEED_STALE_SECONDS = int(os.getenv('PRICE_FEED_STALE_SECONDS', '90'))\n",
+                  1,
+              )
+
+          helpers = '''
+          def _parse_price_feed_timestamp(value):
+              if value is None:
+                  return None
+              try:
+                  raw = str(value).strip()
+                  if raw.isdigit():
+                      return datetime.fromtimestamp(float(raw), tz=timezone.utc)
+                  return datetime.fromisoformat(raw.replace('Z', '+00:00')).astimezone(timezone.utc)
+              except (TypeError, ValueError, OverflowError):
+                  return None
+
+          def _finite_positive(value):
+              try:
+                  value = float(value)
+                  return value if np.isfinite(value) and value > 0 else None
+              except (TypeError, ValueError):
+                  return None
+
+          def _build_canonical_xauusd_feed(provider, spot, bid, ask, timestamp, *, is_stale_hint=False):
+              ts = _parse_price_feed_timestamp(timestamp)
+              spot_f = _finite_positive(spot)
+              bid_f = _finite_positive(bid)
+              ask_f = _finite_positive(ask)
+              if spot_f is None and bid_f is not None and ask_f is not None:
+                  spot_f = (bid_f + ask_f) / 2.0
+              if ts is None or spot_f is None:
+                  return {
+                      'symbol': 'XAUUSD', 'provider': provider, 'status': 'MISSING',
+                      'spot': None, 'mid': None, 'bid': bid_f, 'ask': ask_f,
+                      'timestamp': None, 'age_seconds': None,
+                  }
+              age = max(0.0, (datetime.now(timezone.utc) - ts).total_seconds())
+              status = 'STALE' if is_stale_hint or age > PRICE_FEED_STALE_SECONDS else 'ACTIVE'
+              mid = (bid_f + ask_f) / 2.0 if bid_f is not None and ask_f is not None else spot_f
+              return {
+                  'symbol': 'XAUUSD', 'provider': provider, 'status': status,
+                  'spot': round(spot_f, 6), 'mid': round(mid, 6),
+                  'bid': round(bid_f, 6) if bid_f is not None else None,
+                  'ask': round(ask_f, 6) if ask_f is not None else None,
+                  'timestamp': ts.isoformat(), 'age_seconds': round(age, 3),
+              }
+
+          def get_xauusd_execution_price(feed, direction, role):
+              direction = str(direction).upper()
+              role = str(role).upper()
+              if not feed or feed.get('status') != 'ACTIVE':
+                  return None
+              if role == 'ENTRY':
+                  return feed.get('ask') if direction == 'BUY' else feed.get('bid')
+              if role == 'EXIT':
+                  return feed.get('bid') if direction == 'BUY' else feed.get('ask')
+              return feed.get('mid') or feed.get('spot')
+
+          def fetch_canonical_xauusd_feed(previous_feed=None):
+              if not METALS_DEV_API_KEY:
+                  if previous_feed and previous_feed.get('provider') == 'metals.dev' and previous_feed.get('timestamp'):
+                      return _build_canonical_xauusd_feed(
+                          'metals.dev', previous_feed.get('spot'), previous_feed.get('bid'),
+                          previous_feed.get('ask'), previous_feed.get('timestamp'), is_stale_hint=True
+                      )
+                  return _build_canonical_xauusd_feed('metals.dev', None, None, None, None)
+
+              try:
+                  response = requests.get(
+                      'https://api.metals.dev/v1/metal/spot',
+                      params={'api_key': METALS_DEV_API_KEY, 'metal': 'gold', 'currency': 'USD'},
+                      headers={'Accept': 'application/json'},
+                      timeout=5,
+                  )
+                  response.raise_for_status()
+                  payload = response.json()
+                  rate = payload.get('rate') or {}
+                  return _build_canonical_xauusd_feed(
+                      'metals.dev', rate.get('price'), rate.get('bid'), rate.get('ask'), payload.get('timestamp')
+                  )
+              except Exception as exc:
+                  logger.warning('[XAUUSD_FEED] Metals.Dev request failed: %s', exc)
+                  if previous_feed and previous_feed.get('provider') == 'metals.dev' and previous_feed.get('timestamp'):
+                      return _build_canonical_xauusd_feed(
+                          'metals.dev', previous_feed.get('spot'), previous_feed.get('bid'),
+                          previous_feed.get('ask'), previous_feed.get('timestamp'), is_stale_hint=True
+                      )
+                  return _build_canonical_xauusd_feed('metals.dev', None, None, None, None)
+          '''
+          marker = 'def fetch_live_spot_gold():'
+          idx = text.find(marker)
+          if idx < 0:
+              raise RuntimeError('fetch_live_spot_gold marker not found')
+          if 'def fetch_canonical_xauusd_feed(' not in text:
+              text = text[:idx] + textwrap.dedent(helpers).strip() + '\n\n' + text[idx:]
+
+          new_live = '''
+          def fetch_live_spot_gold():
+              """Return the canonical XAUUSD spot only; never substitute another instrument."""
+              feed = fetch_canonical_xauusd_feed()
+              return float(feed['mid']) if feed.get('status') == 'ACTIVE' and feed.get('mid') else 0.0
+          '''
+          text = replace_def(text, 'fetch_live_spot_gold', new_live)
+
+          new_market = '''
+          def get_market_data():
+              now = datetime.now(timezone.utc)
+              with cache_lock:
+                  snapshot = GLOBAL_CACHE.get('market_data', {}).copy()
+                  last_updated = GLOBAL_CACHE.get('last_updated')
+              if last_updated is not None and (now - last_updated).total_seconds() < 5 and 'price_feed' in snapshot:
+                  return snapshot
+
+              with cache_lock:
+                  previous_feed = GLOBAL_CACHE.get('market_data', {}).get('price_feed')
+              feed = fetch_canonical_xauusd_feed(previous_feed=previous_feed)
+              spot = feed.get('mid') if feed.get('status') == 'ACTIVE' else 0.0
+              return {'gold': round(float(spot), 2) if spot else 0.0, 'dxy': 99.85, 'us10y': 4.63, 'price_feed': feed}
+          '''
+          text = replace_def(text, 'get_market_data', new_market)
+
+          new_cache = '''
+          def fetch_and_update_cache():
+              try:
+                  with cache_lock:
+                      previous_feed = GLOBAL_CACHE.get('market_data', {}).get('price_feed')
+                  feed = fetch_canonical_xauusd_feed(previous_feed=previous_feed)
+                  gold = feed.get('mid') if feed.get('status') == 'ACTIVE' else 0.0
+                  headers = {'User-Agent': 'Mozilla/5.0'}
+                  dxy = 99.85
+                  us10y = 4.63
+                  try:
+                      r_dxy = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB?interval=1m&range=1d", headers=headers, timeout=2)
+                      if r_dxy.status_code == 200:
+                          dxy = float(r_dxy.json()['chart']['result'][0]['meta']['regularMarketPrice'])
+                  except Exception:
+                      pass
+                  try:
+                      r_tnx = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/^TNX?interval=1m&range=1d", headers=headers, timeout=2)
+                      if r_tnx.status_code == 200:
+                          us10y = float(r_tnx.json()['chart']['result'][0]['meta']['regularMarketPrice'])
+                  except Exception:
+                      pass
+
+                  with cache_lock:
+                      GLOBAL_CACHE['market_data'] = {
+                          'gold': round(float(gold), 2) if gold else 0.0,
+                          'dxy': round(float(dxy), 2),
+                          'us10y': round(float(us10y), 2),
+                          'price_feed': feed,
+                      }
+                      GLOBAL_CACHE['last_updated'] = datetime.now(timezone.utc)
+              except Exception as e:
+                  print(f"خطأ تحديث كاش البيانات: {e}")
+          '''
+          text = replace_def(text, 'fetch_and_update_cache', new_cache)
+
+          # Analyze engine: no historical candle-close fallback for live price.
+          old_live_block = '''        spot_data = get_market_data()
+        if spot_data and spot_data.get("gold") > 0:
+            last_price = spot_data["gold"]
+        else:
+            last_price = round(close_gold_m15.iloc[-1], 2)
+'''
+          new_live_block = '''        spot_data = get_market_data()
+        price_feed = spot_data.get("price_feed") or {}
+        if price_feed.get("status") != "ACTIVE" or not price_feed.get("mid"):
+            logger.warning("[XAUUSD_FEED] live canonical feed is %s; signal generation paused", price_feed.get("status", "MISSING"))
+            return None
+        last_price = float(price_feed["mid"])
+'''
+          if old_live_block not in text:
+              raise RuntimeError('analyze_institutional_engine live-price block not found')
+          text = text.replace(old_live_block, new_live_block, 1)
+
+          old_res = '''            "last_price": last_price,
+            "df_m15": df_gold_m15,
+'''
+          new_res = '''            "last_price": last_price,
+            "price_feed": price_feed,
+            "df_m15": df_gold_m15,
+'''
+          if old_res not in text:
+              raise RuntimeError('analyze result block not found')
+          text = text.replace(old_res, new_res, 1)
+
+          # Signal generation: use side-aware execution quote for Entry and preserve canonical mid for display.
+          old_unpack = '''        h4_trend, state = data["h4_trend"], data["state_label"]
+        df, dxy_corr, smc, current_price = data["df_m15"], data["dxy_corr"], data["smc"], data["last_price"]
+'''
+          new_unpack = '''        h4_trend, state = data["h4_trend"], data["state_label"]
+        df, dxy_corr, smc, current_price = data["df_m15"], data["dxy_corr"], data["smc"], data["last_price"]
+        price_feed = data.get("price_feed") or {}
+'''
+          if old_unpack not in text:
+              raise RuntimeError('signal unpack block not found')
+          text = text.replace(old_unpack, new_unpack, 1)
+
+          old_levels = '''        if has_active_open_trade(signal_type):
+            return {"status":"WAIT","reason":f"توجد صفقة {('شراء' if signal_type=='BUY' else 'بيع')} مفتوحة بالفعل؛ لن نكررها قبل حسم الصفقة الحالية.","price":current_price}
+
+        if signal_type == 'BUY':
+            sl = round(current_price - atr*1.25,2); tp1 = round(current_price + atr*1.6,2); tp2 = round(current_price + atr*2.8,2)
+            smc_note = 'تأكيد صاعد من السيولة/FVG' if reasons_bull else 'تأكيد من الزخم والاتجاه'
+        else:
+            sl = round(current_price + atr*1.25,2); tp1 = round(current_price - atr*1.6,2); tp2 = round(current_price - atr*2.8,2)
+            smc_note = 'تأكيد هابط من السيولة/FVG' if reasons_bear else 'تأكيد من الزخم والاتجاه'
+
+        is_valid, validation_reason = validate_trade_levels(signal_type, current_price, sl, tp1, tp2)
+'''
+          new_levels = '''        if has_active_open_trade(signal_type):
+            return {"status":"WAIT","reason":f"توجد صفقة {('شراء' if signal_type=='BUY' else 'بيع')} مفتوحة بالفعل؛ لن نكررها قبل حسم الصفقة الحالية.","price":current_price}
+
+        entry_price = get_xauusd_execution_price(price_feed, signal_type, 'ENTRY')
+        if entry_price is None:
+            return {"status":"WAIT", "reason":f"سعر XAUUSD التنفيذي غير متاح: {price_feed.get('status', 'MISSING')}", "price":current_price}
+
+        if signal_type == 'BUY':
+            sl = round(entry_price - atr*1.25,2); tp1 = round(entry_price + atr*1.6,2); tp2 = round(entry_price + atr*2.8,2)
+            smc_note = 'تأكيد صاعد من السيولة/FVG' if reasons_bull else 'تأكيد من الزخم والاتجاه'
+        else:
+            sl = round(entry_price + atr*1.25,2); tp1 = round(entry_price - atr*1.6,2); tp2 = round(entry_price - atr*2.8,2)
+            smc_note = 'تأكيد هابط من السيولة/FVG' if reasons_bear else 'تأكيد من الزخم والاتجاه'
+
+        is_valid, validation_reason = validate_trade_levels(signal_type, entry_price, sl, tp1, tp2)
+'''
+          if old_levels not in text:
+              raise RuntimeError('signal level block not found')
+          text = text.replace(old_levels, new_levels, 1)
+
+          # Final log_trade call uses the actual side-aware entry price.
+          old_log = 'inserted, trade_id = log_trade(signal_type, current_price, sl, tp1, tp2, round(rsi,1), dxy_corr, round(macd_diff,3), round(stoch_k,1), volatility_ratio, confidence, candle_id=candle_id, signal_score=max(bull_score,bear_score), ai_score=candidate_signal.get(\'ai_score\'))'
+          new_log = 'inserted, trade_id = log_trade(signal_type, entry_price, sl, tp1, tp2, round(rsi,1), dxy_corr, round(macd_diff,3), round(stoch_k,1), volatility_ratio, confidence, candle_id=candle_id, signal_score=max(bull_score,bear_score), ai_score=candidate_signal.get(\'ai_score\'))'
+          if old_log not in text:
+              raise RuntimeError('log_trade call not found')
+          text = text.replace(old_log, new_log, 1)
+
+          # Live lifecycle: exit quote is Bid for BUY and Ask for SELL.
+          new_monitor = '''
+          def monitor_open_trades():
+              conn = get_db_connection()
+              try:
+                  cur = conn.cursor(); cur.execute("SELECT id,signal_type,entry_price,sl,tp1,tp2,trade_status FROM trades WHERE outcome IS NULL AND trade_status IN ('OPEN','TP1_HIT')"); rows = cur.fetchall()
+              except Exception as e:
+                  print(f"⚠️ تعذر تحميل الصفقات المفتوحة: {e}"); rows = []
+              finally:
+                  release_db_connection(conn)
+
+              market = get_market_data()
+              feed = market.get('price_feed') or {}
+              if feed.get('status') != 'ACTIVE':
+                  return
+              for trade_id, sig_type, entry, sl, tp1, tp2, status in rows:
+                  try:
+                      exit_price = get_xauusd_execution_price(feed, sig_type, 'EXIT')
+                      if exit_price is None:
+                          continue
+                      for event_status, event_price in evaluate_trade_lifecycle(sig_type, status, entry, sl, tp1, tp2, price=exit_price):
+                          if update_trade_state(trade_id, event_status, event_price) and event_status in {'TP2_HIT','SL_HIT'}:
+                              break
+                  except Exception as e:
+                      print(f"⚠️ خطأ في دورة حياة الصفقة {trade_id}: {e}")
+          '''
+          text = replace_def(text, 'monitor_open_trades', new_monitor)
+
+          # Price endpoint shows canonical feed metadata rather than an unlabeled raw number.
+          old_price_fragment = '''    msg = f"📊 **أسعار الذهب اللحظية**\\
+🟡 الذهب (XAUUSD): ${data['gold']}\\
+💵 مؤشر الدولار: {data['dxy']}\\
+📈 عوائد السندات: {data['us10y']}%"'''
+          new_price_fragment = '''    feed = data.get('price_feed') or {}
+    msg = f"📊 **أسعار الذهب اللحظية**\\
+🟡 الذهب (XAUUSD): ${data['gold']}\\
+🧭 المصدر: {feed.get('provider', 'N/A')} | الحالة: {feed.get('status', 'MISSING')}\\
+📌 Spot/Mid: {feed.get('mid')} | Bid: {feed.get('bid')} | Ask: {feed.get('ask')}\\
+🕒 Timestamp: {feed.get('timestamp')}\\
+💵 مؤشر الدولار: {data['dxy']}\\
+📈 عوائد السندات: {data['us10y']}%"'''
+          if old_price_fragment in text:
+              text = text.replace(old_price_fragment, new_price_fragment, 1)
+
+          # Historical charting/backtest remains XAUUSD=X; remove gold futures fallback because GC=F is a different instrument.
+          text = text.replace('''            if df_gold_m15.empty:\n                df_gold_m15 = fetch_yahoo_direct("GC=F", range_str="10d", interval_str="15m")\n            if df_gold_h1.empty:\n                df_gold_h1 = fetch_yahoo_direct("GC=F", range_str="60d", interval_str="1h")\n''', '', 1)
+
+          # Reset cache now includes explicit feed metadata.
+          old_reset = '''        GLOBAL_CACHE["market_data"] = {"gold": 0.0, "dxy": 99.85, "us10y": 4.63}
+'''
+          new_reset = '''        GLOBAL_CACHE["market_data"] = {"gold": 0.0, "dxy": 99.85, "us10y": 4.63, "price_feed": {"symbol":"XAUUSD","provider":"metals.dev","status":"MISSING","spot":None,"mid":None,"bid":None,"ask":None,"timestamp":None,"age_seconds":None}}
+'''
+          if old_reset in text:
+              text = text.replace(old_reset, new_reset, 1)
+
+          ast.parse(text)
+          p.write_text(text, encoding='utf-8')
+
+          # Phase 1 + price feed tests using AST extraction, no network and no secrets.
+          tree = ast.parse(text)
+          wanted = {
+              '_trade_direction','validate_trade_levels','_calculate_realized_r','evaluate_trade_lifecycle',
+              '_parse_price_feed_timestamp','_finite_positive','_build_canonical_xauusd_feed','get_xauusd_execution_price'
+          }
+          nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in wanted]
+          ns = {'np': __import__('numpy'), 'datetime': __import__('datetime').datetime, 'timezone': __import__('datetime').timezone, 'PRICE_FEED_STALE_SECONDS': 90}
+          exec(compile(ast.Module(body=nodes, type_ignores=[]), 'bot.py', 'exec'), ns)
+
+          validate = ns['validate_trade_levels']; calc_r = ns['_calculate_realized_r']; evaluate = ns['evaluate_trade_lifecycle']
+          assert validate('BUY',100,95,108,110)[0] and not validate('BUY',100,105,108,110)[0]
+          assert validate('SELL',100,105,92,90)[0] and not validate('SELL',100,95,92,97)[0]
+          assert evaluate('BUY','OPEN',100,95,108,110,price=109)==[('TP1_HIT',108.0)]
+          assert evaluate('BUY','TP1_HIT',100,95,108,110,price=111)==[('TP2_HIT',111.0)]
+          assert evaluate('BUY','OPEN',100,95,108,110,price=94)==[('SL_HIT',94.0)]
+          assert evaluate('SELL','OPEN',100,105,92,90,price=91)==[('TP1_HIT',92.0)]
+          assert evaluate('SELL','TP1_HIT',100,105,92,90,price=89)==[('TP2_HIT',89.0)]
+          assert evaluate('SELL','OPEN',100,105,92,90,price=104)==[]
+          assert evaluate('SELL','OPEN',100,105,92,90,price=106)==[('SL_HIT',106.0)]
+          assert calc_r('BUY',100,95,110)==2.0 and calc_r('BUY',100,95,95)==-1.0
+          assert calc_r('SELL',100,105,90)==2.0 and calc_r('SELL',100,105,105)==-1.0
+
+          ts = ns['_build_canonical_xauusd_feed']('metals.dev', 4393.0, 4392.8, 4393.2, '2026-08-12T01:00:00Z')
+          assert ts['status'] == 'STALE' and ts['mid'] == 4393.0
+          missing = ns['_build_canonical_xauusd_feed']('metals.dev', None, None, None, None)
+          assert missing['status'] == 'MISSING'
+          feed = {'status':'ACTIVE','mid':4393.0,'bid':4392.8,'ask':4393.2}
+          assert ns['get_xauusd_execution_price'](feed,'BUY','ENTRY') == 4393.2
+          assert ns['get_xauusd_execution_price'](feed,'SELL','ENTRY') == 4392.8
+          assert ns['get_xauusd_execution_price'](feed,'BUY','EXIT') == 4392.8
+          assert ns['get_xauusd_execution_price'](feed,'SELL','EXIT') == 4393.2
+          stale = dict(feed, status='STALE')
+          assert ns['get_xauusd_execution_price'](stale,'BUY','ENTRY') is None
+          assert 'PAXGUSDT' not in text
+          assert 'ifcmarkets.net/market-data/precious-metals-prices/xauusd' not in text
+          assert 'GC=F' not in text
+          assert 'XAUUSD=X' in text
+          print('Phase 1 + canonical XAUUSD price feed tests passed.')
+          PY
+
+          python3 -m py_compile bot.py
+          git diff --check
+
+      - name: Commit final change
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bot.py
+          git rm .github/workflows/apply_xauusd_feed.yml
+          git diff --cached --stat
+          git commit -m "fix: unify canonical XAUUSD price feed"
+          git push origin phase1-xauusd-canonical-feed
