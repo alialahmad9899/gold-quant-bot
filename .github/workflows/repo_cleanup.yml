@@ -1,0 +1,66 @@
+name: repository-cleanup
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clean and repair repository
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          bot = Path('bot.py')
+          text = bot.read_text(encoding='utf-8')
+
+          replacements = {
+              "outcome = 0 if abs(f_open - sl) < abs(f_open - tp) else 1":
+                  "outcome = 0 if abs(f_open - sl) < abs(f_open - tp) else 1",
+              "outcome = 0 if abs(f_open - sl) < abs(open_val - tp) else 1":
+                  "outcome = 0 if abs(f_open - sl) < abs(f_open - tp) else 1",
+              'cursor.execute("SELECT COUNT(*) FROM trades WHERE outcome IS NOT NULL")\n        pending_trades = cursor.fetchone()[0] or 0':
+                  'cursor.execute("SELECT COUNT(*) FROM trades WHERE outcome IS NULL AND trade_status IN (\'OPEN\', \'TP1_HIT\')")\n        pending_trades = cursor.fetchone()[0] or 0',
+              '"provider":"legacy provider"':
+                  '"provider":"Yahoo Finance"',
+          }
+
+          for old, new in replacements.items():
+              if old not in text:
+                  raise SystemExit(f'missing repair anchor: {old[:100]}')
+              text = text.replace(old, new, 1)
+
+          bot.write_text(text, encoding='utf-8')
+
+          Path('.gitignore').write_text('''# Python\n__pycache__/\n*.py[cod]\n*.pyo\n.pytest_cache/\n.mypy_cache/\n.ruff_cache/\n\n# Local runtime state\ntrades.db\n*.sqlite\n*.sqlite3\n*.db-wal\n*.db-shm\nxau_quant_bot.log\n*.log\n\n# Secrets / local configuration\n.env\n.env.*\n!.env.example\n''', encoding='utf-8')
+
+          Path('README.md').write_text('''# Gold Quant Bot\n\nبوت تداول كمي للذهب XAUUSD يعمل عبر Telegram، ويجمع بين تحليل السوق، إدارة دورة حياة الصفقة، التعلم الآلي، ومراجعة Gemini عند تفعيلها.\n\n## بنية المشروع\n\n- `bot.py` — التطبيق الرئيسي ومحركات السوق والصفقات والتعلم.\n- `tests/` — اختبارات regression خفيفة تمنع عودة أخطاء معروفة.\n- `.github/workflows/` — CI دائم فقط؛ الإصلاحات لمرة واحدة لا تُحفظ كـworkflow.\n- `requirements.txt` — اعتماديات التشغيل.\n\n## بيانات السوق\n\nYahoo Finance هو المصدر الأساسي لبيانات XAUUSD والشموع التاريخية، مع استخدام `XAUUSD=X` للسعر الفوري و`DX-Y.NYB` و`^TNX` للمؤشرات المساندة. لا يستخدم مسار الإنتاج مصادر سعر ذهب بديلة مثل العقود الآجلة أو العملات المشفرة أو scraping.\n\n## التشغيل\n\nاضبط متغيرات البيئة المطلوبة: `TELEGRAM_TOKEN` و`BOT_PASSWORD` و`DATABASE_URL` عند استخدام PostgreSQL، و`GEMINI_API_KEY` عند تفعيل Gemini. ثم ثبّت الاعتماديات من `requirements.txt` وشغّل `python bot.py`.\n\n## قاعدة البيانات\n\nيفضل PostgreSQL عند توفير `DATABASE_URL`. SQLite متاح كخيار محلي/احتياطي للتشغيل التطويري.\n\n## ملاحظة الاختبارات\n\nاختبارات المستودع تتحقق من مصدر سعر الذهب ومسارات lifecycle المعروفة، وتستخدم `py_compile` كفحص أساسي لصحة بناء `bot.py`.\n''', encoding='utf-8')
+
+          Path('tests/test_repo_regressions.py').write_text('''from pathlib import Path\n\ntext = Path("bot.py").read_text(encoding="utf-8")\n\nassert "open_val" not in text, "undefined backtest variable open_val remains"\nassert "WHERE outcome IS NULL AND trade_status IN ('OPEN','TP1_HIT')" in text, "stats must count open lifecycle trades"\nassert '"provider":"legacy provider"' not in text, "legacy provider label remains"\nassert '"provider":"Yahoo Finance"' in text, "reset state must keep canonical provider"\n\nprint("REPO_REGRESSIONS_OK")\n''', encoding='utf-8')
+          PY
+
+          python3 -m py_compile bot.py
+          python3 tests/test_market_provider_hygiene.py
+          python3 tests/test_repo_regressions.py
+          git diff --check
+
+      - name: Remove one-time cleanup workflow and commit
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm -f .github/workflows/repo_cleanup.yml
+          git add -A
+          git commit -m "chore: clean repository and fix runtime regressions"
+          git push origin main
