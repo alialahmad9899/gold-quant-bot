@@ -26,3 +26,4 @@ jobs:
           git diff --cached --check
           git commit -m 'fix: harden XAUUSD live feed and Yahoo cooldown'
           git push origin HEAD:main
+# trigger Codex market feed repair
