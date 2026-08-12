@@ -1,5 +1,4 @@
 python-telegram-bot[job-queue]>=21.0
-yfinance
 pandas
 numpy
 ta
