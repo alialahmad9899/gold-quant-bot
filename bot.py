@@ -17,7 +17,6 @@ import warnings
 from datetime import datetime, timezone, timedelta
 import numpy as np
 import pandas as pd
-import yfinance as yf
 from hmmlearn.hmm import GaussianHMM
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
@@ -328,6 +327,13 @@ PRICE_FEED_STALE_SECONDS = int(os.getenv('PRICE_FEED_STALE_SECONDS', '90'))
 PRICE_FEED_MIN_REQUEST_INTERVAL = 60.0
 PRICE_FEED_LOCK = threading.Lock()
 CANONICAL_XAUUSD_FEED_CACHE = {'feed': None, 'last_request_monotonic': 0.0}
+ARGENT_AUTH_COOLDOWN_SECONDS = int(os.getenv('ARGENT_AUTH_COOLDOWN_SECONDS', '600'))
+ARGENT_TRANSIENT_COOLDOWN_SECONDS = int(os.getenv('ARGENT_TRANSIENT_COOLDOWN_SECONDS', '300'))
+ARGENT_FEED_STATE = {'blocked_until': 0.0, 'error_type': None, 'error_message': None}
+YAHOO_COOLDOWN_SECONDS = int(os.getenv('YAHOO_COOLDOWN_SECONDS', '1800'))
+YAHOO_FETCH_INTERVAL_SECONDS = int(os.getenv('YAHOO_FETCH_INTERVAL_SECONDS', '900'))
+YAHOO_FEED_STATE = {'blocked_until': 0.0, 'error_type': None, 'error_message': None}
+YAHOO_STATE_LOCK = threading.Lock()
 RAM_WARNING_MB = float(os.getenv('RAM_WARNING_MB', '400'))
 RAM_DEFER_MB = float(os.getenv('RAM_DEFER_MB', '450'))
 RAM_EMERGENCY_MB = float(os.getenv('RAM_EMERGENCY_MB', '480'))
@@ -1606,35 +1612,34 @@ def detect_smc_setup(df):
 # ------------------------------------
 # 4. محرك البيانات الفورية الموحد
 # ------------------------------------
+def _set_yahoo_cooldown(error_type, error_message):
+    with YAHOO_STATE_LOCK:
+        YAHOO_FEED_STATE['blocked_until'] = time.monotonic() + max(1, YAHOO_COOLDOWN_SECONDS)
+        YAHOO_FEED_STATE['error_type'] = str(error_type)
+        YAHOO_FEED_STATE['error_message'] = str(error_message or '')[:300]
+    logger.warning('[MARKET_DATA] Yahoo cooldown type=%s seconds=%s message=%s', error_type, YAHOO_COOLDOWN_SECONDS, str(error_message or '')[:300])
+
+def _yahoo_cooldown_active():
+    with YAHOO_STATE_LOCK: return time.monotonic() < float(YAHOO_FEED_STATE.get('blocked_until', 0.0) or 0.0)
+
 def fetch_yahoo_direct(symbol, range_str="10d", interval_str="15m"):
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept': 'application/json,text/html,application/xhtml+xml',
-        'Referer': 'https://finance.yahoo.com/'
-    }
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval={interval_str}&range={range_str}"
+    if _yahoo_cooldown_active(): return pd.DataFrame()
+    headers={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36','Accept':'application/json,text/html,application/xhtml+xml','Referer':'https://finance.yahoo.com/'}
+    url=f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval={interval_str}&range={range_str}"
     try:
-        r = requests.get(url, headers=headers, timeout=5)
-        if r.status_code == 200:
-            data = r.json()
-            result = data['chart']['result'][0]
-            timestamps = result['timestamp']
-            quote = result['indicators']['quote'][0]
-            
-            df = pd.DataFrame({
-                'Open': quote['open'],
-                'High': quote['high'],
-                'Low': quote['low'],
-                'Close': quote['close'],
-                'Volume': quote.get('volume', [0] * len(timestamps))
-            }, index=pd.to_datetime(timestamps, unit='s', utc=True))
-            
-            df = df.dropna(subset=['Close'])
-            if not df.empty:
-                return df
-    except Exception as e:
-        print(f"تنبيه الاستدعاء المباشر لـ {symbol}: {e}")
-    return pd.DataFrame()
+        response=requests.get(url,headers=headers,timeout=5)
+        if response.status_code==429:
+            _set_yahoo_cooldown('rate_limited','Yahoo HTTP 429 rate limit.'); return pd.DataFrame()
+        if response.status_code!=200:
+            if response.status_code>=500: _set_yahoo_cooldown('server_error',f'Yahoo HTTP {response.status_code}')
+            return pd.DataFrame()
+        data=response.json(); result=data['chart']['result'][0]; timestamps=result['timestamp']; quote=result['indicators']['quote'][0]
+        df=pd.DataFrame({'Open':quote['open'],'High':quote['high'],'Low':quote['low'],'Close':quote['close'],'Volume':quote.get('volume',[0]*len(timestamps))},index=pd.to_datetime(timestamps,unit='s',utc=True)).dropna(subset=['Close'])
+        return df if not df.empty else pd.DataFrame()
+    except Exception as exc:
+        error_text=f'{type(exc).__name__}: {exc}'
+        if any(token in error_text.lower() for token in ('yfratelimiterror','too many requests','http 429','429')): _set_yahoo_cooldown('rate_limited',error_text)
+        return pd.DataFrame()
 
 def _parse_price_feed_timestamp(value):
     if value is None:
@@ -1726,6 +1731,7 @@ def _build_canonical_xauusd_feed(payload, *, fetched_at=None, stale_hint=False):
         'mid': round(mid, 6),
         'spot': round(spot, 6) if spot is not None else round(mid, 6),
         'source_timestamp': source_ts.isoformat(),
+        'timestamp': source_ts.isoformat(),
         'fetched_timestamp': now.isoformat(),
         'source_fetched_timestamp': provider_fetched.isoformat() if provider_fetched else None,
         'age_seconds': round(age_seconds, 3),
@@ -1753,24 +1759,43 @@ def _refresh_cached_feed_status(feed):
     return refreshed
 
 
+def _sanitize_feed_error(message):
+    text = str(message or '')[:300]
+    if ARGENT_API_KEY:
+        text = text.replace(ARGENT_API_KEY, '[REDACTED]')
+    return text
+
+def _set_argent_cooldown(seconds, error_type=None, error_message=None):
+    ARGENT_FEED_STATE['blocked_until'] = time.monotonic() + max(0.0, float(seconds))
+    ARGENT_FEED_STATE['error_type'] = error_type
+    ARGENT_FEED_STATE['error_message'] = _sanitize_feed_error(error_message)
+
+def _argent_cooldown_active():
+    return time.monotonic() < float(ARGENT_FEED_STATE.get('blocked_until', 0.0) or 0.0)
+
+def _build_missing_argent_feed(error_type='missing', error_message='No live XAUUSD data available.'):
+    now = datetime.now(timezone.utc)
+    return {
+        'symbol': 'XAUUSD', 'provider': 'ArgentAPI', 'status': 'MISSING',
+        'bid': None, 'ask': None, 'mid': None, 'spot': None,
+        'source_timestamp': None, 'timestamp': None,
+        'fetched_timestamp': now.isoformat(), 'source_fetched_timestamp': None,
+        'age_seconds': None, 'error_type': str(error_type),
+        'error_message': _sanitize_feed_error(error_message),
+    }
+
 def _argentapi_error_message(response):
     try:
         payload = response.json()
         if isinstance(payload, dict):
             for key in ('error', 'message', 'detail'):
-                if payload.get(key):
-                    return str(payload[key])[:300]
-    except Exception:
-        pass
-    try:
-        return str(response.text or '')[:300]
-    except Exception:
-        return ''
-
+                if payload.get(key): return _sanitize_feed_error(payload[key])
+    except Exception: pass
+    try: return _sanitize_feed_error(response.text or '')
+    except Exception: return ''
 
 def _log_argentapi_failure(error_type, http_status=None, message=''):
-    logger.warning('[XAUUSD_FEED] ArgentAPI failure type=%s http_status=%s message=%s', error_type, http_status, message)
-
+    logger.warning('[XAUUSD_FEED] ArgentAPI failure type=%s http_status=%s message=%s', error_type, http_status, _sanitize_feed_error(message))
 
 def fetch_canonical_xauusd_feed():
     """Canonical live XAUUSD feed backed only by ArgentAPI with a 60s request gate."""
@@ -1780,55 +1805,48 @@ def fetch_canonical_xauusd_feed():
         last_request = float(CANONICAL_XAUUSD_FEED_CACHE.get('last_request_monotonic', 0.0) or 0.0)
         if now_monotonic - last_request < PRICE_FEED_MIN_REQUEST_INTERVAL:
             return _refresh_cached_feed_status(cached)
-
+        if _argent_cooldown_active():
+            if cached: return _refresh_cached_feed_status(cached)
+            return _build_missing_argent_feed(ARGENT_FEED_STATE.get('error_type') or 'cooldown', ARGENT_FEED_STATE.get('error_message') or 'ArgentAPI request cooldown is active.')
         if not ARGENT_API_KEY:
-            _log_argentapi_failure('missing_api_key', None, 'ARGENT_API_KEY is not configured')
-            return {
-                'symbol': 'XAUUSD', 'provider': 'ArgentAPI', 'status': 'MISSING',
-                'bid': None, 'ask': None, 'mid': None, 'spot': None,
-                'source_timestamp': None, 'fetched_timestamp': datetime.now(timezone.utc).isoformat(),
-                'source_fetched_timestamp': None, 'age_seconds': None,
-            }
-
+            feed = _build_missing_argent_feed('missing_api_key', 'ARGENT_API_KEY is not configured.')
+            _set_argent_cooldown(ARGENT_AUTH_COOLDOWN_SECONDS, 'missing_api_key', feed['error_message'])
+            CANONICAL_XAUUSD_FEED_CACHE['feed'] = feed
+            _log_argentapi_failure(feed['error_type'], None, feed['error_message'])
+            return feed
         CANONICAL_XAUUSD_FEED_CACHE['last_request_monotonic'] = now_monotonic
         try:
-            response = requests.get(
-                'https://api.argentapi.com/v1/spot/gold',
-                headers={'X-API-Key': ARGENT_API_KEY, 'Accept': 'application/json'},
-                timeout=5,
-            )
+            response = requests.get('https://api.argentapi.com/v1/spot/gold', headers={'X-API-Key': ARGENT_API_KEY, 'Accept': 'application/json'}, timeout=5)
+        except requests.Timeout as exc:
+            message = _sanitize_feed_error(exc); _set_argent_cooldown(ARGENT_TRANSIENT_COOLDOWN_SECONDS, 'timeout', message); _log_argentapi_failure('timeout', None, message)
+            return _refresh_cached_feed_status(cached) if cached else _build_missing_argent_feed('timeout', message)
+        except requests.RequestException as exc:
+            message = _sanitize_feed_error(exc); _set_argent_cooldown(ARGENT_TRANSIENT_COOLDOWN_SECONDS, 'network', message); _log_argentapi_failure('network', None, message)
+            return _refresh_cached_feed_status(cached) if cached else _build_missing_argent_feed('network', message)
         except Exception as exc:
-            _log_argentapi_failure('network', None, str(exc)[:300])
-            return _refresh_cached_feed_status(cached)
-
+            message = _sanitize_feed_error(exc); _set_argent_cooldown(ARGENT_TRANSIENT_COOLDOWN_SECONDS, 'network', message); _log_argentapi_failure('network', None, message)
+            return _refresh_cached_feed_status(cached) if cached else _build_missing_argent_feed('network', message)
         status_code = int(getattr(response, 'status_code', 0) or 0)
         if status_code in (401, 403):
-            _log_argentapi_failure('authentication', status_code, _argentapi_error_message(response))
-            return _refresh_cached_feed_status(cached)
+            message = _argentapi_error_message(response) or 'ArgentAPI authentication/authorization failed.'; _set_argent_cooldown(ARGENT_AUTH_COOLDOWN_SECONDS, 'authentication', message)
+            feed = _build_missing_argent_feed('authentication', message); CANONICAL_XAUUSD_FEED_CACHE['feed'] = feed; _log_argentapi_failure('authentication', status_code, message); return feed
         if status_code == 429:
-            _log_argentapi_failure('rate_limited', status_code, _argentapi_error_message(response))
-            return _refresh_cached_feed_status(cached)
+            message = _argentapi_error_message(response) or 'ArgentAPI rate limit reached.'; _set_argent_cooldown(ARGENT_TRANSIENT_COOLDOWN_SECONDS, 'rate_limited', message); _log_argentapi_failure('rate_limited', status_code, message)
+            return _refresh_cached_feed_status(cached) if cached else _build_missing_argent_feed('rate_limited', message)
         if 500 <= status_code <= 599:
-            _log_argentapi_failure('server_error', status_code, _argentapi_error_message(response))
-            return _refresh_cached_feed_status(cached)
+            message = _argentapi_error_message(response) or 'ArgentAPI server error.'; _set_argent_cooldown(ARGENT_TRANSIENT_COOLDOWN_SECONDS, 'server_error', message); _log_argentapi_failure('server_error', status_code, message)
+            return _refresh_cached_feed_status(cached) if cached else _build_missing_argent_feed('server_error', message)
         if status_code != 200:
-            _log_argentapi_failure('http_error', status_code, _argentapi_error_message(response))
-            return _refresh_cached_feed_status(cached)
-
-        try:
-            payload = response.json()
+            message = _argentapi_error_message(response) or f'Unexpected HTTP status {status_code}.'; _set_argent_cooldown(ARGENT_TRANSIENT_COOLDOWN_SECONDS, 'http_error', message); _log_argentapi_failure('http_error', status_code, message)
+            return _refresh_cached_feed_status(cached) if cached else _build_missing_argent_feed('http_error', message)
+        try: payload = response.json()
         except Exception as exc:
-            _log_argentapi_failure('malformed_json', status_code, str(exc)[:300])
-            return _refresh_cached_feed_status(cached)
-
-        feed = _build_canonical_xauusd_feed(payload, fetched_at=datetime.now(timezone.utc))
+            message = _sanitize_feed_error(exc); _set_argent_cooldown(ARGENT_TRANSIENT_COOLDOWN_SECONDS, 'malformed_json', message); _log_argentapi_failure('malformed_json', status_code, message)
+            return _refresh_cached_feed_status(cached) if cached else _build_missing_argent_feed('malformed_json', message)
+        feed = _build_canonical_xauusd_feed(payload, fetched_at=datetime.now(timezone.utc)); feed['error_type']=None; feed['error_message']=None
         if feed.get('status') != 'MISSING':
-            CANONICAL_XAUUSD_FEED_CACHE['feed'] = feed
-            return feed
-
-        _log_argentapi_failure('missing_fields', status_code, 'required price/timestamp fields are missing or invalid')
-        return _refresh_cached_feed_status(cached)
-
+            ARGENT_FEED_STATE['blocked_until']=0.0; ARGENT_FEED_STATE['error_type']=None; ARGENT_FEED_STATE['error_message']=None; CANONICAL_XAUUSD_FEED_CACHE['feed']=feed; return feed
+        message='required live price/timestamp fields are missing or invalid.'; _set_argent_cooldown(ARGENT_TRANSIENT_COOLDOWN_SECONDS, 'missing_fields', message); feed=_build_missing_argent_feed('missing_fields', message); CANONICAL_XAUUSD_FEED_CACHE['feed']=feed; _log_argentapi_failure('missing_fields', status_code, message); return feed
 
 def get_xauusd_execution_price(feed, direction, role):
     direction = str(direction).upper()
@@ -1862,26 +1880,12 @@ def fetch_and_update_cache():
     try:
         feed = fetch_canonical_xauusd_feed()
         gold = feed.get('mid') if feed.get('status') == 'ACTIVE' else 0.0
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        dxy = 99.85
-        us10y = 4.63
-        try:
-            r_dxy = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB?interval=1m&range=1d", headers=headers, timeout=2)
-            if r_dxy.status_code == 200:
-                dxy = float(r_dxy.json()['chart']['result'][0]['meta']['regularMarketPrice'])
-        except Exception:
-            pass
-        try:
-            r_tnx = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/^TNX?interval=1m&range=1d", headers=headers, timeout=2)
-            if r_tnx.status_code == 200:
-                us10y = float(r_tnx.json()['chart']['result'][0]['meta']['regularMarketPrice'])
-        except Exception:
-            pass
         with cache_lock:
+            previous = GLOBAL_CACHE.get('market_data') or {}
             GLOBAL_CACHE['market_data'] = {
                 'gold': round(float(gold), 2) if gold else 0.0,
-                'dxy': round(float(dxy), 2),
-                'us10y': round(float(us10y), 2),
+                'dxy': previous.get('dxy'),
+                'us10y': previous.get('us10y'),
                 'price_feed': feed,
             }
             GLOBAL_CACHE['last_updated'] = datetime.now(timezone.utc)
@@ -1889,48 +1893,31 @@ def fetch_and_update_cache():
         logger.warning('[XAUUSD_FEED] cache update failure type=cache_update message=%s', str(exc)[:300])
 
 def get_chart_data_cached():
-    now = datetime.now(timezone.utc)
-    
+    now=datetime.now(timezone.utc)
     with cache_lock:
-        last = MARKET_DATA_CACHE["last_fetch"]
-        if last is not None and (now - last).total_seconds() < 300 and not MARKET_DATA_CACHE["df_gold_m15"].empty:
-            return MARKET_DATA_CACHE.copy()
-
+        last=MARKET_DATA_CACHE["last_fetch"]
+        if last is not None and (now-last).total_seconds()<YAHOO_FETCH_INTERVAL_SECONDS: return MARKET_DATA_CACHE.copy()
     with fetch_lock:
         with cache_lock:
-            last = MARKET_DATA_CACHE["last_fetch"]
-            if last is not None and (now - last).total_seconds() < 300 and not MARKET_DATA_CACHE["df_gold_m15"].empty:
-                return MARKET_DATA_CACHE.copy()
-
+            last=MARKET_DATA_CACHE["last_fetch"]
+            if last is not None and (now-last).total_seconds()<YAHOO_FETCH_INTERVAL_SECONDS: return MARKET_DATA_CACHE.copy()
+        if _yahoo_cooldown_active():
+            with cache_lock: return MARKET_DATA_CACHE.copy()
         try:
-            df_gold_h1 = fetch_yahoo_direct("XAUUSD=X", range_str="60d", interval_str="1h")
-            df_gold_m15 = fetch_yahoo_direct("XAUUSD=X", range_str="10d", interval_str="15m")
-            
-
-            df_dxy_m15 = fetch_yahoo_direct("DX-Y.NYB", range_str="10d", interval_str="15m")
-            df_us10y_m15 = fetch_yahoo_direct("^TNX", range_str="10d", interval_str="15m")
-
-            if df_gold_m15.empty:
-                df_gold_m15 = clean_df_columns(yf.download("XAUUSD=X", period="10d", interval="15m", progress=False, threads=False, auto_adjust=False))
-            if df_gold_h1.empty:
-                df_gold_h1 = clean_df_columns(yf.download("XAUUSD=X", period="60d", interval="1h", progress=False, threads=False, auto_adjust=False))
-            if df_dxy_m15.empty:
-                df_dxy_m15 = clean_df_columns(yf.download("DX-Y.NYB", period="10d", interval="15m", progress=False, threads=False, auto_adjust=False))
-            if df_us10y_m15.empty:
-                df_us10y_m15 = clean_df_columns(yf.download("^TNX", period="10d", interval="15m", progress=False, threads=False, auto_adjust=False))
-
-            if not df_gold_m15.empty:
-                with cache_lock:
-                    MARKET_DATA_CACHE["df_gold_h1"] = df_gold_h1
-                    MARKET_DATA_CACHE["df_gold_m15"] = df_gold_m15
-                    MARKET_DATA_CACHE["df_dxy_m15"] = df_dxy_m15
-                    MARKET_DATA_CACHE["df_us10y_m15"] = df_us10y_m15
-                    MARKET_DATA_CACHE["last_fetch"] = now
-        except Exception as e:
-            print(f"تنبيه تحميل جداول الأسعار: {e}")
-            
-    with cache_lock:
-        return MARKET_DATA_CACHE.copy()
+            df_gold_h1=fetch_yahoo_direct("XAUUSD=X",range_str="60d",interval_str="1h")
+            df_gold_m15=fetch_yahoo_direct("XAUUSD=X",range_str="10d",interval_str="15m")
+            df_dxy_m15=fetch_yahoo_direct("DX-Y.NYB",range_str="10d",interval_str="15m")
+            df_us10y_m15=fetch_yahoo_direct("^TNX",range_str="10d",interval_str="15m")
+            with cache_lock:
+                if not df_gold_h1.empty: MARKET_DATA_CACHE["df_gold_h1"]=df_gold_h1
+                if not df_gold_m15.empty: MARKET_DATA_CACHE["df_gold_m15"]=df_gold_m15
+                if not df_dxy_m15.empty: MARKET_DATA_CACHE["df_dxy_m15"]=df_dxy_m15
+                if not df_us10y_m15.empty: MARKET_DATA_CACHE["df_us10y_m15"]=df_us10y_m15
+                MARKET_DATA_CACHE["last_fetch"]=now
+        except Exception as exc:
+            logger.warning('[MARKET_DATA] historical fetch failure type=%s message=%s',type(exc).__name__,str(exc)[:300])
+            with cache_lock: MARKET_DATA_CACHE["last_fetch"]=now
+    with cache_lock: return MARKET_DATA_CACHE.copy()
 
 def get_verified_closed_m15(df):
     if df is None or df.empty:
@@ -2743,6 +2730,8 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     def fmt(value):
         return f"{float(value):.2f}" if value is not None else "N/A"
     age = f"{float(feed['age_seconds']):.1f} sec" if feed.get('age_seconds') is not None else "N/A"
+    reason = feed.get('error_message') if feed.get('status') == 'MISSING' else None
+    timestamp = feed.get('timestamp') or feed.get('source_timestamp') or 'N/A'
     msg = (
         "📊 **XAUUSD Live Price Feed**\n"
         f"Provider: {feed.get('provider', 'ArgentAPI')}\n"
@@ -2750,9 +2739,11 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Bid: {fmt(feed.get('bid'))}\n"
         f"Ask: {fmt(feed.get('ask'))}\n"
         f"Mid: {fmt(feed.get('mid'))}\n"
+        f"Timestamp: {timestamp}\n"
         f"Age: {age}\n"
-        f"💵 مؤشر الدولار: {data['dxy']}\n"
-        f"📈 عوائد السندات: {data['us10y']}%"
+        f"Reason: {reason or 'N/A'}\n"
+        f"💵 مؤشر الدولار: {data['dxy'] if data.get('dxy') is not None else 'N/A'}\n"
+        f"📈 عوائد السندات: {f"{data['us10y']:.2f}%" if data.get('us10y') is not None else 'N/A'}"
     )
     await safe_reply_text(update, msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
