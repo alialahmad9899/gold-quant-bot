@@ -1,0 +1,33 @@
+name: Apply ArgentAPI XAUUSD feed
+
+on:
+  push:
+    branches: [argentapi-xauusd-feed-v3]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: contains(github.event.head_commit.message, 'chore: add temporary ArgentAPI verification workflow')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply patch and tests
+        shell: bash
+        run: python3 .github/argentapi_apply.py
+      - name: Syntax
+        run: python3 -m py_compile bot.py
+      - name: Diff check
+        run: git diff --check
+      - name: Commit final bot.py only
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add bot.py
+          git add -u .github/argentapi_apply.py .github/workflows/argentapi_apply.yml
+          git commit -m 'fix: replace Metals.Dev with ArgentAPI canonical XAUUSD feed'
+          git push origin HEAD:argentapi-xauusd-feed-v3
