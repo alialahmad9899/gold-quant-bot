@@ -21,6 +21,7 @@ jobs:
           p = Path('.github/restore_yahoo_spot_feed_v2.py')
           s = p.read_text(encoding='utf-8')
           s = s.replace("'_build_missing_yahoo_feed','_yahoo_live_error_message','_log_yahoo_live_failure','_set_yahoo_live_cooldown','_yahoo_live_cooldown_active','_build_yahoo_live_feed','fetch_canonical_xauusd_feed','get_xauusd_execution_price','validate_trade_levels'", "'_build_missing_yahoo_feed','_yahoo_live_error_message','_log_yahoo_live_failure','_set_yahoo_live_cooldown','_yahoo_live_cooldown_active','_build_yahoo_live_feed','fetch_canonical_xauusd_feed','get_xauusd_execution_price','_trade_direction','validate_trade_levels'")
+          s = s.replace("'math':math,'datetime':datetime", "'math':math,'np':type('FakeNP',(),{'isfinite':staticmethod(math.isfinite)}),'datetime':datetime")
           p.write_text(s, encoding='utf-8')
           PY
           python3 .github/restore_yahoo_spot_feed_v2.py
