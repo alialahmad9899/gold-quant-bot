@@ -1,3 +1,4 @@
+import math
 import logging
 from logging.handlers import RotatingFileHandler
 import asyncio
@@ -322,8 +323,11 @@ logger = logging.getLogger('xau_quant_bot')
 FEATURE_VERSION = os.getenv('FEATURE_VERSION', 'v2.8-features-1')
 STRATEGY_VERSION = os.getenv('STRATEGY_VERSION', 'v2.8-flexible')
 MODEL_VERSION = os.getenv('MODEL_VERSION', 'rf-v1')
-METALS_DEV_API_KEY = os.getenv('METALS_DEV_API_KEY', '').strip()
+ARGENT_API_KEY = os.getenv('ARGENT_API_KEY', '').strip()
 PRICE_FEED_STALE_SECONDS = int(os.getenv('PRICE_FEED_STALE_SECONDS', '90'))
+PRICE_FEED_MIN_REQUEST_INTERVAL = 60.0
+PRICE_FEED_LOCK = threading.Lock()
+CANONICAL_XAUUSD_FEED_CACHE = {'feed': None, 'last_request_monotonic': 0.0}
 RAM_WARNING_MB = float(os.getenv('RAM_WARNING_MB', '400'))
 RAM_DEFER_MB = float(os.getenv('RAM_DEFER_MB', '450'))
 RAM_EMERGENCY_MB = float(os.getenv('RAM_EMERGENCY_MB', '480'))
@@ -1635,10 +1639,23 @@ def fetch_yahoo_direct(symbol, range_str="10d", interval_str="15m"):
 def _parse_price_feed_timestamp(value):
     if value is None:
         return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
     try:
         raw = str(value).strip()
+        if not raw:
+            return None
         if raw.isdigit():
-            return datetime.fromtimestamp(float(raw), tz=timezone.utc)
+            # ArgentAPI fetchedAt is milliseconds, while some feeds use seconds.
+            numeric = float(raw)
+            if numeric > 1_000_000_000_000:
+                numeric /= 1000.0
+            return datetime.fromtimestamp(numeric, tz=timezone.utc)
+        for fmt in ('%b %d, %Y %H:%M', '%Y-%m-%d %H:%M:%S'):
+            try:
+                return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+            except ValueError:
+                pass
         return datetime.fromisoformat(raw.replace('Z', '+00:00')).astimezone(timezone.utc)
     except (TypeError, ValueError, OverflowError):
         return None
@@ -1647,34 +1664,170 @@ def _parse_price_feed_timestamp(value):
 def _finite_positive(value):
     try:
         value = float(value)
-        return value if np.isfinite(value) and value > 0 else None
+        return value if math.isfinite(value) and value > 0 else None
     except (TypeError, ValueError):
         return None
 
 
-def _build_canonical_xauusd_feed(provider, spot, bid, ask, timestamp, *, is_stale_hint=False):
-    ts = _parse_price_feed_timestamp(timestamp)
-    spot_f = _finite_positive(spot)
-    bid_f = _finite_positive(bid)
-    ask_f = _finite_positive(ask)
-    if spot_f is None and bid_f is not None and ask_f is not None:
-        spot_f = (bid_f + ask_f) / 2.0
-    if ts is None or spot_f is None:
+def _build_canonical_xauusd_feed(payload, *, fetched_at=None, stale_hint=False):
+    now = fetched_at or datetime.now(timezone.utc)
+    if not isinstance(payload, dict):
         return {
-            'symbol': 'XAUUSD', 'provider': provider, 'status': 'MISSING',
-            'spot': None, 'mid': None, 'bid': bid_f, 'ask': ask_f,
-            'timestamp': None, 'age_seconds': None,
+            'symbol': 'XAUUSD', 'provider': 'ArgentAPI', 'status': 'MISSING',
+            'bid': None, 'ask': None, 'mid': None, 'spot': None,
+            'source_timestamp': None, 'fetched_timestamp': now.isoformat(),
+            'source_fetched_timestamp': None, 'age_seconds': None,
         }
-    age = max(0.0, (datetime.now(timezone.utc) - ts).total_seconds())
-    status = 'STALE' if is_stale_hint or age > PRICE_FEED_STALE_SECONDS else 'ACTIVE'
-    mid = (bid_f + ask_f) / 2.0 if bid_f is not None and ask_f is not None else spot_f
+
+    bid = _finite_positive(payload.get('bid'))
+    ask = _finite_positive(payload.get('ask'))
+    api_mid = _finite_positive(payload.get('mid'))
+    price = _finite_positive(payload.get('price'))
+    source_ts = _parse_price_feed_timestamp(payload.get('sourceTimestamp'))
+    provider_fetched = _parse_price_feed_timestamp(payload.get('fetchedAt'))
+    age_ms = _finite_positive(payload.get('ageMs'))
+    if provider_fetched is None and age_ms is not None:
+        provider_fetched = now - timedelta(seconds=age_ms / 1000.0)
+    if source_ts is None and provider_fetched is not None and age_ms is not None:
+        source_ts = provider_fetched - timedelta(seconds=age_ms / 1000.0)
+
+    if bid is not None and ask is not None:
+        mid = (bid + ask) / 2.0
+    elif api_mid is not None:
+        mid = api_mid
+    elif price is not None:
+        mid = price
+    else:
+        mid = None
+
+    spot = price if price is not None else mid
+    if mid is None or source_ts is None:
+        return {
+            'symbol': 'XAUUSD', 'provider': 'ArgentAPI', 'status': 'MISSING',
+            'bid': bid, 'ask': ask, 'mid': mid, 'spot': spot,
+            'source_timestamp': source_ts.isoformat() if source_ts else None,
+            'fetched_timestamp': now.isoformat(),
+            'source_fetched_timestamp': provider_fetched.isoformat() if provider_fetched else None,
+            'age_seconds': None,
+        }
+
+    calculated_age = max(0.0, (now - source_ts).total_seconds())
+    source_age = (age_ms / 1000.0) if age_ms is not None else calculated_age
+    age_seconds = max(0.0, float(source_age))
+    stale_flag = bool(payload.get('stale'))
+    status = 'STALE' if (stale_hint or stale_flag or age_seconds > PRICE_FEED_STALE_SECONDS) else 'ACTIVE'
+
     return {
-        'symbol': 'XAUUSD', 'provider': provider, 'status': status,
-        'spot': round(spot_f, 6), 'mid': round(mid, 6),
-        'bid': round(bid_f, 6) if bid_f is not None else None,
-        'ask': round(ask_f, 6) if ask_f is not None else None,
-        'timestamp': ts.isoformat(), 'age_seconds': round(age, 3),
+        'symbol': 'XAUUSD',
+        'provider': 'ArgentAPI',
+        'status': status,
+        'bid': round(bid, 6) if bid is not None else None,
+        'ask': round(ask, 6) if ask is not None else None,
+        'mid': round(mid, 6),
+        'spot': round(spot, 6) if spot is not None else round(mid, 6),
+        'source_timestamp': source_ts.isoformat(),
+        'fetched_timestamp': now.isoformat(),
+        'source_fetched_timestamp': provider_fetched.isoformat() if provider_fetched else None,
+        'age_seconds': round(age_seconds, 3),
     }
+
+
+def _refresh_cached_feed_status(feed):
+    if not feed:
+        return {
+            'symbol': 'XAUUSD', 'provider': 'ArgentAPI', 'status': 'MISSING',
+            'bid': None, 'ask': None, 'mid': None, 'spot': None,
+            'source_timestamp': None, 'fetched_timestamp': datetime.now(timezone.utc).isoformat(),
+            'source_fetched_timestamp': None, 'age_seconds': None,
+        }
+    source_ts = _parse_price_feed_timestamp(feed.get('source_timestamp'))
+    if source_ts is None or feed.get('mid') is None:
+        stale = dict(feed)
+        stale['status'] = 'MISSING'
+        stale['age_seconds'] = None
+        return stale
+    age_seconds = max(0.0, (datetime.now(timezone.utc) - source_ts).total_seconds())
+    refreshed = dict(feed)
+    refreshed['age_seconds'] = round(age_seconds, 3)
+    refreshed['status'] = 'STALE' if refreshed.get('status') == 'STALE' or age_seconds > PRICE_FEED_STALE_SECONDS else 'ACTIVE'
+    return refreshed
+
+
+def _argentapi_error_message(response):
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            for key in ('error', 'message', 'detail'):
+                if payload.get(key):
+                    return str(payload[key])[:300]
+    except Exception:
+        pass
+    try:
+        return str(response.text or '')[:300]
+    except Exception:
+        return ''
+
+
+def _log_argentapi_failure(error_type, http_status=None, message=''):
+    logger.warning('[XAUUSD_FEED] ArgentAPI failure type=%s http_status=%s message=%s', error_type, http_status, message)
+
+
+def fetch_canonical_xauusd_feed():
+    """Canonical live XAUUSD feed backed only by ArgentAPI with a 60s request gate."""
+    now_monotonic = time.monotonic()
+    with PRICE_FEED_LOCK:
+        cached = CANONICAL_XAUUSD_FEED_CACHE.get('feed')
+        last_request = float(CANONICAL_XAUUSD_FEED_CACHE.get('last_request_monotonic', 0.0) or 0.0)
+        if now_monotonic - last_request < PRICE_FEED_MIN_REQUEST_INTERVAL:
+            return _refresh_cached_feed_status(cached)
+
+        if not ARGENT_API_KEY:
+            _log_argentapi_failure('missing_api_key', None, 'ARGENT_API_KEY is not configured')
+            return {
+                'symbol': 'XAUUSD', 'provider': 'ArgentAPI', 'status': 'MISSING',
+                'bid': None, 'ask': None, 'mid': None, 'spot': None,
+                'source_timestamp': None, 'fetched_timestamp': datetime.now(timezone.utc).isoformat(),
+                'source_fetched_timestamp': None, 'age_seconds': None,
+            }
+
+        CANONICAL_XAUUSD_FEED_CACHE['last_request_monotonic'] = now_monotonic
+        try:
+            response = requests.get(
+                'https://api.argentapi.com/v1/spot/gold',
+                headers={'X-API-Key': ARGENT_API_KEY, 'Accept': 'application/json'},
+                timeout=5,
+            )
+        except Exception as exc:
+            _log_argentapi_failure('network', None, str(exc)[:300])
+            return _refresh_cached_feed_status(cached)
+
+        status_code = int(getattr(response, 'status_code', 0) or 0)
+        if status_code in (401, 403):
+            _log_argentapi_failure('authentication', status_code, _argentapi_error_message(response))
+            return _refresh_cached_feed_status(cached)
+        if status_code == 429:
+            _log_argentapi_failure('rate_limited', status_code, _argentapi_error_message(response))
+            return _refresh_cached_feed_status(cached)
+        if 500 <= status_code <= 599:
+            _log_argentapi_failure('server_error', status_code, _argentapi_error_message(response))
+            return _refresh_cached_feed_status(cached)
+        if status_code != 200:
+            _log_argentapi_failure('http_error', status_code, _argentapi_error_message(response))
+            return _refresh_cached_feed_status(cached)
+
+        try:
+            payload = response.json()
+        except Exception as exc:
+            _log_argentapi_failure('malformed_json', status_code, str(exc)[:300])
+            return _refresh_cached_feed_status(cached)
+
+        feed = _build_canonical_xauusd_feed(payload, fetched_at=datetime.now(timezone.utc))
+        if feed.get('status') != 'MISSING':
+            CANONICAL_XAUUSD_FEED_CACHE['feed'] = feed
+            return feed
+
+        _log_argentapi_failure('missing_fields', status_code, 'required price/timestamp fields are missing or invalid')
+        return _refresh_cached_feed_status(cached)
 
 
 def get_xauusd_execution_price(feed, direction, role):
@@ -1689,54 +1842,13 @@ def get_xauusd_execution_price(feed, direction, role):
     return feed.get('mid') or feed.get('spot')
 
 
-def fetch_canonical_xauusd_feed(previous_feed=None):
-    if not METALS_DEV_API_KEY:
-        if previous_feed and previous_feed.get('provider') == 'metals.dev' and previous_feed.get('timestamp'):
-            return _build_canonical_xauusd_feed(
-                'metals.dev', previous_feed.get('spot'), previous_feed.get('bid'),
-                previous_feed.get('ask'), previous_feed.get('timestamp'), is_stale_hint=True
-            )
-        return _build_canonical_xauusd_feed('metals.dev', None, None, None, None)
-
-    try:
-        response = requests.get(
-            'https://api.metals.dev/v1/metal/spot',
-            params={'api_key': METALS_DEV_API_KEY, 'metal': 'gold', 'currency': 'USD'},
-            headers={'Accept': 'application/json'},
-            timeout=5,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        rate = payload.get('rate') or {}
-        return _build_canonical_xauusd_feed(
-            'metals.dev', rate.get('price'), rate.get('bid'), rate.get('ask'), payload.get('timestamp')
-        )
-    except Exception as exc:
-        logger.warning('[XAUUSD_FEED] Metals.Dev request failed: %s', exc)
-        if previous_feed and previous_feed.get('provider') == 'metals.dev' and previous_feed.get('timestamp'):
-            return _build_canonical_xauusd_feed(
-                'metals.dev', previous_feed.get('spot'), previous_feed.get('bid'),
-                previous_feed.get('ask'), previous_feed.get('timestamp'), is_stale_hint=True
-            )
-        return _build_canonical_xauusd_feed('metals.dev', None, None, None, None)
-
 def fetch_live_spot_gold():
-    """Return canonical XAUUSD only; never substitute another instrument."""
     feed = fetch_canonical_xauusd_feed()
     return float(feed['mid']) if feed.get('status') == 'ACTIVE' and feed.get('mid') else 0.0
 
 
 def get_market_data():
-    now = datetime.now(timezone.utc)
-    with cache_lock:
-        snapshot = GLOBAL_CACHE.get('market_data', {}).copy()
-        last_updated = GLOBAL_CACHE.get('last_updated')
-    if last_updated is not None and (now - last_updated).total_seconds() < 5 and 'price_feed' in snapshot:
-        return snapshot
-
-    with cache_lock:
-        previous_feed = GLOBAL_CACHE.get('market_data', {}).get('price_feed')
-    feed = fetch_canonical_xauusd_feed(previous_feed=previous_feed)
+    feed = fetch_canonical_xauusd_feed()
     spot = feed.get('mid') if feed.get('status') == 'ACTIVE' else 0.0
     return {
         'gold': round(float(spot), 2) if spot else 0.0,
@@ -1748,9 +1860,7 @@ def get_market_data():
 
 def fetch_and_update_cache():
     try:
-        with cache_lock:
-            previous_feed = GLOBAL_CACHE.get('market_data', {}).get('price_feed')
-        feed = fetch_canonical_xauusd_feed(previous_feed=previous_feed)
+        feed = fetch_canonical_xauusd_feed()
         gold = feed.get('mid') if feed.get('status') == 'ACTIVE' else 0.0
         headers = {'User-Agent': 'Mozilla/5.0'}
         dxy = 99.85
@@ -1775,9 +1885,8 @@ def fetch_and_update_cache():
                 'price_feed': feed,
             }
             GLOBAL_CACHE['last_updated'] = datetime.now(timezone.utc)
-    except Exception as e:
-        print(f"خطأ تحديث كاش البيانات: {e}")
-
+    except Exception as exc:
+        logger.warning('[XAUUSD_FEED] cache update failure type=cache_update message=%s', str(exc)[:300])
 
 def get_chart_data_cached():
     now = datetime.now(timezone.utc)
@@ -2021,7 +2130,7 @@ def generate_quant_signal():
         candle_id = f"XAUUSD_M15_{pd.Timestamp(df.index[-1]).strftime('%Y%m%d_%H%M')}"
         candidate_signal = {
             'status':'SIGNAL','type':'🟢 شراء مرن' if signal_type=='BUY' else '🔴 بيع مرن',
-            'entry':round(current_price,2),'sl':sl,'tp1':tp1,'tp2':tp2,'rr':'1:2.2',
+            'entry':round(entry_price,2),'sl':sl,'tp1':tp1,'tp2':tp2,'rr':'1:2.2',
             'rsi':round(rsi,1),'dxy_corr':round(dxy_corr,2),'confidence':int(confidence*100),
             'risk':'1% مبدئياً (تُراجع حسب الثقة والتذبذب)','smc_note':smc_note,
             'candle_id':candle_id,'signal_candle_close':round(float(close.iloc[-1]),2),
@@ -2358,7 +2467,7 @@ async def reset_all_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
         release_db_connection(conn)
 
     with cache_lock:
-        GLOBAL_CACHE["market_data"] = {"gold": 0.0, "dxy": 99.85, "us10y": 4.63, "price_feed": {"symbol":"XAUUSD","provider":"metals.dev","status":"MISSING","spot":None,"mid":None,"bid":None,"ask":None,"timestamp":None,"age_seconds":None}}
+        GLOBAL_CACHE["market_data"] = {"gold": 0.0, "dxy": 99.85, "us10y": 4.63, "price_feed": {"symbol":"XAUUSD","provider":"legacy provider","status":"MISSING","spot":None,"mid":None,"bid":None,"ask":None,"timestamp":None,"age_seconds":None}}
         GLOBAL_CACHE["analysis"] = None
         GLOBAL_CACHE["last_updated"] = None
 
@@ -2628,10 +2737,25 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authenticated(chat_id):
         await safe_reply_text(update, "🔒 يرجى إدخال كلمة السر أولاً لاستخدام البوت.")
         return
-    
+
     data = get_market_data()
-    msg = f"📊 **أسعار الذهب اللحظية**\n🟡 الذهب (XAUUSD): ${data['gold']}\n💵 مؤشر الدولار: {data['dxy']}\n📈 عوائد السندات: {data['us10y']}%"
+    feed = data.get('price_feed') or {}
+    def fmt(value):
+        return f"{float(value):.2f}" if value is not None else "N/A"
+    age = f"{float(feed['age_seconds']):.1f} sec" if feed.get('age_seconds') is not None else "N/A"
+    msg = (
+        "📊 **XAUUSD Live Price Feed**\n"
+        f"Provider: {feed.get('provider', 'ArgentAPI')}\n"
+        f"Status: {feed.get('status', 'MISSING')}\n"
+        f"Bid: {fmt(feed.get('bid'))}\n"
+        f"Ask: {fmt(feed.get('ask'))}\n"
+        f"Mid: {fmt(feed.get('mid'))}\n"
+        f"Age: {age}\n"
+        f"💵 مؤشر الدولار: {data['dxy']}\n"
+        f"📈 عوائد السندات: {data['us10y']}%"
+    )
     await safe_reply_text(update, msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+
 
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id

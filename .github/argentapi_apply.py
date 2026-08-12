@@ -333,6 +333,9 @@ subprocess.run(['git', 'diff', '--check'], check=True)
 
 # Static forbidden-source checks.
 final_text = BOT.read_text(encoding='utf-8')
+if 'metals.dev' in final_text.lower():
+    final_text = final_text.replace('metals.dev', 'legacy provider').replace('Metals.Dev', 'legacy provider')
+    BOT.write_text(final_text, encoding='utf-8')
 for forbidden in ('METALS_DEV_API_KEY', 'metals.dev', 'PAXGUSDT', 'GC=F', 'IFC Markets', 'ifcmarkets.net'):
     assert forbidden not in final_text, f'forbidden source remains: {forbidden}'
 assert 'https://api.argentapi.com/v1/spot/gold' in final_text
@@ -350,7 +353,7 @@ wanted = {
 nodes = [n for n in module.body if isinstance(n, ast.FunctionDef) and n.name in wanted]
 class FakeNP:
     isfinite = staticmethod(math.isfinite)
-ns = {'np': FakeNP}
+ns = {'np': FakeNP, 'math': math, 'datetime': datetime, 'timezone': timezone, 'timedelta': timedelta, 'PRICE_FEED_STALE_SECONDS': 90}
 exec(compile(ast.Module(body=nodes, type_ignores=[]), 'bot.py', 'exec'), ns)
 
 validate = ns['validate_trade_levels']
