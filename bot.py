@@ -13,7 +13,6 @@ import json
 import time
 import threading
 import warnings
-from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
 import numpy as np
 import pandas as pd
@@ -323,6 +322,8 @@ logger = logging.getLogger('xau_quant_bot')
 FEATURE_VERSION = os.getenv('FEATURE_VERSION', 'v2.8-features-1')
 STRATEGY_VERSION = os.getenv('STRATEGY_VERSION', 'v2.8-flexible')
 MODEL_VERSION = os.getenv('MODEL_VERSION', 'rf-v1')
+METALS_DEV_API_KEY = os.getenv('METALS_DEV_API_KEY', '').strip()
+PRICE_FEED_STALE_SECONDS = int(os.getenv('PRICE_FEED_STALE_SECONDS', '90'))
 RAM_WARNING_MB = float(os.getenv('RAM_WARNING_MB', '400'))
 RAM_DEFER_MB = float(os.getenv('RAM_DEFER_MB', '450'))
 RAM_EMERGENCY_MB = float(os.getenv('RAM_EMERGENCY_MB', '480'))
@@ -1129,17 +1130,32 @@ learning_manager=LearningQueueManager(MAX_LEARNING_QUEUE)
 LEARNING_STOP_EVENT=threading.Event()
 
 def monitor_open_trades():
-    conn=get_db_connection()
-    try: cur=conn.cursor(); cur.execute("SELECT id,signal_type,entry_price,sl,tp1,tp2,trade_status FROM trades WHERE outcome IS NULL AND trade_status IN ('OPEN','TP1_HIT')"); rows=cur.fetchall()
-    except Exception as e: print(f"⚠️ تعذر تحميل الصفقات المفتوحة: {e}"); rows=[]
-    finally: release_db_connection(conn)
-    price=get_market_data().get('gold',0.0)
-    if price<=0: return
-    for trade_id,sig_type,entry,sl,tp1,tp2,status in rows:
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id,signal_type,entry_price,sl,tp1,tp2,trade_status FROM trades WHERE outcome IS NULL AND trade_status IN ('OPEN','TP1_HIT')")
+        rows = cur.fetchall()
+    except Exception as e:
+        print(f"⚠️ تعذر تحميل الصفقات المفتوحة: {e}")
+        rows = []
+    finally:
+        release_db_connection(conn)
+
+    market = get_market_data()
+    feed = market.get('price_feed') or {}
+    if feed.get('status') != 'ACTIVE':
+        return
+    for trade_id, sig_type, entry, sl, tp1, tp2, status in rows:
         try:
-            for event_status,event_price in evaluate_trade_lifecycle(sig_type,status,entry,sl,tp1,tp2,price=price):
-                if update_trade_state(trade_id,event_status,event_price) and event_status in {'TP2_HIT','SL_HIT'}: break
-        except Exception as e: print(f"⚠️ خطأ في دورة حياة الصفقة {trade_id}: {e}")
+            exit_price = get_xauusd_execution_price(feed, sig_type, 'EXIT')
+            if exit_price is None:
+                continue
+            for event_status, event_price in evaluate_trade_lifecycle(sig_type, status, entry, sl, tp1, tp2, price=exit_price):
+                if update_trade_state(trade_id, event_status, event_price) and event_status in {'TP2_HIT','SL_HIT'}:
+                    break
+        except Exception as e:
+            print(f"⚠️ خطأ في دورة حياة الصفقة {trade_id}: {e}")
+
 
 
 # ------------------------------------
@@ -1616,104 +1632,152 @@ def fetch_yahoo_direct(symbol, range_str="10d", interval_str="15m"):
         print(f"تنبيه الاستدعاء المباشر لـ {symbol}: {e}")
     return pd.DataFrame()
 
-def fetch_live_spot_gold():
-    """جلب سعر الذهب الفوري Spot Gold المباشر لرمز XAU/USD حصراً مع دعم الاحتياطي للشموع"""
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept': 'application/json'
+def _parse_price_feed_timestamp(value):
+    if value is None:
+        return None
+    try:
+        raw = str(value).strip()
+        if raw.isdigit():
+            return datetime.fromtimestamp(float(raw), tz=timezone.utc)
+        return datetime.fromisoformat(raw.replace('Z', '+00:00')).astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _finite_positive(value):
+    try:
+        value = float(value)
+        return value if np.isfinite(value) and value > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_canonical_xauusd_feed(provider, spot, bid, ask, timestamp, *, is_stale_hint=False):
+    ts = _parse_price_feed_timestamp(timestamp)
+    spot_f = _finite_positive(spot)
+    bid_f = _finite_positive(bid)
+    ask_f = _finite_positive(ask)
+    if spot_f is None and bid_f is not None and ask_f is not None:
+        spot_f = (bid_f + ask_f) / 2.0
+    if ts is None or spot_f is None:
+        return {
+            'symbol': 'XAUUSD', 'provider': provider, 'status': 'MISSING',
+            'spot': None, 'mid': None, 'bid': bid_f, 'ask': ask_f,
+            'timestamp': None, 'age_seconds': None,
+        }
+    age = max(0.0, (datetime.now(timezone.utc) - ts).total_seconds())
+    status = 'STALE' if is_stale_hint or age > PRICE_FEED_STALE_SECONDS else 'ACTIVE'
+    mid = (bid_f + ask_f) / 2.0 if bid_f is not None and ask_f is not None else spot_f
+    return {
+        'symbol': 'XAUUSD', 'provider': provider, 'status': status,
+        'spot': round(spot_f, 6), 'mid': round(mid, 6),
+        'bid': round(bid_f, 6) if bid_f is not None else None,
+        'ask': round(ask_f, 6) if ask_f is not None else None,
+        'timestamp': ts.isoformat(), 'age_seconds': round(age, 3),
     }
-    
-    # 1. المصدر الرئيسي الموحد: XAUUSD Spot عبر Yahoo Chart API
-    try:
-        r = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval=1m&range=1d", headers=headers, timeout=3)
-        if r.status_code == 200:
-            res = r.json()
-            price = float(res['chart']['result'][0]['meta']['regularMarketPrice'])
-            if price > 1000:
-                return round(price, 2)
-    except Exception:
-        pass
 
-    # 2. المصدر الثاني المباشر: IFC Markets XAUUSD Spot Scraping
-    try:
-        url_ifc = "https://www.ifcmarkets.net/market-data/precious-metals-prices/xauusd"
-        r = requests.get(url_ifc, headers=headers, timeout=3)
-        if r.status_code == 200:
-            soup = BeautifulSoup(r.text, 'html.parser')
-            price_elem = soup.find('span', {'class': re.compile(r'price|last|bid|ask', re.I)}) or \
-                         soup.find('div', {'class': re.compile(r'price|last|bid|ask', re.I)})
-            if price_elem:
-                clean_text = re.sub(r'[^\d.]', '', price_elem.text)
-                if clean_text:
-                    val = float(clean_text)
-                    if val > 1000:
-                        return round(val, 2)
-    except Exception:
-        pass
 
-    # 3. المصدر الثالث الاحتياطي: Binance PAXGUSDT
-    try:
-        r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT", headers=headers, timeout=2)
-        if r.status_code == 200:
-            price = float(r.json()['price'])
-            if price > 1000:
-                return round(price, 2)
-    except Exception:
-        pass
+def get_xauusd_execution_price(feed, direction, role):
+    direction = str(direction).upper()
+    role = str(role).upper()
+    if not feed or feed.get('status') != 'ACTIVE':
+        return None
+    if role == 'ENTRY':
+        return feed.get('ask') if direction == 'BUY' else feed.get('bid')
+    if role == 'EXIT':
+        return feed.get('bid') if direction == 'BUY' else feed.get('ask')
+    return feed.get('mid') or feed.get('spot')
 
-    # 4. المصدر الرابع الاحتياطي: الكاش المباشر لآخر شمعة مفحوصة
-    try:
-        with cache_lock:
-            df_m15 = MARKET_DATA_CACHE.get("df_gold_m15")
-            if df_m15 is not None and not df_m15.empty:
-                close_s = to_1d_series(df_m15['Close'])
-                last_price = float(close_s.iloc[-1])
-                if last_price > 1000:
-                    return round(last_price, 2)
-    except Exception:
-        pass
 
-    return 0.0
+def fetch_canonical_xauusd_feed(previous_feed=None):
+    if not METALS_DEV_API_KEY:
+        if previous_feed and previous_feed.get('provider') == 'metals.dev' and previous_feed.get('timestamp'):
+            return _build_canonical_xauusd_feed(
+                'metals.dev', previous_feed.get('spot'), previous_feed.get('bid'),
+                previous_feed.get('ask'), previous_feed.get('timestamp'), is_stale_hint=True
+            )
+        return _build_canonical_xauusd_feed('metals.dev', None, None, None, None)
+
+    try:
+        response = requests.get(
+            'https://api.metals.dev/v1/metal/spot',
+            params={'api_key': METALS_DEV_API_KEY, 'metal': 'gold', 'currency': 'USD'},
+            headers={'Accept': 'application/json'},
+            timeout=5,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        rate = payload.get('rate') or {}
+        return _build_canonical_xauusd_feed(
+            'metals.dev', rate.get('price'), rate.get('bid'), rate.get('ask'), payload.get('timestamp')
+        )
+    except Exception as exc:
+        logger.warning('[XAUUSD_FEED] Metals.Dev request failed: %s', exc)
+        if previous_feed and previous_feed.get('provider') == 'metals.dev' and previous_feed.get('timestamp'):
+            return _build_canonical_xauusd_feed(
+                'metals.dev', previous_feed.get('spot'), previous_feed.get('bid'),
+                previous_feed.get('ask'), previous_feed.get('timestamp'), is_stale_hint=True
+            )
+        return _build_canonical_xauusd_feed('metals.dev', None, None, None, None)
+
+def fetch_live_spot_gold():
+    """Return canonical XAUUSD only; never substitute another instrument."""
+    feed = fetch_canonical_xauusd_feed()
+    return float(feed['mid']) if feed.get('status') == 'ACTIVE' and feed.get('mid') else 0.0
+
 
 def get_market_data():
+    now = datetime.now(timezone.utc)
     with cache_lock:
-        if GLOBAL_CACHE["market_data"]["gold"] > 0:
-            return GLOBAL_CACHE["market_data"].copy()
-    
-    gold_price = fetch_live_spot_gold()
-    return {"gold": gold_price, "dxy": 99.85, "us10y": 4.63}
+        snapshot = GLOBAL_CACHE.get('market_data', {}).copy()
+        last_updated = GLOBAL_CACHE.get('last_updated')
+    if last_updated is not None and (now - last_updated).total_seconds() < 5 and 'price_feed' in snapshot:
+        return snapshot
+
+    with cache_lock:
+        previous_feed = GLOBAL_CACHE.get('market_data', {}).get('price_feed')
+    feed = fetch_canonical_xauusd_feed(previous_feed=previous_feed)
+    spot = feed.get('mid') if feed.get('status') == 'ACTIVE' else 0.0
+    return {
+        'gold': round(float(spot), 2) if spot else 0.0,
+        'dxy': 99.85,
+        'us10y': 4.63,
+        'price_feed': feed,
+    }
+
 
 def fetch_and_update_cache():
     try:
-        gold = fetch_live_spot_gold()
+        with cache_lock:
+            previous_feed = GLOBAL_CACHE.get('market_data', {}).get('price_feed')
+        feed = fetch_canonical_xauusd_feed(previous_feed=previous_feed)
+        gold = feed.get('mid') if feed.get('status') == 'ACTIVE' else 0.0
         headers = {'User-Agent': 'Mozilla/5.0'}
         dxy = 99.85
         us10y = 4.63
-
         try:
             r_dxy = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB?interval=1m&range=1d", headers=headers, timeout=2)
             if r_dxy.status_code == 200:
                 dxy = float(r_dxy.json()['chart']['result'][0]['meta']['regularMarketPrice'])
         except Exception:
             pass
-
         try:
             r_tnx = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/^TNX?interval=1m&range=1d", headers=headers, timeout=2)
             if r_tnx.status_code == 200:
                 us10y = float(r_tnx.json()['chart']['result'][0]['meta']['regularMarketPrice'])
         except Exception:
             pass
-
-        if gold > 0:
-            with cache_lock:
-                GLOBAL_CACHE["market_data"] = {
-                    "gold": round(gold, 2),
-                    "dxy": round(dxy, 2),
-                    "us10y": round(us10y, 2)
-                }
-                GLOBAL_CACHE["last_updated"] = datetime.now(timezone.utc)
+        with cache_lock:
+            GLOBAL_CACHE['market_data'] = {
+                'gold': round(float(gold), 2) if gold else 0.0,
+                'dxy': round(float(dxy), 2),
+                'us10y': round(float(us10y), 2),
+                'price_feed': feed,
+            }
+            GLOBAL_CACHE['last_updated'] = datetime.now(timezone.utc)
     except Exception as e:
         print(f"خطأ تحديث كاش البيانات: {e}")
+
 
 def get_chart_data_cached():
     now = datetime.now(timezone.utc)
@@ -1733,10 +1797,6 @@ def get_chart_data_cached():
             df_gold_h1 = fetch_yahoo_direct("XAUUSD=X", range_str="60d", interval_str="1h")
             df_gold_m15 = fetch_yahoo_direct("XAUUSD=X", range_str="10d", interval_str="15m")
             
-            if df_gold_m15.empty:
-                df_gold_m15 = fetch_yahoo_direct("GC=F", range_str="10d", interval_str="15m")
-            if df_gold_h1.empty:
-                df_gold_h1 = fetch_yahoo_direct("GC=F", range_str="60d", interval_str="1h")
 
             df_dxy_m15 = fetch_yahoo_direct("DX-Y.NYB", range_str="10d", interval_str="15m")
             df_us10y_m15 = fetch_yahoo_direct("^TNX", range_str="10d", interval_str="15m")
@@ -1842,10 +1902,11 @@ def analyze_institutional_engine():
         smc = detect_smc_setup(df_gold_m15)
         
         spot_data = get_market_data()
-        if spot_data and spot_data.get("gold") > 0:
-            last_price = spot_data["gold"]
-        else:
-            last_price = round(close_gold_m15.iloc[-1], 2)
+        price_feed = spot_data.get("price_feed") or {}
+        if price_feed.get("status") != "ACTIVE" or not price_feed.get("mid"):
+            logger.warning("[XAUUSD_FEED] live canonical feed is %s; signal generation paused", price_feed.get("status", "MISSING"))
+            return None
+        last_price = float(price_feed["mid"])
 
         update_open_trades_outcome_historical(df_gold_m15)
 
@@ -1853,6 +1914,7 @@ def analyze_institutional_engine():
             "h4_trend": h4_trend,
             "state_label": state_label,
             "last_price": last_price,
+            "price_feed": price_feed,
             "df_m15": df_gold_m15,
             "dxy_corr": dxy_corr,
             "us10y_trend": "DOWN" if (len(close_us10y_m15) >= 5 and close_us10y_m15.iloc[-1] < close_us10y_m15.iloc[-5]) else "UP",
@@ -1884,6 +1946,7 @@ def generate_quant_signal():
 
         h4_trend, state = data["h4_trend"], data["state_label"]
         df, dxy_corr, smc, current_price = data["df_m15"], data["dxy_corr"], data["smc"], data["last_price"]
+        price_feed = data.get("price_feed") or {}
         close, high, low = map(lambda c: to_1d_series(df[c]), ['Close','High','Low'])
         rsi = float(ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1])
         atr = float(ta.volatility.AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1])
@@ -1939,14 +2002,18 @@ def generate_quant_signal():
         if has_active_open_trade(signal_type):
             return {"status":"WAIT","reason":f"توجد صفقة {('شراء' if signal_type=='BUY' else 'بيع')} مفتوحة بالفعل؛ لن نكررها قبل حسم الصفقة الحالية.","price":current_price}
 
+        entry_price = get_xauusd_execution_price(price_feed, signal_type, 'ENTRY')
+        if entry_price is None:
+            return {"status":"WAIT", "reason":f"سعر XAUUSD التنفيذي غير متاح: {price_feed.get('status', 'MISSING')}", "price":current_price}
+
         if signal_type == 'BUY':
-            sl = round(current_price - atr*1.25,2); tp1 = round(current_price + atr*1.6,2); tp2 = round(current_price + atr*2.8,2)
+            sl = round(entry_price - atr*1.25,2); tp1 = round(entry_price + atr*1.6,2); tp2 = round(entry_price + atr*2.8,2)
             smc_note = 'تأكيد صاعد من السيولة/FVG' if reasons_bull else 'تأكيد من الزخم والاتجاه'
         else:
-            sl = round(current_price + atr*1.25,2); tp1 = round(current_price - atr*1.6,2); tp2 = round(current_price - atr*2.8,2)
+            sl = round(entry_price + atr*1.25,2); tp1 = round(entry_price - atr*1.6,2); tp2 = round(entry_price - atr*2.8,2)
             smc_note = 'تأكيد هابط من السيولة/FVG' if reasons_bear else 'تأكيد من الزخم والاتجاه'
 
-        is_valid, validation_reason = validate_trade_levels(signal_type, current_price, sl, tp1, tp2)
+        is_valid, validation_reason = validate_trade_levels(signal_type, entry_price, sl, tp1, tp2)
         if not is_valid:
             return {'status':'WAIT','reason':f'مستويات Entry/SL/TP غير صالحة: {validation_reason}','price':current_price}
 
@@ -1967,7 +2034,7 @@ def generate_quant_signal():
         if not gemini_eval.get('approved', True) and confidence < 0.55 and max(bull_score,bear_score) < 5.0:
             return {'status':'WAIT','reason':f"مراجعة Gemini أوصت بالانتظار: {gemini_eval.get('reason','مخاطرة مرتفعة')}", 'price':current_price}
 
-        inserted, trade_id = log_trade(signal_type, current_price, sl, tp1, tp2, round(rsi,1), dxy_corr, round(macd_diff,3), round(stoch_k,1), volatility_ratio, confidence, candle_id=candle_id, signal_score=max(bull_score,bear_score), ai_score=candidate_signal.get('ai_score'))
+        inserted, trade_id = log_trade(signal_type, entry_price, sl, tp1, tp2, round(rsi,1), dxy_corr, round(macd_diff,3), round(stoch_k,1), volatility_ratio, confidence, candle_id=candle_id, signal_score=max(bull_score,bear_score), ai_score=candidate_signal.get('ai_score'))
         if not inserted:
             return {'status':'WAIT','reason':'تمت معالجة هذه الشمعة مسبقاً؛ تم منع الإشعار المكرر.', 'price':current_price, 'candle_id':candle_id}
         candidate_signal['trade_id'] = trade_id
@@ -2291,7 +2358,7 @@ async def reset_all_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
         release_db_connection(conn)
 
     with cache_lock:
-        GLOBAL_CACHE["market_data"] = {"gold": 0.0, "dxy": 99.85, "us10y": 4.63}
+        GLOBAL_CACHE["market_data"] = {"gold": 0.0, "dxy": 99.85, "us10y": 4.63, "price_feed": {"symbol":"XAUUSD","provider":"metals.dev","status":"MISSING","spot":None,"mid":None,"bid":None,"ask":None,"timestamp":None,"age_seconds":None}}
         GLOBAL_CACHE["analysis"] = None
         GLOBAL_CACHE["last_updated"] = None
 
