@@ -27,9 +27,33 @@ jobs:
               raise SystemExit('test-runner insertion point not found')
           p.write_text(s.replace(needle, insert, 1), encoding='utf-8')
           PY
+      - name: Ensure runtime helper imports
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('bot.py')
+          s = p.read_text(encoding='utf-8')
+          if not s.startswith('import math\n') and '\nimport math\n' not in s:
+              s = 'import math\n' + s
+          p.write_text(s, encoding='utf-8')
+          PY
       - name: Apply patch and core tests
         shell: bash
         run: python3 .github/argentapi_apply.py
+      - name: Normalize generated feed state handling
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('bot.py')
+          s = p.read_text(encoding='utf-8')
+          old = "refreshed['status'] = 'STALE' if age_seconds > PRICE_FEED_STALE_SECONDS else 'ACTIVE'"
+          new = "refreshed['status'] = 'STALE' if refreshed.get('status') == 'STALE' or age_seconds > PRICE_FEED_STALE_SECONDS else 'ACTIVE'"
+          if old not in s:
+              raise SystemExit('cached stale-state line not found')
+          p.write_text(s.replace(old, new, 1), encoding='utf-8')
+          PY
       - name: ArgentAPI error and cooldown tests
         shell: bash
         run: |
@@ -61,7 +85,7 @@ jobs:
           class FakeNP: isfinite = staticmethod(math.isfinite)
           ns = {'np':FakeNP,'math':math,'datetime':datetime,'timezone':timezone,'timedelta':timedelta,'time':time,'threading':threading,'logger':FakeLogger(),'ARGENT_API_KEY':'test-key','PRICE_FEED_STALE_SECONDS':90,'PRICE_FEED_MIN_REQUEST_INTERVAL':60.0,'PRICE_FEED_LOCK':threading.Lock(),'CANONICAL_XAUUSD_FEED_CACHE':{'feed':None,'last_request_monotonic':0.0}}
           exec(compile(ast.Module(body=nodes,type_ignores=[]),'bot.py','exec'),ns)
-          build=ns['_build_canonical_xauusd_feed']; fetch=ns['fetch_canonical_xauusd_feed']; exec_price=ns['get_xauusd_execution_price']
+          build=ns['_build_canonical_xauusd_feed']; refresh=ns['_refresh_cached_feed_status']; fetch=ns['fetch_canonical_xauusd_feed']; exec_price=ns['get_xauusd_execution_price']
           now=datetime.now(timezone.utc)
           base={'bid':4395.0,'ask':4397.0,'mid':4396.0,'price':4396.0,'sourceTimestamp':(now-timedelta(seconds=10)).strftime('%b %d, %Y %H:%M'),'fetchedAt':int(now.timestamp()*1000),'ageMs':10000,'stale':False}
           feed=build(base,fetched_at=now)
@@ -71,6 +95,9 @@ jobs:
           assert exec_price(feed,'BUY','EXIT')==4395.0 and exec_price(feed,'SELL','EXIT')==4397.0
           stale=dict(base); stale['ageMs']=120000; stale['sourceTimestamp']=(now-timedelta(seconds=120)).strftime('%b %d, %Y %H:%M')
           stale_feed=build(stale,fetched_at=now); assert stale_feed['status']=='STALE'; assert exec_price(stale_feed,'BUY','ENTRY') is None
+          stale_flag=dict(base, stale=True)
+          stale_flag_feed=build(stale_flag,fetched_at=now); assert stale_flag_feed['status']=='STALE'
+          assert refresh(stale_flag_feed)['status']=='STALE'
           missing=build({'sourceTimestamp':now.strftime('%b %d, %Y %H:%M')},fetched_at=now); assert missing['status']=='MISSING'
           price_only=build({'price':4396.0,'sourceTimestamp':now.strftime('%b %d, %Y %H:%M')},fetched_at=now); assert price_only['status']=='ACTIVE' and price_only['mid']==4396.0 and exec_price(price_only,'BUY','ENTRY') is None
 
