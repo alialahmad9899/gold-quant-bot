@@ -1609,42 +1609,29 @@ def detect_smc_setup(df):
     }
 
 # ------------------------------------
-# 4. محرك البيانات الفورية الموحد
+# 4. محرك بيانات XAU/USD المعزول: Live Spot vs Historical OHLC
 # ------------------------------------
-def _set_yahoo_historical_cooldown(error_type,error_message):
+def _set_yahoo_historical_cooldown(error_type, error_message):
     with YAHOO_HISTORICAL_STATE_LOCK:
-        YAHOO_HISTORICAL_FEED_STATE['blocked_until']=time.monotonic()+max(1,YAHOO_HISTORICAL_COOLDOWN_SECONDS); YAHOO_HISTORICAL_FEED_STATE['error_type']=str(error_type); YAHOO_HISTORICAL_FEED_STATE['error_message']=str(error_message or '')[:300]
-    logger.warning('[MARKET_DATA] Yahoo historical cooldown type=%s seconds=%s message=%s',error_type,YAHOO_HISTORICAL_COOLDOWN_SECONDS,str(error_message or '')[:300])
+        YAHOO_HISTORICAL_FEED_STATE['blocked_until'] = time.monotonic() + max(1, YAHOO_HISTORICAL_COOLDOWN_SECONDS)
+        YAHOO_HISTORICAL_FEED_STATE['error_type'] = str(error_type)
+        YAHOO_HISTORICAL_FEED_STATE['error_message'] = str(error_message or '')[:300]
+    logger.warning('[MARKET_DATA] Yahoo historical cooldown type=%s seconds=%s message=%s', error_type, YAHOO_HISTORICAL_COOLDOWN_SECONDS, str(error_message or '')[:300])
+
 def _yahoo_historical_cooldown_active():
-    with YAHOO_HISTORICAL_STATE_LOCK: return time.monotonic()<float(YAHOO_HISTORICAL_FEED_STATE.get('blocked_until',0.0) or 0.0)
-def _set_yahoo_live_cooldown(error_type,error_message):
+    with YAHOO_HISTORICAL_STATE_LOCK:
+        return time.monotonic() < float(YAHOO_HISTORICAL_FEED_STATE.get('blocked_until', 0.0) or 0.0)
+
+def _set_yahoo_live_cooldown(error_type, error_message):
     with YAHOO_LIVE_STATE_LOCK:
-        YAHOO_LIVE_FEED_STATE['blocked_until']=time.monotonic()+max(1,YAHOO_LIVE_COOLDOWN_SECONDS); YAHOO_LIVE_FEED_STATE['error_type']=str(error_type); YAHOO_LIVE_FEED_STATE['error_message']=str(error_message or '')[:300]
-    logger.warning('[XAUUSD_FEED] Yahoo Spot cooldown type=%s seconds=%s message=%s',error_type,YAHOO_LIVE_COOLDOWN_SECONDS,str(error_message or '')[:300])
+        YAHOO_LIVE_FEED_STATE['blocked_until'] = time.monotonic() + max(1, YAHOO_LIVE_COOLDOWN_SECONDS)
+        YAHOO_LIVE_FEED_STATE['error_type'] = str(error_type)
+        YAHOO_LIVE_FEED_STATE['error_message'] = str(error_message or '')[:300]
+    logger.warning('[XAUUSD_FEED] Yahoo Spot cooldown type=%s seconds=%s message=%s', error_type, YAHOO_LIVE_COOLDOWN_SECONDS, str(error_message or '')[:300])
+
 def _yahoo_live_cooldown_active():
-    with YAHOO_LIVE_STATE_LOCK: return time.monotonic()<float(YAHOO_LIVE_FEED_STATE.get('blocked_until',0.0) or 0.0)
-
-def _yahoo_cooldown_active():
-    with YAHOO_STATE_LOCK: return time.monotonic() < float(YAHOO_FEED_STATE.get('blocked_until', 0.0) or 0.0)
-
-def fetch_yahoo_direct(symbol,range_str="10d",interval_str="15m"):
-    if _yahoo_historical_cooldown_active(): return pd.DataFrame()
-    headers={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36','Accept':'application/json','Referer':'https://finance.yahoo.com/'}
-    url=f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval={interval_str}&range={range_str}"
-    try:
-        response=requests.get(url,headers=headers,timeout=5); status=int(getattr(response,'status_code',0) or 0)
-        if status==429: _set_yahoo_historical_cooldown('rate_limited','Yahoo historical HTTP 429 rate limit.'); return pd.DataFrame()
-        if status!=200:
-            if status>=500: _set_yahoo_historical_cooldown('server_error',f'Yahoo historical HTTP {status}')
-            return pd.DataFrame()
-        data=response.json(); result=data.get('chart',{}).get('result') or []; ts=result[0].get('timestamp') if result else None; quotes=(result[0].get('indicators') or {}).get('quote') if result else None
-        if not result or not isinstance(result[0],dict) or not ts or not quotes: _set_yahoo_historical_cooldown('malformed_payload','Yahoo historical response is missing result/timestamps/OHLC.'); return pd.DataFrame()
-        q=quotes[0]; df=pd.DataFrame({'Open':q.get('open'),'High':q.get('high'),'Low':q.get('low'),'Close':q.get('close'),'Volume':q.get('volume',[0]*len(ts))},index=pd.to_datetime(ts,unit='s',utc=True)).dropna(subset=['Open','High','Low','Close'])
-        return df if not df.empty else pd.DataFrame()
-    except requests.Timeout as exc: _set_yahoo_historical_cooldown('timeout',str(exc)[:300]); return pd.DataFrame()
-    except requests.RequestException as exc: _set_yahoo_historical_cooldown('network',str(exc)[:300]); return pd.DataFrame()
-    except Exception as exc:
-        msg=f'{type(exc).__name__}: {exc}'; _set_yahoo_historical_cooldown('rate_limited' if any(x in msg.lower() for x in ('429','too many requests','yfratelimiterror')) else 'historical_error',msg); return pd.DataFrame()
+    with YAHOO_LIVE_STATE_LOCK:
+        return time.monotonic() < float(YAHOO_LIVE_FEED_STATE.get('blocked_until', 0.0) or 0.0)
 
 def _parse_price_feed_timestamp(value):
     if value is None:
@@ -1652,169 +1639,116 @@ def _parse_price_feed_timestamp(value):
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
     try:
-        raw = str(value).strip()
+        raw=str(value).strip()
         if not raw:
             return None
-        if raw.isdigit():
-            # Yahoo Finance fetchedAt is milliseconds, while some feeds use seconds.
-            numeric = float(raw)
-            if numeric > 1_000_000_000_000:
-                numeric /= 1000.0
-            return datetime.fromtimestamp(numeric, tz=timezone.utc)
-        for fmt in ('%b %d, %Y %H:%M', '%Y-%m-%d %H:%M:%S'):
-            try:
-                return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
-            except ValueError:
-                pass
-        return datetime.fromisoformat(raw.replace('Z', '+00:00')).astimezone(timezone.utc)
-    except (TypeError, ValueError, OverflowError):
+        return datetime.fromtimestamp(float(raw),tz=timezone.utc) if raw.isdigit() else datetime.fromisoformat(raw.replace('Z','+00:00')).astimezone(timezone.utc)
+    except (TypeError,ValueError,OverflowError):
         return None
-
 
 def _finite_positive(value):
     try:
-        value = float(value)
-        return value if math.isfinite(value) and value > 0 else None
-    except (TypeError, ValueError):
+        value=float(value)
+        return value if math.isfinite(value) and value>0 else None
+    except (TypeError,ValueError):
         return None
 
-
-def _build_canonical_xauusd_feed(payload, *, fetched_at=None, stale_hint=False):
-    now = fetched_at or datetime.now(timezone.utc)
-    if not isinstance(payload, dict):
-        return {
-            'symbol': 'XAUUSD', 'provider': 'Yahoo Finance', 'status': 'MISSING',
-            'bid': None, 'ask': None, 'mid': None, 'spot': None,
-            'source_timestamp': None, 'fetched_timestamp': now.isoformat(),
-            'source_fetched_timestamp': None, 'age_seconds': None,
-        }
-
-    bid = _finite_positive(payload.get('bid'))
-    ask = _finite_positive(payload.get('ask'))
-    api_mid = _finite_positive(payload.get('mid'))
-    price = _finite_positive(payload.get('price'))
-    source_ts = _parse_price_feed_timestamp(payload.get('sourceTimestamp'))
-    provider_fetched = _parse_price_feed_timestamp(payload.get('fetchedAt'))
-    age_ms = _finite_positive(payload.get('ageMs'))
-    if provider_fetched is None and age_ms is not None:
-        provider_fetched = now - timedelta(seconds=age_ms / 1000.0)
-    if source_ts is None and provider_fetched is not None and age_ms is not None:
-        source_ts = provider_fetched - timedelta(seconds=age_ms / 1000.0)
-
-    if bid is not None and ask is not None:
-        mid = (bid + ask) / 2.0
-    elif api_mid is not None:
-        mid = api_mid
-    elif price is not None:
-        mid = price
-    else:
-        mid = None
-
-    spot = price if price is not None else mid
-    if mid is None or source_ts is None:
-        return {
-            'symbol': 'XAUUSD', 'provider': 'Yahoo Finance', 'status': 'MISSING',
-            'bid': bid, 'ask': ask, 'mid': mid, 'spot': spot,
-            'source_timestamp': source_ts.isoformat() if source_ts else None,
-            'fetched_timestamp': now.isoformat(),
-            'source_fetched_timestamp': provider_fetched.isoformat() if provider_fetched else None,
-            'age_seconds': None,
-        }
-
-    calculated_age = max(0.0, (now - source_ts).total_seconds())
-    source_age = (age_ms / 1000.0) if age_ms is not None else calculated_age
-    age_seconds = max(0.0, float(source_age))
-    stale_flag = bool(payload.get('stale'))
-    status = 'STALE' if (stale_hint or stale_flag or age_seconds > PRICE_FEED_STALE_SECONDS) else 'ACTIVE'
-
-    return {
-        'symbol': 'XAUUSD',
-        'provider': 'Yahoo Finance',
-        'status': status,
-        'bid': round(bid, 6) if bid is not None else None,
-        'ask': round(ask, 6) if ask is not None else None,
-        'mid': round(mid, 6),
-        'spot': round(spot, 6) if spot is not None else round(mid, 6),
-        'source_timestamp': source_ts.isoformat(),
-        'timestamp': source_ts.isoformat(),
-        'fetched_timestamp': now.isoformat(),
-        'source_fetched_timestamp': provider_fetched.isoformat() if provider_fetched else None,
-        'age_seconds': round(age_seconds, 3),
-    }
-
-
-def _refresh_cached_feed_status(feed):
-    if not feed: return _build_missing_yahoo_feed('no_cached_feed','Yahoo XAUUSD Spot cache is empty and no fresh live quote is available.')
-    refreshed=dict(feed)
-    if refreshed.get('status')=='MISSING':
-        refreshed['error_type']=refreshed.get('error_type') or 'missing'; refreshed['error_message']=refreshed.get('error_message') or 'Yahoo XAUUSD Spot quote is unavailable.'; return refreshed
-    ts=_parse_price_feed_timestamp(refreshed.get('source_timestamp'))
-    if ts is None or refreshed.get('mid') is None:
-        refreshed['status']='MISSING'; refreshed['age_seconds']=None; refreshed['error_type']=refreshed.get('error_type') or 'missing_timestamp'; refreshed['error_message']=refreshed.get('error_message') or 'Yahoo XAUUSD Spot timestamp/price is missing.'; return refreshed
-    age=max(0.0,(datetime.now(timezone.utc)-ts).total_seconds()); refreshed['age_seconds']=round(age,3); refreshed['status']='STALE' if refreshed.get('status')=='STALE' or age>PRICE_FEED_STALE_SECONDS else 'ACTIVE'; return refreshed
-
 def _build_missing_yahoo_feed(error_type='missing', error_message='No live XAUUSD Spot data available.'):
-    now = datetime.now(timezone.utc)
+    now=datetime.now(timezone.utc)
     return {'symbol':'XAUUSD','provider':'Yahoo Finance','status':'MISSING','bid':None,'ask':None,'mid':None,'spot':None,'source_timestamp':None,'timestamp':None,'fetched_timestamp':now.isoformat(),'source_fetched_timestamp':None,'age_seconds':None,'error_type':str(error_type),'error_message':str(error_message or '')[:300],'spread_available':False}
-
 
 def _yahoo_live_error_message(response):
     try:
-        payload = response.json(); chart = payload.get('chart') or {}; err = chart.get('error')
-        if isinstance(err, dict): return str(err.get('description') or err.get('code') or '')[:300]
-    except Exception: pass
+        payload=response.json(); chart=payload.get('chart') or {}; err=chart.get('error')
+        if isinstance(err,dict): return str(err.get('description') or err.get('code') or '')[:300]
+    except Exception:
+        pass
     try: return str(response.text or '')[:300]
     except Exception: return ''
 
+def _log_yahoo_live_failure(error_type,http_status=None,message=''):
+    logger.warning('[XAUUSD_FEED] Yahoo Spot failure type=%s http_status=%s message=%s',error_type,http_status,str(message or '')[:300])
 
-def _log_yahoo_live_failure(error_type, http_status=None, message=''):
-    logger.warning('[XAUUSD_FEED] Yahoo Spot failure type=%s http_status=%s message=%s', error_type, http_status, str(message or '')[:300])
-
-
-def _set_yahoo_live_cooldown(error_type, error_message):
-    with YAHOO_STATE_LOCK:
-        YAHOO_FEED_STATE['blocked_until'] = time.monotonic() + max(1, YAHOO_COOLDOWN_SECONDS)
-        YAHOO_FEED_STATE['error_type'] = str(error_type); YAHOO_FEED_STATE['error_message'] = str(error_message or '')[:300]
-    logger.warning('[XAUUSD_FEED] Yahoo Spot cooldown type=%s seconds=%s message=%s', error_type, YAHOO_COOLDOWN_SECONDS, str(error_message or '')[:300])
-
-
-def _yahoo_live_cooldown_active():
-    with YAHOO_STATE_LOCK: return time.monotonic() < float(YAHOO_FEED_STATE.get('blocked_until', 0.0) or 0.0)
-
-
-def _build_yahoo_live_feed(payload, *, fetched_at=None):
-    now = fetched_at or datetime.now(timezone.utc)
-    if not isinstance(payload, dict): return _build_missing_yahoo_feed('malformed_payload','Yahoo returned a non-object payload.')
-    result = ((payload.get('chart') or {}).get('result') or [])
-    if not result or not isinstance(result[0], dict): return _build_missing_yahoo_feed('missing_result','Yahoo response does not contain chart.result.')
-    meta = result[0].get('meta') or {}
-    try: price = float(meta.get('regularMarketPrice'))
-    except (TypeError,ValueError): price = None
-    if price is None or not math.isfinite(price) or price <= 1000: return _build_missing_yahoo_feed('missing_price','Yahoo XAUUSD=X regularMarketPrice is missing or invalid.')
-    try: source_ts = datetime.fromtimestamp(float(meta.get('regularMarketTime')), tz=timezone.utc)
-    except (TypeError,ValueError,OverflowError): source_ts = None
+def _build_yahoo_live_feed(payload,*,fetched_at=None):
+    now=fetched_at or datetime.now(timezone.utc)
+    if not isinstance(payload,dict): return _build_missing_yahoo_feed('malformed_payload','Yahoo returned a non-object payload.')
+    result=((payload.get('chart') or {}).get('result') or [])
+    if not result or not isinstance(result[0],dict): return _build_missing_yahoo_feed('missing_result','Yahoo response does not contain chart.result.')
+    meta=result[0].get('meta') or {}
+    price=_finite_positive(meta.get('regularMarketPrice'))
+    if price is None or price <= 1000: return _build_missing_yahoo_feed('missing_price','Yahoo XAUUSD=X regularMarketPrice is missing or invalid.')
+    try: source_ts=datetime.fromtimestamp(float(meta.get('regularMarketTime')),tz=timezone.utc)
+    except (TypeError,ValueError,OverflowError): source_ts=None
     if source_ts is None: return _build_missing_yahoo_feed('missing_timestamp','Yahoo XAUUSD=X regularMarketTime is missing or invalid.')
-    age = max(0.0,(now-source_ts).total_seconds())
-    def finite_side(v):
-        try:
-            x=float(v); return x if math.isfinite(x) and x>1000 else None
-        except (TypeError,ValueError): return None
-    bid, ask = finite_side(meta.get('bid')), finite_side(meta.get('ask'))
-    spread_available = bid is not None and ask is not None
-    if not spread_available: bid = ask = price
-    mid = (bid + ask) / 2.0
+    age=max(0.0,(now-source_ts).total_seconds())
+    bid=_finite_positive(meta.get('bid')); ask=_finite_positive(meta.get('ask'))
+    spread_available=bid is not None and ask is not None
+    if not spread_available: bid=price; ask=price
+    mid=(bid+ask)/2.0
     return {'symbol':'XAUUSD','provider':'Yahoo Finance','status':'STALE' if age>PRICE_FEED_STALE_SECONDS else 'ACTIVE','bid':round(bid,6),'ask':round(ask,6),'mid':round(mid,6),'spot':round(price,6),'source_timestamp':source_ts.isoformat(),'timestamp':source_ts.isoformat(),'fetched_timestamp':now.isoformat(),'source_fetched_timestamp':None,'age_seconds':round(age,3),'error_type':None,'error_message':None,'spread_available':spread_available}
 
+def _refresh_cached_feed_status(feed):
+    if not feed:
+        return _build_missing_yahoo_feed('no_cached_feed','Yahoo XAUUSD Spot cache is empty and no fresh live quote is available.')
+    refreshed=dict(feed)
+    if refreshed.get('status')=='MISSING':
+        refreshed['error_type']=refreshed.get('error_type') or 'missing'
+        refreshed['error_message']=refreshed.get('error_message') or 'Yahoo XAUUSD Spot quote is unavailable.'
+        return refreshed
+    source_ts=_parse_price_feed_timestamp(refreshed.get('source_timestamp'))
+    if source_ts is None or refreshed.get('mid') is None:
+        refreshed['status']='MISSING'; refreshed['age_seconds']=None
+        refreshed['error_type']=refreshed.get('error_type') or 'missing_timestamp'
+        refreshed['error_message']=refreshed.get('error_message') or 'Yahoo XAUUSD Spot timestamp/price is missing.'
+        return refreshed
+    age=max(0.0,(datetime.now(timezone.utc)-source_ts).total_seconds())
+    refreshed['age_seconds']=round(age,3)
+    refreshed['status']='STALE' if refreshed.get('status')=='STALE' or age>PRICE_FEED_STALE_SECONDS else 'ACTIVE'
+    return refreshed
+
+def fetch_yahoo_direct(symbol,range_str='10d',interval_str='15m'):
+    """Historical XAUUSD OHLC only. Its cooldown/state is independent from live Spot."""
+    if _yahoo_historical_cooldown_active(): return pd.DataFrame()
+    headers={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36','Accept':'application/json','Referer':'https://finance.yahoo.com/'}
+    url=f'https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval={interval_str}&range={range_str}'
+    try:
+        response=requests.get(url,headers=headers,timeout=5); status=int(getattr(response,'status_code',0) or 0)
+        if status==429:
+            _set_yahoo_historical_cooldown('rate_limited','Yahoo historical HTTP 429 rate limit.'); return pd.DataFrame()
+        if status!=200:
+            if status>=500: _set_yahoo_historical_cooldown('server_error',f'Yahoo historical HTTP {status}')
+            return pd.DataFrame()
+        payload=response.json(); result=(payload.get('chart') or {}).get('result') or []
+        if not result or not isinstance(result[0],dict):
+            _set_yahoo_historical_cooldown('malformed_payload','Yahoo historical response missing chart.result.'); return pd.DataFrame()
+        timestamps=result[0].get('timestamp') or []; quotes=((result[0].get('indicators') or {}).get('quote') or [])
+        if not timestamps or not quotes:
+            _set_yahoo_historical_cooldown('missing_ohlc','Yahoo historical response missing OHLC arrays.'); return pd.DataFrame()
+        q=quotes[0]
+        df=pd.DataFrame({'Open':q.get('open'),'High':q.get('high'),'Low':q.get('low'),'Close':q.get('close'),'Volume':q.get('volume',[0]*len(timestamps))},index=pd.to_datetime(timestamps,unit='s',utc=True)).dropna(subset=['Open','High','Low','Close'])
+        return df if not df.empty else pd.DataFrame()
+    except requests.Timeout as exc:
+        _set_yahoo_historical_cooldown('timeout',str(exc)[:300]); return pd.DataFrame()
+    except requests.RequestException as exc:
+        _set_yahoo_historical_cooldown('network',str(exc)[:300]); return pd.DataFrame()
+    except Exception as exc:
+        msg=f'{type(exc).__name__}: {exc}'
+        _set_yahoo_historical_cooldown('rate_limited' if any(t in msg.lower() for t in ('429','too many requests','yfratelimiterror')) else 'historical_error',msg)
+        return pd.DataFrame()
 
 def fetch_canonical_xauusd_feed():
+    """Live XAUUSD Spot only; never substitute historical close, futures, crypto or scraping."""
     now_m=time.monotonic()
     with PRICE_FEED_LOCK:
-        cached=CANONICAL_XAUUSD_FEED_CACHE.get('feed'); last=float(CANONICAL_XAUUSD_FEED_CACHE.get('last_request_monotonic',0.0) or 0.0)
+        cached=CANONICAL_XAUUSD_FEED_CACHE.get('feed')
+        last=float(CANONICAL_XAUUSD_FEED_CACHE.get('last_request_monotonic',0.0) or 0.0)
         if now_m-last<PRICE_FEED_MIN_REQUEST_INTERVAL: return _refresh_cached_feed_status(cached)
-        if _yahoo_live_cooldown_active(): return _refresh_cached_feed_status(cached) if cached else _build_missing_yahoo_feed(YAHOO_LIVE_FEED_STATE.get('error_type') or 'cooldown',YAHOO_LIVE_FEED_STATE.get('error_message') or 'Yahoo live Spot cooldown is active.')
+        if _yahoo_live_cooldown_active():
+            return _refresh_cached_feed_status(cached) if cached else _build_missing_yahoo_feed(YAHOO_LIVE_FEED_STATE.get('error_type') or 'cooldown',YAHOO_LIVE_FEED_STATE.get('error_message') or 'Yahoo live Spot cooldown is active.')
         CANONICAL_XAUUSD_FEED_CACHE['last_request_monotonic']=now_m
     headers={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36','Accept':'application/json','Referer':'https://finance.yahoo.com/'}
-    try: response=requests.get('https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X',params={'interval':'1m','range':'1d'},headers=headers,timeout=5)
+    try:
+        response=requests.get('https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X',params={'interval':'1m','range':'1d'},headers=headers,timeout=5)
     except requests.Timeout as exc:
         msg=str(exc)[:300]; _set_yahoo_live_cooldown('timeout',msg); _log_yahoo_live_failure('timeout',None,msg); return _refresh_cached_feed_status(cached) if cached else _build_missing_yahoo_feed('timeout',msg)
     except requests.RequestException as exc:
@@ -1834,8 +1768,10 @@ def fetch_canonical_xauusd_feed():
     feed=_build_yahoo_live_feed(payload,fetched_at=datetime.now(timezone.utc))
     if feed.get('status')=='MISSING':
         msg=feed.get('error_message') or 'Yahoo live Spot payload did not contain a valid quote.'; _set_yahoo_live_cooldown(feed.get('error_type') or 'invalid_data',msg); CANONICAL_XAUUSD_FEED_CACHE['feed']=feed; _log_yahoo_live_failure(feed.get('error_type'),code,msg); return feed
-    with YAHOO_LIVE_STATE_LOCK: YAHOO_LIVE_FEED_STATE['blocked_until']=0.0; YAHOO_LIVE_FEED_STATE['error_type']=None; YAHOO_LIVE_FEED_STATE['error_message']=None
-    CANONICAL_XAUUSD_FEED_CACHE['feed']=feed; return feed
+    with YAHOO_LIVE_STATE_LOCK:
+        YAHOO_LIVE_FEED_STATE['blocked_until']=0.0; YAHOO_LIVE_FEED_STATE['error_type']=None; YAHOO_LIVE_FEED_STATE['error_message']=None
+    CANONICAL_XAUUSD_FEED_CACHE['feed']=feed
+    return feed
 
 def get_xauusd_execution_price(feed, direction, role):
     direction = str(direction).upper()
