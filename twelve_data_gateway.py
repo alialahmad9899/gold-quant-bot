@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import functools
 import inspect
@@ -28,6 +29,14 @@ H1_INTERVAL = 3600.0
 MAX_BACKOFF_SECONDS = 900.0
 
 _REQUEST_CLASS = contextvars.ContextVar("twelve_data_request_class", default="background")
+_MANUAL_CALLERS = {
+    "price",
+    "analyze",
+    "ai_info",
+    "signal",
+    "backtest",
+    "system_health_check",
+}
 
 _LOCK = threading.RLock()
 _STATE = {
@@ -47,13 +56,16 @@ def _utc_day() -> int:
     return int(datetime.now(timezone.utc).strftime("%Y%m%d"))
 
 
+def _manual_call_active() -> bool:
+    try:
+        return any(frame.function in _MANUAL_CALLERS for frame in inspect.stack(context=0)[1:])
+    except Exception:
+        return False
+
+
 @contextmanager
 def request_class_scope(request_class: str):
-    """Temporarily mark Twelve Data traffic as manual or background.
-
-    Context variables propagate through asyncio.to_thread(), allowing Telegram
-    handlers to keep their manual quota classification across worker threads.
-    """
+    """Temporarily mark Twelve Data traffic as manual or background."""
     value = "manual" if request_class == "manual" else "background"
     token = _REQUEST_CLASS.set(value)
     try:
@@ -73,6 +85,26 @@ def manual_request_handler(func):
 
 def _is_manual_context() -> bool:
     return _REQUEST_CLASS.get() == "manual"
+
+
+def _run_with_manual_scope(func, args, kwargs):
+    with request_class_scope("manual"):
+        return func(*args, **kwargs)
+
+
+def _install_asyncio_to_thread_guard():
+    if getattr(asyncio, "_gold_quant_twelve_data_context_guard_installed", False):
+        return
+    original = asyncio.to_thread
+
+    @functools.wraps(original)
+    async def guarded_to_thread(func, /, *args, **kwargs):
+        if _is_manual_context() or _manual_call_active():
+            return await original(_run_with_manual_scope, func, args, kwargs)
+        return await original(func, *args, **kwargs)
+
+    asyncio.to_thread = guarded_to_thread
+    asyncio._gold_quant_twelve_data_context_guard_installed = True
 
 
 def _is_postgres() -> bool:
@@ -281,10 +313,7 @@ def quota_summary():
 
 
 def is_manual_live_price_call():
-    for frame in inspect.stack()[1:]:
-        if frame.function == "price":
-            return True
-    return False
+    return _manual_call_active()
 
 
 def classify_url(url: str):
@@ -296,9 +325,9 @@ def classify_url(url: str):
     if endpoint == "time_series":
         key = f"time_series:{symbol}:{interval}"
         interval_seconds = M15_INTERVAL if interval == "15min" else H1_INTERVAL if interval in {"1h", "60min"} else 900.0
-        request_class = "manual" if _is_manual_context() else "background"
+        request_class = "manual" if (_is_manual_context() or _manual_call_active()) else "background"
         return request_class, key, MANUAL_QUOTE_INTERVAL if request_class == "manual" else interval_seconds
-    manual = _is_manual_context() or (is_manual_live_price_call() and endpoint == "quote" and symbol == "XAU/USD")
+    manual = _is_manual_context() or (_manual_call_active() and endpoint == "quote" and symbol == "XAU/USD")
     key = f"quote:{symbol}"
     return ("manual" if manual else "background"), key, (MANUAL_QUOTE_INTERVAL if manual else BACKGROUND_QUOTE_INTERVAL)
 
@@ -345,3 +374,6 @@ def wrap_requests_get(original_get):
             raise
     guarded_get.__name__ = getattr(original_get, "__name__", "get")
     return guarded_get
+
+
+_install_asyncio_to_thread_guard()
