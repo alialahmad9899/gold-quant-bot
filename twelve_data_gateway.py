@@ -1,0 +1,6 @@
+"""Centralized Twelve Data request guard."""
+
+TOTAL_BUDGET = 800
+BACKGROUND_BUDGET = 750
+MANUAL_RESERVE = 50
+MINUTE_BUDGET = 8
