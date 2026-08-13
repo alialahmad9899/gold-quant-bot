@@ -43,3 +43,30 @@ def test_failed_request_blocks_retries(tmp_path, monkeypatch):
         assert gateway.reserve_credit("background", "blocked", 0) is False
     finally:
         gateway.time.monotonic = old
+
+
+def test_manual_scope_classifies_quote_and_time_series_as_manual(tmp_path, monkeypatch):
+    monkeypatch.setenv("DB_FILE", str(tmp_path / "quota.db"))
+    gateway = importlib.import_module("twelve_data_gateway")
+    quote_url = "https://api.twelvedata.com/quote?symbol=XAU/USD&apikey=test"
+    series_url = "https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=15min&apikey=test"
+
+    assert gateway.classify_url(quote_url)[0] == "background"
+    assert gateway.classify_url(series_url)[0] == "background"
+    with gateway.request_class_scope("manual"):
+        assert gateway.classify_url(quote_url)[0] == "manual"
+        assert gateway.classify_url(series_url)[0] == "manual"
+
+
+def test_manual_scope_survives_async_to_thread(tmp_path, monkeypatch):
+    monkeypatch.setenv("DB_FILE", str(tmp_path / "quota.db"))
+    gateway = importlib.import_module("twelve_data_gateway")
+    url = "https://api.twelvedata.com/quote?symbol=XAU/USD&apikey=test"
+
+    async def probe():
+        import asyncio
+        with gateway.request_class_scope("manual"):
+            return await asyncio.to_thread(lambda: gateway.classify_url(url)[0])
+
+    import asyncio
+    assert asyncio.run(probe()) == "manual"
