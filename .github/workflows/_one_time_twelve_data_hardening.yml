@@ -1,0 +1,480 @@
+name: One-time Twelve Data hardening
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  harden:
+    if: github.actor == 'alialahmad9899' || github.actor == 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply hardening patch
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          root = Path('.')
+          bot_path = root / 'bot.py'
+          text = bot_path.read_text(encoding='utf-8')
+
+          old = '''# أزمنة تنظيم الطلبات للحفاظ المضمون على الخطة المجانية لـ Twelve Data
+          TWELVE_DATA_LIVE_INTERVAL = 60.0       # طلب السعر المباشر مرة كل 60 ثانية
+          TWELVE_DATA_OHLC_INTERVAL = 300.0      # طلب الشموع مرة كل 5 دقائق
+          LAST_TWELVE_DATA_QUOTE_TIME = 0.0
+          LAST_TWELVE_DATA_OHLC_TIME = 0.0
+          TWELVE_DATA_LOCK = threading.Lock()
+          '''
+          new = '''# ميزانية Twelve Data المحافظة للخطة المجانية
+          # نترك هامش أمان واضحاً تحت الحد اليومي الرسمي، ولا نستهلك الحصة كلها.
+          TWELVE_DATA_DAILY_BUDGET = int(os.getenv('TWELVE_DATA_DAILY_BUDGET', '650'))
+          TWELVE_DATA_MINUTE_BUDGET = int(os.getenv('TWELVE_DATA_MINUTE_BUDGET', '4'))
+          TWELVE_DATA_LIVE_INTERVAL = float(os.getenv('TWELVE_DATA_LIVE_INTERVAL', '180.0'))
+          TWELVE_DATA_OHLC_INTERVAL = float(os.getenv('TWELVE_DATA_OHLC_INTERVAL', '60.0'))
+          PRICE_FEED_EXECUTION_MAX_AGE = int(os.getenv('PRICE_FEED_EXECUTION_MAX_AGE', '300'))
+          LAST_TWELVE_DATA_QUOTE_TIME = 0.0
+          TWELVE_DATA_OHLC_LAST_REQUESTS = {}
+          TWELVE_DATA_LOCK = threading.Lock()
+          TWELVE_DATA_STATE = {
+              'day': datetime.now(timezone.utc).date().isoformat(),
+              'daily_requests': 0,
+              'minute_requests': [],
+              'blocked_until': 0.0,
+              'backoff_seconds': 0.0,
+              'daily_exhausted': False,
+              'last_error': None,
+              'last_request_at': None,
+          }
+
+          def _reset_twelve_data_budget_for_tests():
+              with TWELVE_DATA_LOCK:
+                  TWELVE_DATA_STATE.update({
+                      'day': datetime.now(timezone.utc).date().isoformat(),
+                      'daily_requests': 0,
+                      'minute_requests': [],
+                      'blocked_until': 0.0,
+                      'backoff_seconds': 0.0,
+                      'daily_exhausted': False,
+                      'last_error': None,
+                      'last_request_at': None,
+                  })
+
+          def _refresh_twelve_data_day(now_dt=None):
+              now_dt = now_dt or datetime.now(timezone.utc)
+              day = now_dt.date().isoformat()
+              if TWELVE_DATA_STATE.get('day') != day:
+                  TWELVE_DATA_STATE['day'] = day
+                  TWELVE_DATA_STATE['daily_requests'] = 0
+                  TWELVE_DATA_STATE['minute_requests'] = []
+                  TWELVE_DATA_STATE['blocked_until'] = 0.0
+                  TWELVE_DATA_STATE['backoff_seconds'] = 0.0
+                  TWELVE_DATA_STATE['daily_exhausted'] = False
+                  TWELVE_DATA_STATE['last_error'] = None
+
+          def _twelve_data_request_allowed(request_kind='quote'):
+              now = time.monotonic()
+              with TWELVE_DATA_LOCK:
+                  _refresh_twelve_data_day()
+                  TWELVE_DATA_STATE['minute_requests'] = [
+                      ts for ts in TWELVE_DATA_STATE['minute_requests'] if now - ts < 60.0
+                  ]
+                  if TWELVE_DATA_STATE['daily_exhausted']:
+                      return False
+                  if TWELVE_DATA_STATE['daily_requests'] >= TWELVE_DATA_DAILY_BUDGET:
+                      TWELVE_DATA_STATE['daily_exhausted'] = True
+                      return False
+                  if now < float(TWELVE_DATA_STATE.get('blocked_until', 0.0) or 0.0):
+                      return False
+                  if len(TWELVE_DATA_STATE['minute_requests']) >= TWELVE_DATA_MINUTE_BUDGET:
+                      return False
+                  return True
+
+          def _record_twelve_data_credit():
+              now = time.monotonic()
+              with TWELVE_DATA_LOCK:
+                  _refresh_twelve_data_day()
+                  TWELVE_DATA_STATE['daily_requests'] += 1
+                  TWELVE_DATA_STATE['minute_requests'] = [
+                      ts for ts in TWELVE_DATA_STATE['minute_requests'] if now - ts < 60.0
+                  ]
+                  TWELVE_DATA_STATE['minute_requests'].append(now)
+                  TWELVE_DATA_STATE['last_request_at'] = datetime.now(timezone.utc).isoformat()
+                  if TWELVE_DATA_STATE['daily_requests'] >= TWELVE_DATA_DAILY_BUDGET:
+                      TWELVE_DATA_STATE['daily_exhausted'] = True
+
+          def _record_twelve_data_success():
+              with TWELVE_DATA_LOCK:
+                  TWELVE_DATA_STATE['backoff_seconds'] = 0.0
+                  TWELVE_DATA_STATE['blocked_until'] = 0.0
+                  TWELVE_DATA_STATE['last_error'] = None
+
+          def _record_twelve_data_failure(error_message):
+              now = time.monotonic()
+              message = str(error_message or '')[:300]
+              lowered = message.lower()
+              with TWELVE_DATA_LOCK:
+                  previous = float(TWELVE_DATA_STATE.get('backoff_seconds', 0.0) or 0.0)
+                  delay = 60.0 if '429' in lowered else (30.0 if '403' in lowered or '401' in lowered else 15.0)
+                  delay = min(900.0, max(delay, previous * 2.0 if previous else delay))
+                  TWELVE_DATA_STATE['backoff_seconds'] = delay
+                  TWELVE_DATA_STATE['blocked_until'] = now + delay
+                  TWELVE_DATA_STATE['last_error'] = message
+                  if 'daily' in lowered or 'per day' in lowered or 'credits exhausted' in lowered:
+                      TWELVE_DATA_STATE['daily_exhausted'] = True
+
+          def twelve_data_quota_summary():
+              with TWELVE_DATA_LOCK:
+                  _refresh_twelve_data_day()
+                  now = time.monotonic()
+                  minute_count = len([ts for ts in TWELVE_DATA_STATE['minute_requests'] if now - ts < 60.0])
+                  return {
+                      'daily_used': int(TWELVE_DATA_STATE['daily_requests']),
+                      'daily_budget': int(TWELVE_DATA_DAILY_BUDGET),
+                      'minute_used': int(minute_count),
+                      'minute_budget': int(TWELVE_DATA_MINUTE_BUDGET),
+                      'blocked_until': float(TWELVE_DATA_STATE.get('blocked_until', 0.0) or 0.0),
+                      'daily_exhausted': bool(TWELVE_DATA_STATE.get('daily_exhausted')),
+                      'last_error': TWELVE_DATA_STATE.get('last_error'),
+                  }
+          '''
+          if old not in text:
+              raise SystemExit('quota block not found')
+          text = text.replace(old, new, 1)
+
+          new_live = '''def fetch_twelve_data_live_quote():
+              """جلب سعر XAU/USD المباشر من Twelve Data مع حواجز الحصة والتراجع الذكي."""
+              global LAST_TWELVE_DATA_QUOTE_TIME
+              if not TWELVE_DATA_API_KEY:
+                  return None
+
+              now = time.monotonic()
+              with TWELVE_DATA_LOCK:
+                  last_ok = float(LAST_TWELVE_DATA_QUOTE_TIME or 0.0)
+                  if last_ok and now - last_ok < TWELVE_DATA_LIVE_INTERVAL:
+                      return None
+              if not _twelve_data_request_allowed('quote'):
+                  return None
+
+              _record_twelve_data_credit()
+              url = f"https://api.twelvedata.com/quote?symbol=XAU/USD&apikey={TWELVE_DATA_API_KEY}"
+              try:
+                  r = requests.get(url, timeout=6)
+                  data = r.json() if r.content else {}
+                  if r.status_code != 200 or data.get('status') == 'error':
+                      message = data.get('message') or f'HTTP {r.status_code}'
+                      _record_twelve_data_failure(message)
+                      logger.warning('[TWELVE_DATA] Quote failed: %s', message)
+                      return None
+
+                  price = _finite_positive(data.get('close') or data.get('price'))
+                  if not price or price <= 1000:
+                      _record_twelve_data_failure('Invalid XAU/USD live price.')
+                      return None
+
+                  with TWELVE_DATA_LOCK:
+                      LAST_TWELVE_DATA_QUOTE_TIME = time.monotonic()
+                  bid = _finite_positive(data.get('bid'))
+                  ask = _finite_positive(data.get('ask'))
+                  spread_available = bid is not None and ask is not None and ask >= bid
+                  mid = (bid + ask) / 2.0 if spread_available else price
+
+                  ts_str = data.get('datetime') or data.get('timestamp')
+                  source_dt = datetime.now(timezone.utc)
+                  timestamp_source = 'fetched'
+                  if ts_str:
+                      parsed = _parse_price_feed_timestamp(ts_str)
+                      if parsed:
+                          source_dt = parsed
+                          timestamp_source = 'provider'
+
+                  now_dt = datetime.now(timezone.utc)
+                  age = max(0.0, (now_dt - source_dt).total_seconds())
+                  feed = {
+                      'symbol': 'XAU/USD',
+                      'provider': 'Twelve Data',
+                      'status': 'ACTIVE' if age <= PRICE_FEED_STALE_SECONDS else 'STALE',
+                      'bid': round(bid, 6) if bid is not None else None,
+                      'ask': round(ask, 6) if ask is not None else None,
+                      'mid': round(mid, 6),
+                      'spot': round(price, 6),
+                      'timestamp': source_dt.isoformat(),
+                      'source_timestamp': source_dt.isoformat(),
+                      'timestamp_source': timestamp_source,
+                      'fetched_timestamp': now_dt.isoformat(),
+                      'age_seconds': round(age, 3),
+                      'error_type': None,
+                      'error_message': None,
+                      'spread_available': bool(spread_available),
+                      'execution_ready': bool(spread_available and age <= PRICE_FEED_EXECUTION_MAX_AGE),
+                  }
+                  _record_twelve_data_success()
+                  return feed
+              except Exception as e:
+                  _record_twelve_data_failure(str(e))
+                  logger.warning('[TWELVE_DATA] Exception fetching live quote: %s', e)
+                  return None
+
+          '''
+          text, n = re.subn(r'def fetch_twelve_data_live_quote\(\):.*?\n(?=def fetch_twelve_data_ohlc)', new_live, text, count=1, flags=re.S)
+          if n != 1:
+              raise SystemExit('live quote block not found')
+
+          new_ohlc = '''def fetch_twelve_data_ohlc(symbol='XAU/USD', interval='15min', outputsize=150):
+              """جلب شموع OHLC التاريخية من Twelve Data مع كاش مستقل لكل فاصل زمني."""
+              if not TWELVE_DATA_API_KEY:
+                  return pd.DataFrame()
+
+              td_symbol = "XAU/USD" if "XAU" in symbol.upper() else symbol
+              td_interval = "15min" if interval in ("15m", "15min") else ("1h" if interval in ("1h", "60min") else "1day")
+              key = (td_symbol.upper(), td_interval)
+              now = time.monotonic()
+              with TWELVE_DATA_LOCK:
+                  last_request = float(TWELVE_DATA_OHLC_LAST_REQUESTS.get(key, 0.0) or 0.0)
+                  if last_request and now - last_request < TWELVE_DATA_OHLC_INTERVAL:
+                      return pd.DataFrame()
+              if not _twelve_data_request_allowed('ohlc'):
+                  return pd.DataFrame()
+
+              _record_twelve_data_credit()
+              url = f"https://api.twelvedata.com/time_series?symbol={td_symbol}&interval={td_interval}&outputsize={outputsize}&apikey={TWELVE_DATA_API_KEY}"
+              try:
+                  r = requests.get(url, timeout=8)
+                  data = r.json() if r.content else {}
+                  with TWELVE_DATA_LOCK:
+                      TWELVE_DATA_OHLC_LAST_REQUESTS[key] = time.monotonic()
+                  if r.status_code != 200 or data.get('status') == 'error':
+                      message = data.get('message') or f'HTTP {r.status_code}'
+                      _record_twelve_data_failure(message)
+                      logger.warning('[TWELVE_DATA] OHLC failed: %s', message)
+                      return pd.DataFrame()
+                  values = data.get('values', [])
+                  if not values:
+                      _record_twelve_data_failure('Twelve Data returned no OHLC values.')
+                      return pd.DataFrame()
+
+                  df = pd.DataFrame(values)
+                  if 'datetime' in df.columns:
+                      df['datetime'] = pd.to_datetime(df['datetime'], utc=True)
+                      df = df.set_index('datetime').sort_index()
+                  df = df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
+                  for col in ['Open', 'High', 'Low', 'Close']:
+                      if col not in df.columns:
+                          _record_twelve_data_failure(f'Missing OHLC field: {col}')
+                          return pd.DataFrame()
+                      df[col] = pd.to_numeric(df[col], errors='coerce')
+                  if 'Volume' in df.columns:
+                      df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce').fillna(0.0)
+                  else:
+                      df['Volume'] = 0.0
+                  df = df.dropna(subset=['Open', 'High', 'Low', 'Close'])
+                  if df.empty:
+                      _record_twelve_data_failure('Twelve Data OHLC payload became empty after validation.')
+                      return pd.DataFrame()
+                  _record_twelve_data_success()
+                  return df
+              except Exception as e:
+                  _record_twelve_data_failure(str(e))
+                  logger.warning('[TWELVE_DATA] Exception fetching OHLC: %s', e)
+                  return pd.DataFrame()
+
+          '''
+          text, n = re.subn(r'def fetch_twelve_data_ohlc\(.*?\n(?=def fetch_canonical_xauusd_feed)', new_ohlc, text, count=1, flags=re.S)
+          if n != 1:
+              raise SystemExit('ohlc block not found')
+
+          new_canonical = '''def fetch_canonical_xauusd_feed():
+              """المصدر المرجعي الوحيد لـ XAU/USD: Twelve Data، مع كاش حي صريح."""
+              now = time.monotonic()
+              cached = CANONICAL_XAUUSD_FEED_CACHE.get('feed')
+              if cached:
+                  refreshed = _refresh_cached_feed_status(cached)
+                  if refreshed.get('status') == 'ACTIVE':
+                      CANONICAL_XAUUSD_FEED_CACHE['feed'] = refreshed
+                      return refreshed
+
+              if TWELVE_DATA_API_KEY:
+                  feed_td = fetch_twelve_data_live_quote()
+                  if feed_td:
+                      CANONICAL_XAUUSD_FEED_CACHE['feed'] = feed_td
+                      return feed_td
+
+              if cached:
+                  stale = _refresh_cached_feed_status(cached)
+                  if stale.get('status') in {'ACTIVE', 'STALE'}:
+                      return stale
+
+              return _build_missing_twelve_feed(
+                  'unavailable',
+                  'تعذر الحصول على سعر XAU/USD المباشر من Twelve Data حالياً.'
+              )
+
+          '''
+          text, n = re.subn(r'def fetch_canonical_xauusd_feed\(\):.*?\n(?=def get_xauusd_execution_price)', new_canonical, text, count=1, flags=re.S)
+          if n != 1:
+              raise SystemExit('canonical feed block not found')
+
+          new_execution = '''def get_xauusd_execution_price(feed, direction, role):
+              direction = str(direction).upper()
+              role = str(role).upper()
+              if not feed or feed.get('status') != 'ACTIVE' or not feed.get('execution_ready'):
+                  return None
+              if feed.get('age_seconds') is None or float(feed.get('age_seconds')) > PRICE_FEED_EXECUTION_MAX_AGE:
+                  return None
+              if role == 'ENTRY':
+                  return feed.get('ask') if direction == 'BUY' else feed.get('bid')
+              if role == 'EXIT':
+                  return feed.get('bid') if direction == 'BUY' else feed.get('ask')
+              return feed.get('mid') or feed.get('spot')
+
+          '''
+          text, n = re.subn(r'def get_xauusd_execution_price\(.*?\n(?=def fetch_live_spot_gold)', new_execution, text, count=1, flags=re.S)
+          if n != 1:
+              raise SystemExit('execution block not found')
+
+          new_chart = '''def _historical_interval_needs_refresh(df, interval):
+              if df is None or df.empty or not isinstance(df.index, pd.DatetimeIndex):
+                  return True
+              now = pd.Timestamp(datetime.now(timezone.utc))
+              if interval == '15min':
+                  last_completed = now.floor('15min') - pd.Timedelta(minutes=15)
+              elif interval == '1h':
+                  last_completed = now.floor('1h') - pd.Timedelta(hours=1)
+              else:
+                  last_completed = now.floor('1D') - pd.Timedelta(days=1)
+              latest = pd.Timestamp(df.index[-1])
+              if latest.tzinfo is None:
+                  latest = latest.tz_localize('UTC')
+              else:
+                  latest = latest.tz_convert('UTC')
+              return latest < last_completed
+
+          def get_chart_data_cached():
+              now = datetime.now(timezone.utc)
+              with cache_lock:
+                  current = MARKET_DATA_CACHE.copy()
+                  m15_ready = not current['df_gold_m15'].empty
+                  h1_ready = not current['df_gold_h1'].empty
+              needs_m15 = _historical_interval_needs_refresh(current['df_gold_m15'], '15min')
+              needs_h1 = _historical_interval_needs_refresh(current['df_gold_h1'], '1h')
+              if m15_ready and h1_ready and not needs_m15 and not needs_h1:
+                  return current
+
+              with fetch_lock:
+                  with cache_lock:
+                      current = MARKET_DATA_CACHE.copy()
+                  needs_m15 = _historical_interval_needs_refresh(current['df_gold_m15'], '15min')
+                  needs_h1 = _historical_interval_needs_refresh(current['df_gold_h1'], '1h')
+                  if not (needs_m15 or needs_h1):
+                      return current
+
+                  if needs_h1:
+                      df_h1 = fetch_twelve_data_ohlc('XAU/USD', interval='1h', outputsize=150)
+                      if not df_h1.empty:
+                          with cache_lock:
+                              MARKET_DATA_CACHE['df_gold_h1'] = df_h1
+
+                  if needs_m15:
+                      df_m15 = fetch_twelve_data_ohlc('XAU/USD', interval='15min', outputsize=150)
+                      if not df_m15.empty:
+                          with cache_lock:
+                              MARKET_DATA_CACHE['df_gold_m15'] = df_m15
+
+                  with cache_lock:
+                      MARKET_DATA_CACHE['last_fetch'] = now
+                      return MARKET_DATA_CACHE.copy()
+
+          '''
+          text, n = re.subn(r'def get_chart_data_cached\(\):.*?\n(?=def get_verified_closed_m15)', new_chart, text, count=1, flags=re.S)
+          if n != 1:
+              raise SystemExit('chart cache block not found')
+
+          old_validation = """    except (TypeError, ValueError): return False, 'Entry/SL/TP must be numeric.'\n    if not all(np.isfinite(v) and v > 0 for v in (entry_f, sl_f, tp1_f, tp2_f)): return False, 'Entry/SL/TP must be finite positive prices.'\n    valid = (sl_f < entry_f < tp1_f < tp2_f) if direction == 'BUY' else ((tp2_f < tp1_f < entry_f < sl_f) if direction == 'SELL' else False)\n    return (True, 'OK') if valid else (False, 'Invalid BUY/SELL price ordering for Entry/SL/TP.')\n"""
+          new_validation = """    except (TypeError, ValueError): return False, 'مستويات الدخول ووقف الخسارة والأهداف يجب أن تكون أرقاماً صالحة.'\n    if not all(np.isfinite(v) and v > 0 for v in (entry_f, sl_f, tp1_f, tp2_f)): return False, 'مستويات الدخول ووقف الخسارة والأهداف يجب أن تكون أسعاراً موجبة وصالحة.'\n    valid = (sl_f < entry_f < tp1_f < tp2_f) if direction == 'BUY' else ((tp2_f < tp1_f < entry_f < sl_f) if direction == 'SELL' else False)\n    return (True, 'سليم') if valid else (False, 'ترتيب مستويات الدخول ووقف الخسارة والأهداف غير صالح لاتجاه الصفقة.')\n"""
+          if old_validation not in text:
+              raise SystemExit('validation block not found')
+          text = text.replace(old_validation, new_validation, 1)
+
+          old_price = '''    msg = (\n        "📊 **XAU/USD Live Price Feed (Twelve Data Pure)**\\n"\n        "Provider: Twelve Data\\n"\n        f"Status: {feed.get('status', 'MISSING')}\\n"\n        f"Bid: {fmt(feed.get('bid'))}\\n"\n        f"Ask: {fmt(feed.get('ask'))}\\n"\n        f"Mid: {fmt(feed.get('mid'))}\\n"\n        f"Timestamp: {timestamp}\\n"\n        f"Age: {age}\\n"\n        f"Reason: {reason or 'N/A'}"\n    )\n'''
+          new_price = '''    status_map = {\n        'ACTIVE': 'نشط',\n        'STALE': 'قديم',\n        'MISSING': 'غير متاح',\n    }\n    quota = twelve_data_quota_summary()\n    msg = (\n        "📊 **سعر الذهب XAU/USD المباشر**\\n"\n        "───────────────────\\n"\n        "📡 **المزود:** Twelve Data\\n"\n        f"📍 **الحالة:** {status_map.get(feed.get('status'), feed.get('status', 'غير متاح'))}\\n"\n        f"🟢 **Bid:** {fmt(feed.get('bid'))}\\n"\n        f"🔴 **Ask:** {fmt(feed.get('ask'))}\\n"\n        f"💰 **السعر المتوسط:** {fmt(feed.get('mid'))}\\n"\n        f"🕒 **وقت المصدر:** {timestamp}\\n"\n        f"⏱️ **عمر البيانات:** {age}\\n"\n        f"🎯 **جاهزية التنفيذ:** {'نعم' if feed.get('execution_ready') else 'لا'}\\n"\n        f"📦 **استهلاك الحصة اليومي:** {quota['daily_used']}/{quota['daily_budget']}\\n"\n        f"⚡ **استهلاك الدقيقة:** {quota['minute_used']}/{quota['minute_budget']}\\n"\n        f"💡 **الملاحظة:** {reason or 'البيانات تعمل ضمن القيود الحالية.'}"\n    )\n'''
+          if old_price not in text:
+              raise SystemExit('price message block not found')
+          text = text.replace(old_price, new_price, 1)
+
+          old_health = '''    report_lines.append("\\n📊 **4. فحص اتصالات أسعار الذهب عبر Twelve Data:**")\n    gold_price = await asyncio.to_thread(fetch_live_spot_gold)\n'''
+          new_health = '''    report_lines.append("\\n📊 **4. فحص اتصال Twelve Data وحصة الاستخدام:**")\n    quota = twelve_data_quota_summary()\n    report_lines.append(f"  📦 الحصة اليومية: {quota['daily_used']}/{quota['daily_budget']} | الدقيقة: {quota['minute_used']}/{quota['minute_budget']}")\n    if quota['daily_exhausted']:\n        report_lines.append("  🛑 تم إيقاف طلبات Twelve Data مؤقتاً لحماية الحصة اليومية.")\n    elif quota['blocked_until'] > time.monotonic():\n        report_lines.append("  ⏳ يوجد تباطؤ أمني مؤقت بعد خطأ سابق في Twelve Data.")\n    gold_price = await asyncio.to_thread(fetch_live_spot_gold)\n'''
+          if old_health not in text:
+              raise SystemExit('health block not found')
+          text = text.replace(old_health, new_health, 1)
+
+          old_failed_password = 'await notify_admin(context, f"⚠️ **محاولة دخول فاشلة!**\\nالمستخدم: {user_info}\\nكلمة السر المدخلة: `{text}`")'
+          new_failed_password = 'await notify_admin(context, f"⚠️ **محاولة دخول فاشلة!**\\nالمستخدم: {user_info}\\nتنبيه: تم رفض محاولة الدخول دون تسجيل كلمة السر.")'
+          if old_failed_password in text:
+              text = text.replace(old_failed_password, new_failed_password, 1)
+
+          bot_path.write_text(text, encoding='utf-8')
+
+          req = root / 'requirements.txt'
+          req_text = req.read_text(encoding='utf-8')
+          if not re.search(r'^scikit-learn(?:[<>=].*)?$', req_text, flags=re.M):
+              req_text += 'scikit-learn\n'
+          req.write_text(req_text, encoding='utf-8')
+
+          readme = root / 'README.md'
+          readme.write_text('''# Gold Quant Bot\n\nبوت تداول كمي للذهب XAU/USD يعمل عبر Telegram، ويجمع بين التحليل الفني/الكمي، SMC/HMM/ML، Gemini، وإدارة دورة حياة الصفقة.\n\n## بنية المشروع\n\n- `bot.py` — التطبيق الرئيسي ومحركات السوق والصفقات والتعلم.\n- `tests/` — اختبارات regression الخاصة بمسار Twelve Data والحصة والمنطق التنفيذي.\n- `requirements.txt` — اعتماديات التشغيل.\n\n## مصدر بيانات السوق\n\n**Twelve Data هو المصدر الوحيد لسعر وبيانات XAU/USD في مسار الإنتاج.** لا يستخدم البوت Yahoo Finance أو العقود الآجلة أو العملات المشفرة أو scraping كمصدر بديل.\n\nبيانات M15/H1 التاريخية تستخدم للتحليل من الكاش، بينما إنشاء صفقة جديدة يتطلب Live Quote حديثاً وصالحاً من Twelve Data مع Bid/Ask صالحين. لا يتم تحويل إغلاق شمعة M15 إلى سعر تنفيذ لحظي.\n\n## حماية الخطة المجانية\n\nيعمل النظام بميزانية داخلية محافظة للطلبات مع حد للدقيقة واليوم، وتراجع تلقائي بعد أخطاء API، وحالة حماية عند الاقتراب من الحصة. الهدف هو حماية الحصة اليومية وعدم استنزافها بالكامل.\n\n## رسائل Telegram\n\nتبقى الرسائل التي يراها المستخدم عبر Telegram باللغة العربية. التفاصيل التقنية الخاصة بالسجلات الداخلية قد تظهر بالإنجليزية عندما تكون مرتبطة باسم API أو استثناء برمجي.\n\n## التشغيل\n\nاضبط متغيرات البيئة المطلوبة: `TELEGRAM_TOKEN` و`BOT_PASSWORD` و`TWELVE_DATA_API_KEY`، و`DATABASE_URL` عند استخدام PostgreSQL، و`GEMINI_API_KEY` عند تفعيل Gemini. ثم ثبّت الاعتماديات من `requirements.txt` وشغّل `python bot.py`.\n\n## التحقق\n\nالحد الأدنى قبل النشر:\n\n`python3 -m py_compile bot.py`\n\n`python3 -m pytest -q`\n''', encoding='utf-8')
+
+          tests = root / 'tests'
+          tests.mkdir(exist_ok=True)
+          (tests / 'test_twelve_data_guardrails.py').write_text('''import importlib.util\nimport os\nfrom pathlib import Path\n\nos.environ.setdefault("TELEGRAM_TOKEN", "test-token")\nos.environ.setdefault("BOT_PASSWORD", "test-password")\nos.environ.setdefault("TWELVE_DATA_API_KEY", "test-key")\n\nBOT_PATH = Path(__file__).resolve().parents[1] / "bot.py"\nspec = importlib.util.spec_from_file_location("gold_quant_bot", BOT_PATH)\nmodule = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(module)\n\ndef test_twelve_data_budget_is_conservative():\n    assert 0 < module.TWELVE_DATA_DAILY_BUDGET < 800\n    assert 0 < module.TWELVE_DATA_MINUTE_BUDGET < 8\n\ndef test_daily_budget_blocks_after_limit(monkeypatch):\n    module._reset_twelve_data_budget_for_tests()\n    monkeypatch.setattr(module, "TWELVE_DATA_DAILY_BUDGET", 2)\n    module._record_twelve_data_credit()\n    module._record_twelve_data_credit()\n    assert not module._twelve_data_request_allowed("quote")\n    assert module.TWELVE_DATA_STATE["daily_exhausted"] is True\n\ndef test_failed_request_enters_backoff(monkeypatch):\n    module._reset_twelve_data_budget_for_tests()\n    now = 1000.0\n    monkeypatch.setattr(module.time, "monotonic", lambda: now)\n    module._record_twelve_data_failure("429 Too Many Requests")\n    assert module.TWELVE_DATA_STATE["blocked_until"] > now\n''', encoding='utf-8')
+
+          (tests / 'test_market_feed_semantics.py').write_text('''import importlib.util\nimport os\nfrom datetime import datetime, timezone, timedelta\nfrom pathlib import Path\n\nos.environ.setdefault("TELEGRAM_TOKEN", "test-token")\nos.environ.setdefault("BOT_PASSWORD", "test-password")\nos.environ.setdefault("TWELVE_DATA_API_KEY", "test-key")\nBOT_PATH = Path(__file__).resolve().parents[1] / "bot.py"\nspec = importlib.util.spec_from_file_location("gold_quant_bot_feed", BOT_PATH)\nmodule = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(module)\n\ndef test_m15_cache_never_becomes_live_execution_feed(monkeypatch):\n    module.CANONICAL_XAUUSD_FEED_CACHE['feed'] = None\n    module.MARKET_DATA_CACHE['df_gold_m15'] = module.pd.DataFrame({'Close': [3300.0]}, index=[datetime.now(timezone.utc) - timedelta(minutes=5)])\n    monkeypatch.setattr(module, 'fetch_twelve_data_live_quote', lambda: None)\n    feed = module.fetch_canonical_xauusd_feed()\n    assert feed['status'] == 'MISSING'\n    assert feed.get('execution_ready') is not True\n\ndef test_stale_live_quote_is_not_execution_ready():\n    feed = {\n        'status': 'ACTIVE', 'execution_ready': True, 'bid': 3299.0, 'ask': 3301.0,\n        'mid': 3300.0, 'timestamp': (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat(),\n    }\n    refreshed = module._refresh_cached_feed_status(feed)\n    assert refreshed['status'] == 'STALE'\n''', encoding='utf-8')
+
+          (tests / 'test_market_cache_refresh.py').write_text('''import importlib.util\nimport os\nfrom datetime import datetime, timezone, timedelta\nfrom pathlib import Path\n\nos.environ.setdefault("TELEGRAM_TOKEN", "test-token")\nos.environ.setdefault("BOT_PASSWORD", "test-password")\nos.environ.setdefault("TWELVE_DATA_API_KEY", "test-key")\nBOT_PATH = Path(__file__).resolve().parents[1] / "bot.py"\nspec = importlib.util.spec_from_file_location("gold_quant_bot_cache", BOT_PATH)\nmodule = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(module)\n\ndef test_fresh_15m_cache_does_not_need_refresh():\n    ts = datetime.now(timezone.utc) - timedelta(minutes=5)\n    df = module.pd.DataFrame({'Close': [3300.0]}, index=[ts])\n    assert module._historical_interval_needs_refresh(df, '15min') is False\n\ndef test_old_15m_cache_needs_refresh():\n    ts = datetime.now(timezone.utc) - timedelta(hours=1)\n    df = module.pd.DataFrame({'Close': [3300.0]}, index=[ts])\n    assert module._historical_interval_needs_refresh(df, '15min') is True\n''', encoding='utf-8')
+
+          (tests / 'test_signal_execution_guard.py').write_text('''import importlib.util\nimport os\nfrom pathlib import Path\n\nos.environ.setdefault("TELEGRAM_TOKEN", "test-token")\nos.environ.setdefault("BOT_PASSWORD", "test-password")\nos.environ.setdefault("TWELVE_DATA_API_KEY", "test-key")\nBOT_PATH = Path(__file__).resolve().parents[1] / "bot.py"\nspec = importlib.util.spec_from_file_location("gold_quant_bot_signal", BOT_PATH)\nmodule = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(module)\n\ndef test_execution_requires_real_bid_ask():\n    feed = {'status': 'ACTIVE', 'execution_ready': False, 'bid': None, 'ask': None, 'mid': 3300.0}\n    assert module.get_xauusd_execution_price(feed, 'BUY', 'ENTRY') is None\n    assert module.get_xauusd_execution_price(feed, 'SELL', 'ENTRY') is None\n''', encoding='utf-8')
+
+          (tests / 'test_project_hygiene.py').write_text('''from pathlib import Path\n\ndef test_requirements_declare_sklearn():\n    req = Path('requirements.txt').read_text(encoding='utf-8')\n    assert 'scikit-learn' in req\n\ndef test_readme_matches_twelve_data_only_architecture():\n    readme = Path('README.md').read_text(encoding='utf-8')\n    assert 'Twelve Data هو المصدر الوحيد' in readme\n    assert 'Yahoo Finance هو المصدر الأساسي' not in readme\n\ndef test_no_english_user_price_labels():\n    bot = Path('bot.py').read_text(encoding='utf-8')\n    assert 'Provider: Twelve Data' not in bot\n    assert 'Status:' not in bot\n''', encoding='utf-8')
+
+          # لا نترك الـworkflow المؤقت في المشروع بعد نجاح عملية الترحيل.
+          workflow = root / '.github/workflows/_one_time_twelve_data_hardening.yml'
+          if workflow.exists():
+              workflow.unlink()
+          PY
+
+      - name: Install dependencies
+        run: python3 -m pip install --upgrade pip && python3 -m pip install -r requirements.txt pytest
+
+      - name: Verify
+        env:
+          TELEGRAM_TOKEN: test-token
+          BOT_PASSWORD: test-password
+          TWELVE_DATA_API_KEY: test-key
+        run: |
+          python3 -m py_compile bot.py
+          python3 -m pytest -q
+          git diff --check
+          if grep -RniE 'Yahoo Finance|query1\.finance\.yahoo|query2\.finance\.yahoo|yfinance' bot.py; then
+            echo 'Yahoo Finance code still exists in bot.py'
+            exit 1
+          fi
+
+      - name: Commit verified hardening
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bot.py requirements.txt README.md tests docs/superpowers/plans/2026-08-13-twelve-data-free-hardening.md .github/workflows/_one_time_twelve_data_hardening.yml
+          if git diff --cached --quiet; then
+            echo 'No changes to commit'
+            exit 0
+          fi
+          git commit -m "fix: harden Twelve Data free-tier execution path"
+          git push origin main
