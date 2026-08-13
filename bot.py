@@ -300,8 +300,8 @@ PRICE_FEED_MIN_REQUEST_INTERVAL = 1.5
 PRICE_FEED_LOCK = threading.Lock()
 CANONICAL_XAUUSD_FEED_CACHE = {'feed': None, 'last_request_monotonic': 0.0, 'blocked_until': 0.0}
 
-YAHOO_LIVE_COOLDOWN_SECONDS = int(os.getenv('YAHOO_LIVE_COOLDOWN_SECONDS', '60'))
-YAHOO_HISTORICAL_COOLDOWN_SECONDS = int(os.getenv('YAHOO_HISTORICAL_COOLDOWN_SECONDS', '300'))
+YAHOO_LIVE_COOLDOWN_SECONDS = max(60, int(os.getenv('YAHOO_LIVE_COOLDOWN_SECONDS', '60')))
+YAHOO_HISTORICAL_COOLDOWN_SECONDS = max(300, int(os.getenv('YAHOO_HISTORICAL_COOLDOWN_SECONDS', '300')))
 YAHOO_HISTORICAL_FETCH_INTERVAL_SECONDS = int(os.getenv('YAHOO_HISTORICAL_FETCH_INTERVAL_SECONDS', '300'))
 YAHOO_LIVE_FEED_STATE = {'blocked_until': 0.0, 'error_type': None, 'error_message': None}
 YAHOO_HISTORICAL_FEED_STATE = {'blocked_until': 0.0, 'error_type': None, 'error_message': None}
@@ -311,6 +311,10 @@ YAHOO_LIVE_REQUEST_LOCK = threading.Lock()
 YAHOO_HISTORICAL_REQUEST_LOCK = threading.Lock()
 YAHOO_HIST_CACHE = {}
 YAHOO_HTTP_DIAGNOSTIC = {'status': None, 'host': None, 'transport': None, 'error_type': None, 'message': None}
+YAHOO_AUX_LIVE_CACHE = {}
+YAHOO_AUX_LIVE_CACHE_TTL = 60.0
+YAHOO_AUX_LIVE_CACHE_LOCK = threading.Lock()
+
 
 RAM_WARNING_MB = float(os.getenv('RAM_WARNING_MB', '400'))
 RAM_DEFER_MB = float(os.getenv('RAM_DEFER_MB', '450'))
@@ -1713,6 +1717,31 @@ def http_get_yahoo(url, timeout=8):
                 continue
     return None
 
+def fetch_yahoo_aux_live(symbol, ttl=60.0):
+    key = str(symbol)
+    now = time.monotonic()
+    with YAHOO_AUX_LIVE_CACHE_LOCK:
+        cached = YAHOO_AUX_LIVE_CACHE.get(key)
+        if cached and now - cached.get('last_checked', 0.0) < float(ttl):
+            return cached.get('value')
+        data = http_get_yahoo(
+            f'https://query1.finance.yahoo.com/v8/finance/chart/{key}?interval=1m&range=1d',
+            timeout=4,
+        )
+        value = None
+        if data and (data.get('chart') or {}).get('result'):
+            try:
+                meta = data['chart']['result'][0].get('meta') or {}
+                value = _finite_positive(meta.get('regularMarketPrice'))
+            except Exception:
+                value = None
+        previous = cached.get('value') if cached else None
+        YAHOO_AUX_LIVE_CACHE[key] = {
+            'value': value if value is not None else previous,
+            'last_checked': now,
+        }
+        return YAHOO_AUX_LIVE_CACHE[key]['value']
+
 def fetch_yahoo_direct(symbol, range_str='10d', interval_str='15m'):
     """Fetch Yahoo OHLC through a per-symbol cache and single-flight request lock."""
     key = (str(symbol), str(interval_str), str(range_str))
@@ -1737,7 +1766,9 @@ def fetch_yahoo_direct(symbol, range_str='10d', interval_str='15m'):
             diag = dict(YAHOO_HTTP_DIAGNOSTIC)
             status = diag.get('status')
             cooldown = YAHOO_HISTORICAL_COOLDOWN_SECONDS
-            if status in (403, 429):
+            if status == 404:
+                cooldown = 1800
+            elif status in (403, 429):
                 cooldown = 900
             elif status is not None and status >= 500:
                 cooldown = 120
@@ -1780,7 +1811,7 @@ def fetch_canonical_xauusd_feed():
         if not payload:
             diag = dict(YAHOO_HTTP_DIAGNOSTIC)
             status = diag.get('status')
-            cooldown = 900 if status in (403, 429) else (120 if status is not None and status >= 500 else 60)
+            cooldown = 1800 if status == 404 else (900 if status in (403, 429) else (120 if status is not None and status >= 500 else YAHOO_LIVE_COOLDOWN_SECONDS))
             msg = diag.get('message') or 'Yahoo XAUUSD=X live quote request failed.'
             kind = diag.get('error_type') or 'network_error'
             CANONICAL_XAUUSD_FEED_CACHE['blocked_until'] = time.monotonic() + cooldown
@@ -1849,25 +1880,11 @@ def fetch_and_update_cache():
         feed = fetch_canonical_xauusd_feed()
         gold = feed.get('mid') or feed.get('spot') or 0.0
 
-        dxy = None
-        data_dxy = http_get_yahoo('https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB?interval=1m&range=1d', timeout=4)
-        if data_dxy and (data_dxy.get('chart') or {}).get('result'):
-            try:
-                meta = data_dxy['chart']['result'][0]['meta']
-                value = _finite_positive(meta.get('regularMarketPrice'))
-                dxy = round(value, 4) if value is not None else None
-            except Exception:
-                dxy = None
+        dxy_value = fetch_yahoo_aux_live('DX-Y.NYB', ttl=60.0)
+        dxy = round(float(dxy_value), 4) if dxy_value is not None else None
 
-        us10y = None
-        data_tnx = http_get_yahoo('https://query1.finance.yahoo.com/v8/finance/chart/^TNX?interval=1m&range=1d', timeout=4)
-        if data_tnx and (data_tnx.get('chart') or {}).get('result'):
-            try:
-                meta = data_tnx['chart']['result'][0]['meta']
-                value = _finite_positive(meta.get('regularMarketPrice'))
-                us10y = round(value, 4) if value is not None else None
-            except Exception:
-                us10y = None
+        us10y_value = fetch_yahoo_aux_live('^TNX', ttl=60.0)
+        us10y = round(float(us10y_value), 4) if us10y_value is not None else None
 
         with cache_lock:
             previous = GLOBAL_CACHE.get('market_data') or {}
@@ -2879,6 +2896,58 @@ async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = f"⏸️ **تنبيه الانتظار المؤسسي**\n💡 السبب: {sig['reason'] if sig else 'لا توجد فرصة مطابقة'}"
     await safe_reply_text(update, msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
+TELEGRAM_POLL_LOCK_KEY = 492817361
+TELEGRAM_POLL_LOCK_CONN = None
+
+
+def acquire_telegram_poll_lock(wait_seconds=90):
+    global TELEGRAM_POLL_LOCK_CONN
+    if not DATABASE_URL or not str(DATABASE_URL).lower().startswith(('postgresql://', 'postgres://')):
+        logger.warning('[TELEGRAM] PostgreSQL advisory lock unavailable; relying on Render single-instance configuration.')
+        return True
+    deadline = time.monotonic() + max(5, int(wait_seconds))
+    while time.monotonic() < deadline:
+        conn = None
+        try:
+            conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute('SELECT pg_try_advisory_lock(%s)', (TELEGRAM_POLL_LOCK_KEY,))
+                locked = bool(cur.fetchone()[0])
+            if locked:
+                TELEGRAM_POLL_LOCK_CONN = conn
+                logger.info('[TELEGRAM] Acquired singleton polling lock.')
+                return True
+        except Exception as exc:
+            logger.warning('[TELEGRAM] Polling lock attempt failed: %s', str(exc)[:250])
+        finally:
+            if conn is not None and TELEGRAM_POLL_LOCK_CONN is not conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        time.sleep(5)
+    return False
+
+
+def release_telegram_poll_lock():
+    global TELEGRAM_POLL_LOCK_CONN
+    conn = TELEGRAM_POLL_LOCK_CONN
+    TELEGRAM_POLL_LOCK_CONN = None
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute('SELECT pg_advisory_unlock(%s)', (TELEGRAM_POLL_LOCK_KEY,))
+    except Exception:
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 if __name__ == '__main__':
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
@@ -2902,4 +2971,9 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
     
     print("🤖 البوت الهجين (Quant + Pure Dynamic Gemini Discovery + Walk-Forward ML) يعمل بكفاءة تامة...")
-    app.run_polling(drop_pending_updates=True)
+    if not acquire_telegram_poll_lock():
+        raise RuntimeError("لم يتم الحصول على قفل Telegram singleton؛ يوجد مثيل آخر يعمل أو قاعدة البيانات غير متاحة.")
+    try:
+        app.run_polling(drop_pending_updates=True)
+    finally:
+        release_telegram_poll_lock()
