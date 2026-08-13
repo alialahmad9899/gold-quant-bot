@@ -296,13 +296,13 @@ logging.getLogger('httpcore').setLevel(logging.WARNING)
 FEATURE_VERSION = os.getenv('FEATURE_VERSION', 'v2.8-features-1')
 STRATEGY_VERSION = os.getenv('STRATEGY_VERSION', 'v2.8-flexible')
 MODEL_VERSION = os.getenv('MODEL_VERSION', 'rf-v1')
-PRICE_FEED_STALE_SECONDS = int(os.getenv('PRICE_FEED_STALE_SECONDS', '180'))
+PRICE_FEED_STALE_SECONDS = int(os.getenv('PRICE_FEED_STALE_SECONDS', '900'))
 PRICE_FEED_MIN_REQUEST_INTERVAL = 3.0
 PRICE_FEED_LOCK = threading.Lock()
 CANONICAL_XAUUSD_FEED_CACHE = {'feed': None, 'last_request_monotonic': 0.0, 'blocked_until': 0.0}
 
 # أزمنة تنظيم الطلبات للحفاظ على الحدود المجانية لـ Twelve Data
-TWELVE_DATA_LIVE_INTERVAL = 120.0     # طلب السعر المباشر مرة كل دقيقتين عند وجود كاش
+TWELVE_DATA_LIVE_INTERVAL = 60.0      # طلب السعر المباشر مرة كل دقيقة عند وجود كاش
 TWELVE_DATA_OHLC_INTERVAL = 300.0     # طلب الشموع مرة كل 5 دقائق عند وجود كاش
 LAST_TWELVE_DATA_QUOTE_TIME = 0.0
 LAST_TWELVE_DATA_OHLC_TIME = 0.0
@@ -1780,9 +1780,12 @@ def fetch_canonical_xauusd_feed():
         cached = CANONICAL_XAUUSD_FEED_CACHE.get('feed')
         last_attempt = float(CANONICAL_XAUUSD_FEED_CACHE.get('last_request_monotonic', 0.0) or 0.0)
         
-        # تجنب الطلبات الزائدة إذا كان الكاش حديثاً
-        if now - last_attempt < PRICE_FEED_MIN_REQUEST_INTERVAL and cached and cached.get('status') == 'ACTIVE':
-            return _refresh_cached_feed_status(cached)
+        # 0. إذا كان الكاش مفككاً وحديثاً، أعد استخدامه فوراً دون حظر
+        if cached:
+            refreshed_cached = _refresh_cached_feed_status(cached)
+            if refreshed_cached.get('status') == 'ACTIVE' and (now - last_attempt < PRICE_FEED_MIN_REQUEST_INTERVAL):
+                return refreshed_cached
+
         CANONICAL_XAUUSD_FEED_CACHE['last_request_monotonic'] = now
 
         # 1. طلب السعر الفوري من Twelve Data أولاً
@@ -1792,6 +1795,12 @@ def fetch_canonical_xauusd_feed():
                 CANONICAL_XAUUSD_FEED_CACHE['feed'] = feed_td
                 CANONICAL_XAUUSD_FEED_CACHE['blocked_until'] = 0.0
                 return feed_td
+
+        # إذا كانت التهدئة ملغية أو Twelve Data لم يرجع جديد، وكان الكاش السابق لا يزال ACTIVE، استخدمه!
+        if cached:
+            refreshed = _refresh_cached_feed_status(cached)
+            if refreshed.get('status') == 'ACTIVE':
+                return refreshed
 
         # 2. طلب السعر الفوري من Yahoo Finance كاحتياطي مع رموز متعددة
         for sym in ['XAUUSD=X', 'GC=F']:
@@ -1807,11 +1816,15 @@ def fetch_canonical_xauusd_feed():
                     ts = meta.get('regularMarketTime')
                     source_dt = datetime.fromtimestamp(int(ts), tz=timezone.utc) if ts else datetime.now(timezone.utc)
                     age = max(0.0, (datetime.now(timezone.utc) - source_dt).total_seconds())
-                    feed = {'symbol': sym, 'provider': 'Yahoo Finance', 'status': 'ACTIVE' if age <= PRICE_FEED_STALE_SECONDS else 'STALE', 'bid': bid, 'ask': ask, 'mid': round(float(mid), 6), 'spot': round(float(price), 6), 'timestamp': source_dt.isoformat(), 'fetched_timestamp': datetime.now(timezone.utc).isoformat(), 'age_seconds': round(age, 3), 'error_type': None, 'error_message': None, 'spread_available': bool(meta.get('bid') and meta.get('ask'))}
-                    CANONICAL_XAUUSD_FEED_CACHE['feed'] = feed
-                    return feed
+                    status = 'ACTIVE' if age <= PRICE_FEED_STALE_SECONDS else 'STALE'
+                    feed = {'symbol': sym, 'provider': 'Yahoo Finance', 'status': status, 'bid': bid, 'ask': ask, 'mid': round(float(mid), 6), 'spot': round(float(price), 6), 'timestamp': source_dt.isoformat(), 'fetched_timestamp': datetime.now(timezone.utc).isoformat(), 'age_seconds': round(age, 3), 'error_type': None, 'error_message': None, 'spread_available': bool(meta.get('bid') and meta.get('ask'))}
+                    
+                    # نحدث الكاش فقط إذا كان السعر نشطاً وليس قديداً (STALE)
+                    if status == 'ACTIVE':
+                        CANONICAL_XAUUSD_FEED_CACHE['feed'] = feed
+                        return feed
 
-        # 3. طبقة الاحتياط من كاش الشموع السابقة
+        # 3. طبقة الاحتياط المباشرة: استخدام أحدث سعر من شمعة M15 الكاش (حيث أظهر الفحص تحميل 150 شمعة بنجاح)
         with cache_lock:
             df_m15 = MARKET_DATA_CACHE.get("df_gold_m15")
             if df_m15 is not None and not df_m15.empty:
@@ -1819,13 +1832,16 @@ def fetch_canonical_xauusd_feed():
                     last_c = float(to_1d_series(df_m15['Close']).iloc[-1])
                     if last_c > 1000:
                         now_dt = datetime.now(timezone.utc)
-                        feed = {'symbol': 'XAUUSD=X', 'provider': 'Twelve Data' if TWELVE_DATA_API_KEY else 'Yahoo Finance', 'status': 'ACTIVE', 'bid': round(last_c, 6), 'ask': round(last_c, 6), 'mid': round(last_c, 6), 'spot': round(last_c, 6), 'timestamp': now_dt.isoformat(), 'fetched_timestamp': now_dt.isoformat(), 'age_seconds': 0.0, 'error_type': None, 'error_message': None, 'spread_available': False}
+                        feed = {'symbol': 'XAUUSD=X', 'provider': 'M15 Candle Feed', 'status': 'ACTIVE', 'bid': round(last_c, 6), 'ask': round(last_c, 6), 'mid': round(last_c, 6), 'spot': round(last_c, 6), 'timestamp': now_dt.isoformat(), 'fetched_timestamp': now_dt.isoformat(), 'age_seconds': 0.0, 'error_type': None, 'error_message': None, 'spread_available': False}
                         CANONICAL_XAUUSD_FEED_CACHE['feed'] = feed
                         return feed
                 except Exception:
                     pass
 
-        return _refresh_cached_feed_status(cached) if cached else _build_missing_yahoo_feed('no_data', 'تعذر جلب سعر الذهب المباشر من المزودات.')
+        if cached:
+            return _refresh_cached_feed_status(cached)
+
+        return _build_missing_yahoo_feed('no_data', 'تعذر جلب سعر الذهب المباشر من المزودات.')
 
 def get_xauusd_execution_price(feed, direction, role):
     direction = str(direction).upper()
