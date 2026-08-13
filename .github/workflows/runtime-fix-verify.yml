@@ -22,10 +22,15 @@ jobs:
           from pathlib import Path
           p = Path('bot.py')
           s = p.read_text(encoding='utf-8')
-          old = "if status in (403, 404, 429):\n                    return None"
-          new = "if status in (403, 404, 429):\n                    continue"
-          assert s.count(old) == 2, s.count(old)
-          p.write_text(s.replace(old, new), encoding='utf-8')
+          old1 = "if status in (403, 404, 429):\n                    return None"
+          new1 = "if status in (403, 404, 429):\n                    continue"
+          assert old1 in s
+          s = s.replace(old1, new1, 1)
+          old2 = "if status in (403, 404, 429) or status >= 500:\n                    return None"
+          new2 = "if status in (403, 404, 429) or status >= 500:\n                    continue"
+          assert old2 in s
+          s = s.replace(old2, new2, 1)
+          p.write_text(s, encoding='utf-8')
           PY
           pytest -q tests/test_yahoo_host_failover.py
           rm -f tests/test_yahoo_host_failover.py .github/workflows/runtime-fix-verify.yml
