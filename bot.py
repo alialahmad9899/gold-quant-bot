@@ -124,7 +124,7 @@ def discover_available_models(force_refresh=False):
                 if not clean_name:
                     continue
 
-                if any(pat in clean_name.lower() for pat in DEPRECATED_MODEL_PATTERATE):
+                if any(pat in clean_name.lower() for pat in DEPRECATED_MODEL_PATTERNS):
                     continue
                 
                 supported_methods = getattr(m, 'supported_generation_methods', []) or []
@@ -1666,7 +1666,11 @@ def fetch_twelve_data_ohlc(symbol='XAU/USD', interval='15min', outputsize=150):
                     else:
                         return pd.DataFrame()
                 if 'Volume' in df.columns:
-                    df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce').fillna(0.0)
+                    vol_series = pd.to_numeric(df['Volume'], errors='coerce')
+                    if hasattr(vol_series, 'fillna'):
+                        df['Volume'] = vol_series.fillna(0.0)
+                    else:
+                        df['Volume'] = 0.0
                 else:
                     df['Volume'] = 0.0
                 df = df.dropna(subset=['Open', 'High', 'Low', 'Close'])
