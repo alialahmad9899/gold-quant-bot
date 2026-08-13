@@ -1688,7 +1688,7 @@ def http_get_yahoo(url, timeout=8):
                     return None
                 YAHOO_HTTP_DIAGNOSTIC.update(error_type=f'http_{status}', message=str(getattr(r, 'text', '') or '')[:250])
                 if status in (403, 404, 429):
-                    return None
+                    continue
                 if status >= 500:
                     continue
             except Exception as exc:
@@ -1711,7 +1711,7 @@ def http_get_yahoo(url, timeout=8):
                     return None
                 YAHOO_HTTP_DIAGNOSTIC.update(error_type=f'http_{status}', message=str(getattr(r, 'text', '') or '')[:250])
                 if status in (403, 404, 429) or status >= 500:
-                    return None
+                    continue
             except Exception as exc:
                 YAHOO_HTTP_DIAGNOSTIC = {'status': None, 'host': host, 'transport': 'requests', 'error_type': type(exc).__name__, 'message': str(exc)[:250]}
                 continue
