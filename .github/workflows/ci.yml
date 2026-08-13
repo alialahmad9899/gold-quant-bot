@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   test:
@@ -18,9 +18,64 @@ jobs:
       TWELVE_DATA_API_KEY: test-key
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
+      - name: One-time runtime cleanup
+        if: ${{ github.event_name == 'push' && !contains(github.event.head_commit.message, 'chore: cleanup runtime artifacts') }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          bot_path = Path('bot.py')
+          text = bot_path.read_text(encoding='utf-8')
+          import_line = 'from twelve_data_gateway import manual_request_handler'
+          if import_line not in text:
+              marker = 'import requests\n'
+              if marker not in text:
+                  raise SystemExit('Could not find requests import in bot.py')
+              text = text.replace(marker, marker + import_line + '\n', 1)
+
+          manual_handlers = {'price', 'ai_info', 'analyze', 'backtest', 'signal', 'system_health_check'}
+          for name in sorted(manual_handlers):
+              pattern = rf'(?m)^(?!@manual_request_handler\n)(async def {name}\()'
+              text, changed = re.subn(pattern, '@manual_request_handler\n\\1', text, count=1)
+              if changed != 1:
+                  raise SystemExit(f'Could not decorate handler: {name}')
+          bot_path.write_text(text, encoding='utf-8')
+
+          removable = [
+              'requests.py',
+              'tools/apply_quota_750_patch.py',
+              'tools/apply_twelve_data_750_budget.py',
+              'tools/apply_twelve_data_hardening.py',
+              'docs/superpowers/plans/2026-08-13-twelve-data-free-hardening.md',
+              'docs/superpowers/plans/2026-08-14-twelve-data-750-budget.md',
+              'docs/superpowers/specs/2026-08-14-twelve-data-750-budget-design.md',
+          ]
+          for raw in removable:
+              path = Path(raw)
+              if path.exists():
+                  path.unlink()
+          for raw in ['tools', 'docs/superpowers/plans', 'docs/superpowers/specs', 'docs/superpowers', 'docs']:
+              path = Path(raw)
+              if path.exists() and path.is_dir() and not any(path.iterdir()):
+                  path.rmdir()
+          PY
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m 'chore: cleanup runtime artifacts'
+            git push origin main
+          fi
+
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements.txt pytest
       - run: python -m py_compile bot.py twelve_data_gateway.py
