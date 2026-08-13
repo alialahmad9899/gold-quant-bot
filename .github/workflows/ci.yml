@@ -23,6 +23,6 @@ jobs:
           python-version: '3.11'
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements.txt pytest
-      - run: python -m py_compile bot.py
-      - run: pytest -q
+      - run: python -m py_compile bot.py twelve_data_gateway.py
+      - run: python -m pytest -q
       - run: git diff --check
