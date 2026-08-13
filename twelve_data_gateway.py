@@ -193,6 +193,7 @@ def reset_for_tests():
             "loaded": True,
             "last_request_by_key": {},
         })
+        _ensure_db()
         _persist_locked()
 
 
