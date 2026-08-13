@@ -124,7 +124,7 @@ def discover_available_models(force_refresh=False):
                 if not clean_name:
                     continue
 
-                if any(pat in clean_name.lower() for pat in DEPRECATED_MODEL_PATTERNS):
+                if any(pat in clean_name.lower() for pat in DEPRECATED_MODEL_PATTERATE):
                     continue
                 
                 supported_methods = getattr(m, 'supported_generation_methods', []) or []
@@ -1656,12 +1656,19 @@ def fetch_twelve_data_ohlc(symbol='XAU/USD', interval='15min', outputsize=150):
             values = data.get("values", [])
             if values:
                 df = pd.DataFrame(values)
-                df['datetime'] = pd.to_datetime(df['datetime'], utc=True)
-                df = df.set_index('datetime').sort_index()
+                if 'datetime' in df.columns:
+                    df['datetime'] = pd.to_datetime(df['datetime'], utc=True)
+                    df = df.set_index('datetime').sort_index()
                 df = df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
                 for col in ['Open', 'High', 'Low', 'Close']:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-                df['Volume'] = pd.to_numeric(df.get('Volume', 0), errors='coerce').fillna(0)
+                    if col in df.columns:
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
+                    else:
+                        return pd.DataFrame()
+                if 'Volume' in df.columns:
+                    df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce').fillna(0.0)
+                else:
+                    df['Volume'] = 0.0
                 df = df.dropna(subset=['Open', 'High', 'Low', 'Close'])
                 if not df.empty:
                     return df
