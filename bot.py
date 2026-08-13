@@ -302,8 +302,8 @@ PRICE_FEED_LOCK = threading.Lock()
 CANONICAL_XAUUSD_FEED_CACHE = {'feed': None, 'last_request_monotonic': 0.0, 'blocked_until': 0.0}
 
 # أزمنة تنظيم الطلبات للحفاظ على الحدود المجانية لـ Twelve Data
-TWELVE_DATA_LIVE_INTERVAL = 180.0     # طلب السعر المباشر مرة كل 3 دقائق (480 طلب/يوم)
-TWELVE_DATA_OHLC_INTERVAL = 600.0     # طلب الشموع مرة كل 10 دقائق (144 طلب/يوم)
+TWELVE_DATA_LIVE_INTERVAL = 120.0     # طلب السعر المباشر مرة كل دقيقتين عند وجود كاش
+TWELVE_DATA_OHLC_INTERVAL = 300.0     # طلب الشموع مرة كل 5 دقائق عند وجود كاش
 LAST_TWELVE_DATA_QUOTE_TIME = 0.0
 LAST_TWELVE_DATA_OHLC_TIME = 0.0
 TWELVE_DATA_LOCK = threading.Lock()
@@ -1576,7 +1576,7 @@ def _refresh_cached_feed_status(feed):
     refreshed['status'] = 'STALE' if age > PRICE_FEED_STALE_SECONDS else 'ACTIVE'
     return refreshed
 
-# --- 🚀 دوال Twelve Data الرسمية مع منظم الطلبات الذكي ---
+# --- 🚀 دوال Twelve Data الرسمية مع منظم الطلبات الذكي المصلح ---
 def fetch_twelve_data_live_quote():
     """Fetch real-time spot quote for XAU/USD from Twelve Data with rate limiting."""
     global LAST_TWELVE_DATA_QUOTE_TIME
@@ -1584,11 +1584,12 @@ def fetch_twelve_data_live_quote():
         return None
 
     now = time.monotonic()
+    with cache_lock:
+        has_cache = bool(GLOBAL_CACHE.get("market_data", {}).get("gold", 0.0) > 1000)
+
     with TWELVE_DATA_LOCK:
-        if now - LAST_TWELVE_DATA_QUOTE_TIME < TWELVE_DATA_LIVE_INTERVAL:
-            # لم ينقضِ وقت التهدئة المقدر بـ 3 دقائق لمنع تجاوز الحدود؛ يرجع None ليعتمد النظام على Yahoo Finance
+        if has_cache and (now - LAST_TWELVE_DATA_QUOTE_TIME < TWELVE_DATA_LIVE_INTERVAL):
             return None
-        LAST_TWELVE_DATA_QUOTE_TIME = now
 
     url = f"https://api.twelvedata.com/quote?symbol=XAU/USD&apikey={TWELVE_DATA_API_KEY}"
     try:
@@ -1600,6 +1601,8 @@ def fetch_twelve_data_live_quote():
                 return None
             price = _finite_positive(data.get("close") or data.get("price"))
             if price and price > 1000:
+                with TWELVE_DATA_LOCK:
+                    LAST_TWELVE_DATA_QUOTE_TIME = time.monotonic()
                 bid = _finite_positive(data.get("bid")) or price
                 ask = _finite_positive(data.get("ask")) or price
                 mid = (bid + ask) / 2.0
@@ -1638,11 +1641,12 @@ def fetch_twelve_data_ohlc(symbol='XAU/USD', interval='15min', outputsize=150):
         return pd.DataFrame()
 
     now = time.monotonic()
+    with cache_lock:
+        has_candles = not MARKET_DATA_CACHE.get("df_gold_m15", pd.DataFrame()).empty
+
     with TWELVE_DATA_LOCK:
-        if now - LAST_TWELVE_DATA_OHLC_TIME < TWELVE_DATA_OHLC_INTERVAL:
-            # لم ينقضِ وقت التهدئة المقدر بـ 10 دقائق لمنع تجاوز الحدود
+        if has_candles and (now - LAST_TWELVE_DATA_OHLC_TIME < TWELVE_DATA_OHLC_INTERVAL):
             return pd.DataFrame()
-        LAST_TWELVE_DATA_OHLC_TIME = now
     
     td_symbol = "XAU/USD" if "XAU" in symbol.upper() else symbol
     td_interval = "15min" if interval in ("15m", "15min") else ("1h" if interval in ("1h", "60min") else "1day")
@@ -1677,12 +1681,14 @@ def fetch_twelve_data_ohlc(symbol='XAU/USD', interval='15min', outputsize=150):
                     df['Volume'] = 0.0
                 df = df.dropna(subset=['Open', 'High', 'Low', 'Close'])
                 if not df.empty:
+                    with TWELVE_DATA_LOCK:
+                        LAST_TWELVE_DATA_OHLC_TIME = time.monotonic()
                     return df
     except Exception as e:
         logger.warning("[TWELVE_DATA] Exception fetching OHLC: %s", e)
     return pd.DataFrame()
 
-# --- محرك Yahoo Finance الاحتياطي ---
+# --- محرك Yahoo Finance الاحتياطي المطور ---
 def http_get_yahoo(url, timeout=5):
     global YAHOO_HTTP_DIAGNOSTIC
     headers = {
@@ -1732,32 +1738,37 @@ def fetch_yahoo_direct(symbol, range_str='10d', interval_str='15m'):
     key = (str(symbol), str(interval_str), str(range_str))
     now = time.monotonic()
     cached = YAHOO_HIST_CACHE.get(key)
-    ttl = YAHOO_HISTORICAL_FETCH_INTERVAL_SECONDS if "XAU" in symbol else 300
+    ttl = YAHOO_HISTORICAL_FETCH_INTERVAL_SECONDS if "XAU" in symbol or "GC=F" in symbol else 300
     if cached and (now - cached.get('last_success', 0.0) < ttl) and not cached.get('df', pd.DataFrame()).empty:
         return cached.get('df').copy()
 
-    # 1. التجربة عبر Twelve Data للذهب (إذا كان ضمن وقت السماح)
-    if "XAU" in symbol.upper() and TWELVE_DATA_API_KEY:
+    # 1. التجربة عبر Twelve Data للذهب أولاً
+    if ("XAU" in symbol.upper() or "GC=F" in symbol.upper()) and TWELVE_DATA_API_KEY:
         df_td = fetch_twelve_data_ohlc('XAU/USD', interval=interval_str, outputsize=150)
         if not df_td.empty:
             YAHOO_HIST_CACHE[key] = {'df': df_td.copy(), 'last_success': now, 'blocked_until': 0.0}
             return df_td
 
-    # 2. الاحتياطي عبر Yahoo Finance (دون قيود حصص)
+    # 2. الاحتياطي عبر Yahoo Finance مع رموز متعددة للذهب (XAUUSD=X أو GC=F)
+    symbols_to_try = [symbol]
+    if symbol == 'XAUUSD=X':
+        symbols_to_try.append('GC=F')
+
     with YAHOO_HISTORICAL_REQUEST_LOCK:
-        data = http_get_yahoo(f'https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval={interval_str}&range={range_str}', timeout=6)
-        if data:
-            try:
-                result = ((data.get('chart') or {}).get('result') or [None])[0]
-                timestamps = result.get('timestamp') or []
-                quote = ((result.get('indicators') or {}).get('quote') or [None])[0]
-                if timestamps and quote:
-                    df = pd.DataFrame({'Open': quote.get('open', []), 'High': quote.get('high', []), 'Low': quote.get('low', []), 'Close': quote.get('close', []), 'Volume': quote.get('volume', [0] * len(timestamps))}, index=pd.to_datetime(timestamps, unit='s', utc=True)).dropna(subset=['Open', 'High', 'Low', 'Close'])
-                    if not df.empty:
-                        YAHOO_HIST_CACHE[key] = {'df': df.copy(), 'last_success': now, 'blocked_until': 0.0}
-                        return df
-            except Exception:
-                pass
+        for sym in symbols_to_try:
+            data = http_get_yahoo(f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval={interval_str}&range={range_str}', timeout=6)
+            if data:
+                try:
+                    result = ((data.get('chart') or {}).get('result') or [None])[0]
+                    timestamps = result.get('timestamp') or []
+                    quote = ((result.get('indicators') or {}).get('quote') or [None])[0]
+                    if timestamps and quote:
+                        df = pd.DataFrame({'Open': quote.get('open', []), 'High': quote.get('high', []), 'Low': quote.get('low', []), 'Close': quote.get('close', []), 'Volume': quote.get('volume', [0] * len(timestamps))}, index=pd.to_datetime(timestamps, unit='s', utc=True)).dropna(subset=['Open', 'High', 'Low', 'Close'])
+                        if not df.empty:
+                            YAHOO_HIST_CACHE[key] = {'df': df.copy(), 'last_success': now, 'blocked_until': 0.0}
+                            return df
+                except Exception:
+                    pass
 
     old_df = cached.get('df', pd.DataFrame()).copy() if cached else pd.DataFrame()
     return old_df
@@ -1774,7 +1785,7 @@ def fetch_canonical_xauusd_feed():
             return _refresh_cached_feed_status(cached)
         CANONICAL_XAUUSD_FEED_CACHE['last_request_monotonic'] = now
 
-        # 1. طلب السعر الفوري من Twelve Data أولاً (إذا سمح المنظم الحجمي)
+        # 1. طلب السعر الفوري من Twelve Data أولاً
         if TWELVE_DATA_API_KEY:
             feed_td = fetch_twelve_data_live_quote()
             if feed_td and feed_td.get('status') == 'ACTIVE':
@@ -1782,22 +1793,23 @@ def fetch_canonical_xauusd_feed():
                 CANONICAL_XAUUSD_FEED_CACHE['blocked_until'] = 0.0
                 return feed_td
 
-        # 2. طلب السعر الفوري من Yahoo Finance كاحتياطي ممتاز ومفتوح
-        payload = http_get_yahoo('https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval=1m&range=1d', timeout=5)
-        if payload:
-            result = ((payload.get('chart') or {}).get('result') or [None])[0]
-            meta = (result or {}).get('meta') or {}
-            price = _finite_positive(meta.get('regularMarketPrice'))
-            if price and price > 1000:
-                bid = _finite_positive(meta.get('bid')) or price
-                ask = _finite_positive(meta.get('ask')) or price
-                mid = (bid + ask) / 2.0
-                ts = meta.get('regularMarketTime')
-                source_dt = datetime.fromtimestamp(int(ts), tz=timezone.utc) if ts else datetime.now(timezone.utc)
-                age = max(0.0, (datetime.now(timezone.utc) - source_dt).total_seconds())
-                feed = {'symbol': 'XAUUSD=X', 'provider': 'Yahoo Finance', 'status': 'ACTIVE' if age <= PRICE_FEED_STALE_SECONDS else 'STALE', 'bid': bid, 'ask': ask, 'mid': round(float(mid), 6), 'spot': round(float(price), 6), 'timestamp': source_dt.isoformat(), 'fetched_timestamp': datetime.now(timezone.utc).isoformat(), 'age_seconds': round(age, 3), 'error_type': None, 'error_message': None, 'spread_available': bool(meta.get('bid') and meta.get('ask'))}
-                CANONICAL_XAUUSD_FEED_CACHE['feed'] = feed
-                return feed
+        # 2. طلب السعر الفوري من Yahoo Finance كاحتياطي مع رموز متعددة
+        for sym in ['XAUUSD=X', 'GC=F']:
+            payload = http_get_yahoo(f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1m&range=1d', timeout=5)
+            if payload:
+                result = ((payload.get('chart') or {}).get('result') or [None])[0]
+                meta = (result or {}).get('meta') or {}
+                price = _finite_positive(meta.get('regularMarketPrice'))
+                if price and price > 1000:
+                    bid = _finite_positive(meta.get('bid')) or price
+                    ask = _finite_positive(meta.get('ask')) or price
+                    mid = (bid + ask) / 2.0
+                    ts = meta.get('regularMarketTime')
+                    source_dt = datetime.fromtimestamp(int(ts), tz=timezone.utc) if ts else datetime.now(timezone.utc)
+                    age = max(0.0, (datetime.now(timezone.utc) - source_dt).total_seconds())
+                    feed = {'symbol': sym, 'provider': 'Yahoo Finance', 'status': 'ACTIVE' if age <= PRICE_FEED_STALE_SECONDS else 'STALE', 'bid': bid, 'ask': ask, 'mid': round(float(mid), 6), 'spot': round(float(price), 6), 'timestamp': source_dt.isoformat(), 'fetched_timestamp': datetime.now(timezone.utc).isoformat(), 'age_seconds': round(age, 3), 'error_type': None, 'error_message': None, 'spread_available': bool(meta.get('bid') and meta.get('ask'))}
+                    CANONICAL_XAUUSD_FEED_CACHE['feed'] = feed
+                    return feed
 
         # 3. طبقة الاحتياط من كاش الشموع السابقة
         with cache_lock:
@@ -1870,12 +1882,14 @@ def get_chart_data_cached():
     now = datetime.now(timezone.utc)
     with cache_lock:
         last = MARKET_DATA_CACHE['last_fetch']
-        if last is not None and (now - last).total_seconds() < YAHOO_HISTORICAL_FETCH_INTERVAL_SECONDS:
+        has_data = not MARKET_DATA_CACHE['df_gold_m15'].empty
+        if has_data and last is not None and (now - last).total_seconds() < YAHOO_HISTORICAL_FETCH_INTERVAL_SECONDS:
             return MARKET_DATA_CACHE.copy()
     with fetch_lock:
         with cache_lock:
             last = MARKET_DATA_CACHE['last_fetch']
-            if last is not None and (now - last).total_seconds() < YAHOO_HISTORICAL_FETCH_INTERVAL_SECONDS:
+            has_data = not MARKET_DATA_CACHE['df_gold_m15'].empty
+            if has_data and last is not None and (now - last).total_seconds() < YAHOO_HISTORICAL_FETCH_INTERVAL_SECONDS:
                 return MARKET_DATA_CACHE.copy()
         try:
             df_gold_h1 = fetch_yahoo_direct('XAUUSD=X', range_str='60d', interval_str='1h')
@@ -2384,6 +2398,10 @@ async def post_init(app):
             await asyncio.to_thread(discover_available_models, True)
         except Exception as e:
             logger.warning("تعذر الاستكشاف الأولي للموديلات: %s", e)
+
+    # التعبئة المباشرة الفورية للكاش عند الإقلاع
+    await asyncio.to_thread(fetch_and_update_cache)
+    await asyncio.to_thread(get_chart_data_cached)
 
     create_managed_task(background_cache_worker())
     create_managed_task(auto_market_scanner(app))
