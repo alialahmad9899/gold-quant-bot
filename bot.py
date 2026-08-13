@@ -296,10 +296,17 @@ logging.getLogger('httpcore').setLevel(logging.WARNING)
 FEATURE_VERSION = os.getenv('FEATURE_VERSION', 'v2.8-features-1')
 STRATEGY_VERSION = os.getenv('STRATEGY_VERSION', 'v2.8-flexible')
 MODEL_VERSION = os.getenv('MODEL_VERSION', 'rf-v1')
-PRICE_FEED_STALE_SECONDS = int(os.getenv('PRICE_FEED_STALE_SECONDS', '90'))
-PRICE_FEED_MIN_REQUEST_INTERVAL = 1.5
+PRICE_FEED_STALE_SECONDS = int(os.getenv('PRICE_FEED_STALE_SECONDS', '180'))
+PRICE_FEED_MIN_REQUEST_INTERVAL = 3.0
 PRICE_FEED_LOCK = threading.Lock()
 CANONICAL_XAUUSD_FEED_CACHE = {'feed': None, 'last_request_monotonic': 0.0, 'blocked_until': 0.0}
+
+# أزمنة تنظيم الطلبات للحفاظ على الحدود المجانية لـ Twelve Data
+TWELVE_DATA_LIVE_INTERVAL = 180.0     # طلب السعر المباشر مرة كل 3 دقائق (480 طلب/يوم)
+TWELVE_DATA_OHLC_INTERVAL = 600.0     # طلب الشموع مرة كل 10 دقائق (144 طلب/يوم)
+LAST_TWELVE_DATA_QUOTE_TIME = 0.0
+LAST_TWELVE_DATA_OHLC_TIME = 0.0
+TWELVE_DATA_LOCK = threading.Lock()
 
 YAHOO_LIVE_COOLDOWN_SECONDS = max(15, int(os.getenv('YAHOO_LIVE_COOLDOWN_SECONDS', '15')))
 YAHOO_HISTORICAL_COOLDOWN_SECONDS = max(30, int(os.getenv('YAHOO_HISTORICAL_COOLDOWN_SECONDS', '30')))
@@ -1569,33 +1576,20 @@ def _refresh_cached_feed_status(feed):
     refreshed['status'] = 'STALE' if age > PRICE_FEED_STALE_SECONDS else 'ACTIVE'
     return refreshed
 
-def _set_yahoo_historical_cooldown(error_type, error_message):
-    with YAHOO_HISTORICAL_STATE_LOCK:
-        YAHOO_HISTORICAL_FEED_STATE['blocked_until'] = time.monotonic() + max(5, YAHOO_HISTORICAL_COOLDOWN_SECONDS)
-        YAHOO_HISTORICAL_FEED_STATE['error_type'] = str(error_type)
-        YAHOO_HISTORICAL_FEED_STATE['error_message'] = str(error_message or '')[:300]
-    logger.warning('[MARKET_DATA] Historical cooldown type=%s seconds=%s message=%s', error_type, YAHOO_HISTORICAL_COOLDOWN_SECONDS, str(error_message or '')[:300])
-
-def _yahoo_historical_cooldown_active():
-    with YAHOO_HISTORICAL_STATE_LOCK:
-        return time.monotonic() < float(YAHOO_HISTORICAL_FEED_STATE.get('blocked_until', 0.0) or 0.0)
-
-def _set_yahoo_live_cooldown(error_type, error_message):
-    with YAHOO_LIVE_STATE_LOCK:
-        YAHOO_LIVE_FEED_STATE['blocked_until'] = time.monotonic() + max(5, YAHOO_LIVE_COOLDOWN_SECONDS)
-        YAHOO_LIVE_FEED_STATE['error_type'] = str(error_type)
-        YAHOO_LIVE_FEED_STATE['error_message'] = str(error_message or '')[:300]
-    logger.warning('[XAUUSD_FEED] Live Spot cooldown type=%s seconds=%s message=%s', error_type, YAHOO_LIVE_COOLDOWN_SECONDS, str(error_message or '')[:300])
-
-def _yahoo_live_cooldown_active():
-    with YAHOO_LIVE_STATE_LOCK:
-        return time.monotonic() < float(YAHOO_LIVE_FEED_STATE.get('blocked_until', 0.0) or 0.0)
-
-# --- 🚀 دوال Twelve Data الرسمية ---
+# --- 🚀 دوال Twelve Data الرسمية مع منظم الطلبات الذكي ---
 def fetch_twelve_data_live_quote():
-    """Fetch real-time spot quote for XAU/USD from Twelve Data API."""
+    """Fetch real-time spot quote for XAU/USD from Twelve Data with rate limiting."""
+    global LAST_TWELVE_DATA_QUOTE_TIME
     if not TWELVE_DATA_API_KEY:
         return None
+
+    now = time.monotonic()
+    with TWELVE_DATA_LOCK:
+        if now - LAST_TWELVE_DATA_QUOTE_TIME < TWELVE_DATA_LIVE_INTERVAL:
+            # لم ينقضِ وقت التهدئة المقدر بـ 3 دقائق لمنع تجاوز الحدود؛ يرجع None ليعتمد النظام على Yahoo Finance
+            return None
+        LAST_TWELVE_DATA_QUOTE_TIME = now
+
     url = f"https://api.twelvedata.com/quote?symbol=XAU/USD&apikey={TWELVE_DATA_API_KEY}"
     try:
         r = requests.get(url, timeout=6)
@@ -1638,9 +1632,17 @@ def fetch_twelve_data_live_quote():
     return None
 
 def fetch_twelve_data_ohlc(symbol='XAU/USD', interval='15min', outputsize=150):
-    """Fetch historical OHLC candles from Twelve Data API."""
+    """Fetch historical OHLC candles from Twelve Data API with rate limiting."""
+    global LAST_TWELVE_DATA_OHLC_TIME
     if not TWELVE_DATA_API_KEY:
         return pd.DataFrame()
+
+    now = time.monotonic()
+    with TWELVE_DATA_LOCK:
+        if now - LAST_TWELVE_DATA_OHLC_TIME < TWELVE_DATA_OHLC_INTERVAL:
+            # لم ينقضِ وقت التهدئة المقدر بـ 10 دقائق لمنع تجاوز الحدود
+            return pd.DataFrame()
+        LAST_TWELVE_DATA_OHLC_TIME = now
     
     td_symbol = "XAU/USD" if "XAU" in symbol.upper() else symbol
     td_interval = "15min" if interval in ("15m", "15min") else ("1h" if interval in ("1h", "60min") else "1day")
@@ -1734,14 +1736,14 @@ def fetch_yahoo_direct(symbol, range_str='10d', interval_str='15m'):
     if cached and (now - cached.get('last_success', 0.0) < ttl) and not cached.get('df', pd.DataFrame()).empty:
         return cached.get('df').copy()
 
-    # 1. التجربة عبر Twelve Data للذهب
+    # 1. التجربة عبر Twelve Data للذهب (إذا كان ضمن وقت السماح)
     if "XAU" in symbol.upper() and TWELVE_DATA_API_KEY:
         df_td = fetch_twelve_data_ohlc('XAU/USD', interval=interval_str, outputsize=150)
         if not df_td.empty:
             YAHOO_HIST_CACHE[key] = {'df': df_td.copy(), 'last_success': now, 'blocked_until': 0.0}
             return df_td
 
-    # 2. الاحتياطي عبر Yahoo Finance
+    # 2. الاحتياطي عبر Yahoo Finance (دون قيود حصص)
     with YAHOO_HISTORICAL_REQUEST_LOCK:
         data = http_get_yahoo(f'https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval={interval_str}&range={range_str}', timeout=6)
         if data:
@@ -1767,12 +1769,12 @@ def fetch_canonical_xauusd_feed():
         cached = CANONICAL_XAUUSD_FEED_CACHE.get('feed')
         last_attempt = float(CANONICAL_XAUUSD_FEED_CACHE.get('last_request_monotonic', 0.0) or 0.0)
         
-        # تجنب الطلبات الزائدة إذا كان الكاش حديثاً (أقل من 3 ثوانٍ)
+        # تجنب الطلبات الزائدة إذا كان الكاش حديثاً
         if now - last_attempt < PRICE_FEED_MIN_REQUEST_INTERVAL and cached and cached.get('status') == 'ACTIVE':
             return _refresh_cached_feed_status(cached)
         CANONICAL_XAUUSD_FEED_CACHE['last_request_monotonic'] = now
 
-        # 1. طلب السعر الفوري من Twelve Data أولاً
+        # 1. طلب السعر الفوري من Twelve Data أولاً (إذا سمح المنظم الحجمي)
         if TWELVE_DATA_API_KEY:
             feed_td = fetch_twelve_data_live_quote()
             if feed_td and feed_td.get('status') == 'ACTIVE':
@@ -1780,7 +1782,7 @@ def fetch_canonical_xauusd_feed():
                 CANONICAL_XAUUSD_FEED_CACHE['blocked_until'] = 0.0
                 return feed_td
 
-        # 2. طلب السعر الفوري من Yahoo Finance كاحتياطي
+        # 2. طلب السعر الفوري من Yahoo Finance كاحتياطي ممتاز ومفتوح
         payload = http_get_yahoo('https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval=1m&range=1d', timeout=5)
         if payload:
             result = ((payload.get('chart') or {}).get('result') or [None])[0]
@@ -2320,7 +2322,7 @@ async def background_cache_worker():
             await asyncio.to_thread(fetch_and_update_cache)
         except Exception as e:
             print(f"خطأ خلفية الكاش: {e}")
-        await asyncio.sleep(5)
+        await asyncio.sleep(10)
 
 async def auto_market_scanner(app):
     last_sent_candle = None
