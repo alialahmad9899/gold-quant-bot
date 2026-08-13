@@ -412,9 +412,9 @@ def to_1d_series(df_col):
 def get_main_keyboard():
     keyboard = [
         [KeyboardButton("⚡ إشارة فورية"), KeyboardButton("🧠 تحليل بنية السوق")],
-        [KeyboardButton("📊 الأسعار اللحظية"), KeyboardButton("📈 إحصائيات النظام")],
-        [KeyboardButton("📉 اختبار الاستراتيجية العكسي"), KeyboardButton("🔍 فحص الأخطاء الشامل")],
-        [KeyboardButton("🧹 تصفير البيانات")]
+        [KeyboardButton("💡 معلومات من الذكاء الاصطناعي"), KeyboardButton("📊 الأسعار اللحظية")],
+        [KeyboardButton("📈 إحصائيات النظام"), KeyboardButton("📉 اختبار الاستراتيجية العكسي")],
+        [KeyboardButton("🔍 فحص الأخطاء الشامل"), KeyboardButton("🧹 تصفير البيانات")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -1127,6 +1127,49 @@ def gemini_verify_signal(signal_data, market_summary):
     except Exception as e:
         logger.warning(f"⚠️ [Gemini Vetting Fallback] تعذر مراجعة الإشارة عبر Gemini: {e}")
         return {"approved": True, "reason": "اعتماد كمي تلقائي (خدمة الذكاء الاصطناعي غير متاحة مؤقتاً)"}
+
+def generate_ai_market_insights():
+    if not gemini_client:
+        return "⚠️ خدمة الذكاء الاصطناعي Gemini غير متوفرة حالياً."
+
+    engine_res = analyze_institutional_engine()
+    if not engine_res:
+        return "⚠️ تعذر جلب بيانات السوق الحالية لتحليلها بالذكاء الاصطناعي."
+
+    df_m15 = engine_res['df_m15']
+    last_price = engine_res['last_price']
+    h4_trend = engine_res['h4_trend']
+    state_label = engine_res['state_label']
+    smc = engine_res['smc']
+
+    closes = to_1d_series(df_m15['Close']).tail(10).tolist()
+    highs = to_1d_series(df_m15['High']).tail(10).tolist()
+    lows = to_1d_series(df_m15['Low']).tail(10).tolist()
+
+    prompt = f"""
+    أنت محلل أسواق مالية ومستشار كمي خبير في تداول الذهب XAU/USD.
+    قم بفحص قراءات البيانات الحالية وتقديم تقرير تحليلي دقيق، واكتفاء بنصائح تداول احترافية.
+
+    بيانات السوق الحية:
+    - السعر الحالي للذهب: ${last_price}
+    - اتجاه H4 الحاكم: {h4_trend}
+    - حالة الحركة على M15: {state_label}
+    - إغلاقات أحدث 10 شموع (M15): {closes}
+    - أعلى أسعار (M15): {highs}
+    - أدنى أسعار (M15): {lows}
+    - بنية السيولة الفتحية SMC: {smc}
+
+    اكتب تقريراً باللغة العربية موجزاً ومنظماً يحتوي على:
+    1. **قراءة الاتجاه والزخم الحالي**
+    2. **مناطق الدعم والمقاومة اللحظية القريبة**
+    3. **النصيحة الفنية والتوصية بالإجراء المناسب (شراء / بيع / انتظار)**
+    """
+
+    try:
+        resp_text, used_model = execute_gemini_dynamic_request(prompt, response_mime_type=None, task_type="vetting")
+        return resp_text
+    except Exception as e:
+        return f"⚠️ تعذر إجراء تحليل الذكاء الاصطناعي حالياً: {e}"
 
 def update_open_trades_outcome_historical(df_m15):
     if df_m15 is None or df_m15.empty: return
@@ -1895,8 +1938,41 @@ def analyze_institutional_engine():
         return None
 
 # ------------------------------------
-# 5. خوارزمية توليد الإشارات الكمية المدمجة مع تدقيق Gemini
+# 5. خوارزمية توليد الإشارات الكمية المدمجة وحساب الثقة الديناميكي
 # ------------------------------------
+def calculate_dynamic_confidence(h4_trend, state, ema_fast, ema_slow, rsi, smc, volatility_ratio, dxy_corr, clf, feat_df):
+    """حساب نسبة الثقة الديناميكية استناداً لتطابق الفلاتر الإحصائية ونموذج الـ ML."""
+    if clf:
+        try:
+            probs = clf.predict_proba(feat_df)[0]
+            classes = list(clf.classes_)
+            if 1 in classes:
+                ml_conf = round(float(probs[classes.index(1)]), 2)
+                if ml_conf > 0 and ml_conf != 0.60:
+                    return ml_conf
+        except Exception:
+            pass
+
+    # حساب ديناميكي تراكمي في حال عدم وجود عينات كافية للـ ML
+    base_confidence = 0.40
+
+    if (h4_trend == 'BULLISH' and state == 'BULLISH') or (h4_trend == 'BEARISH' and state == 'BEARISH'):
+        base_confidence += 0.15
+
+    if (ema_fast > ema_slow and h4_trend == 'BULLISH') or (ema_fast < ema_slow and h4_trend == 'BEARISH'):
+        base_confidence += 0.10
+
+    if smc.get('fvg_bullish') or smc.get('sweep_bullish') or smc.get('fvg_bearish') or smc.get('sweep_bearish'):
+        base_confidence += 0.15
+
+    if 40 <= rsi <= 60:
+        base_confidence += 0.10
+
+    if 0.015 <= volatility_ratio <= 0.08:
+        base_confidence += 0.10
+
+    return min(0.95, round(base_confidence, 2))
+
 def generate_quant_signal():
     global LAST_SCANNER_CANDLE
     with SIGNAL_LOCK:
@@ -1927,16 +2003,10 @@ def generate_quant_signal():
             return {"status": "WAIT", "reason": "التذبذب الحالي منخفض جداً ولا يكفي لإدارة صفقة بكفاءة.", "price": current_price}
 
         clf = train_self_learning_model()
-        confidence = 0.60
-        if clf:
-            try:
-                feat = pd.DataFrame([[rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio]], columns=['rsi', 'dxy_corr', 'macd_diff', 'stoch_k', 'volatility_ratio'])
-                probs = clf.predict_proba(feat)[0]
-                classes = list(clf.classes_)
-                if 1 in classes:
-                    confidence = round(float(probs[classes.index(1)]), 2)
-            except Exception:
-                confidence = 0.60
+        feat_df = pd.DataFrame([[rsi, dxy_corr, macd_diff, stoch_k, volatility_ratio]], columns=['rsi', 'dxy_corr', 'macd_diff', 'stoch_k', 'volatility_ratio'])
+        
+        # حساب الثقة الديناميكية
+        confidence = calculate_dynamic_confidence(h4_trend, state, ema_fast, ema_slow, rsi, smc, volatility_ratio, dxy_corr, clf, feat_df)
 
         bull_score = 0.0
         bear_score = 0.0
@@ -2541,6 +2611,8 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
         await signal(update, context)
     elif "تحليل بنية السوق" in text or text == "/analyze":
         await analyze(update, context)
+    elif "معلومات من الذكاء الاصطناعي" in text or text == "/ai_info":
+        await ai_info(update, context)
     elif "الأسعار اللحظية" in text or text == "/price":
         await price(update, context)
     elif "إحصائيات النظام" in text or text == "/stats":
@@ -2591,21 +2663,41 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = get_market_data()
     feed = data.get('price_feed') or {}
     def fmt(value):
-        return f"{float(value):.2f}" if value is not None else "N/A"
-    age = f"{float(feed['age_seconds']):.1f} sec" if feed.get('age_seconds') is not None else "N/A"
-    reason = feed.get('error_message') or feed.get('error_type') if feed.get('status') == 'MISSING' else None
-    timestamp = feed.get('timestamp') or feed.get('source_timestamp') or 'N/A'
+        return f"{float(value):.2f}" if value is not None else "غير متوفر"
+    age = f"{float(feed['age_seconds']):.1f} ثانية" if feed.get('age_seconds') is not None else "غير متوفر"
+    
+    status_ar = "نشط 🟢" if feed.get('status') == 'ACTIVE' else ("قديم 🟡" if feed.get('status') == 'STALE' else "مفقود 🔴")
+
+    msg = (
+        "📊 **جدول الأسعار اللحظية المباشرة (Twelve Data)**\n"
+        "───────────────────\n"
+        f"🌐 **المزود:** Twelve Data\n"
+        f"⚡ **حالة الاتصال:** {status_ar}\n"
+        f"🔻 **سعر الطلب (Ask):** ${fmt(feed.get('ask'))}\n"
+        f"🔺 **سعر العرض (Bid):** ${fmt(feed.get('bid'))}\n"
+        f"💵 **السعر المتوسط (Mid):** ${fmt(feed.get('mid'))}\n"
+        f"🕒 **التوقيت:** {feed.get('timestamp') or 'غير متوفر'}\n"
+        f"⏱️ **عمر البيانات:** {age}\n"
+        "───────────────────\n"
+        "🤖 *البيانات محدثة ومأخوذة فوراً من مزود الأسعار المباشر.*"
+    )
+    await safe_reply_text(update, msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+
+async def ai_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not is_authenticated(chat_id):
+        await safe_reply_text(update, "🔒 يرجى إدخال كلمة السر أولاً لاستخدام البوت.")
+        return
+
+    await safe_reply_text(update, "💡 **جاري فحص حالة السوق الحية وصياغة تقرير ونصيحة بالذكاء الاصطناعي (Gemini)...**", parse_mode='Markdown')
+    ai_report = await asyncio.to_thread(generate_ai_market_insights)
     
     msg = (
-        "📊 **XAU/USD Live Price Feed (Twelve Data Pure)**\n"
-        "Provider: Twelve Data\n"
-        f"Status: {feed.get('status', 'MISSING')}\n"
-        f"Bid: {fmt(feed.get('bid'))}\n"
-        f"Ask: {fmt(feed.get('ask'))}\n"
-        f"Mid: {fmt(feed.get('mid'))}\n"
-        f"Timestamp: {timestamp}\n"
-        f"Age: {age}\n"
-        f"Reason: {reason or 'N/A'}"
+        f"🤖 **تقرير ونصيحة الذكاء الاصطناعي (Gemini)**\n"
+        f"───────────────────\n"
+        f"{ai_report}\n"
+        f"───────────────────\n"
+        f"💡 *هذا التحليل يتجدد تلقائياً مع تحركات الشموع الحية.*"
     )
     await safe_reply_text(update, msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
@@ -2810,6 +2902,7 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("price", price))
     app.add_handler(CommandHandler("analyze", analyze))
+    app.add_handler(CommandHandler("ai_info", ai_info))
     app.add_handler(CommandHandler("signal", signal))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("backtest", backtest))
@@ -2819,7 +2912,7 @@ if __name__ == '__main__':
     
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
     
-    print("🤖 البوت الهجين (Twelve Data Pure + Dynamic Gemini Discovery + Walk-Forward ML) يعمل بكفاءة تامة...")
+    print("🤖 البوت الهجين (Twelve Data Pure + Dynamic Gemini Discovery + Multi-Factor ML) يعمل بكفاءة تامة...")
     if not acquire_telegram_poll_lock():
         raise RuntimeError("لم يتم الحصول على قفل Telegram singleton؛ يوجد مثيل آخر يعمل أو قاعدة البيانات غير متاحة.")
     try:
