@@ -70,3 +70,16 @@ def test_manual_scope_survives_async_to_thread(tmp_path, monkeypatch):
 
     import asyncio
     assert asyncio.run(probe()) == "manual"
+
+
+def test_manual_handler_name_survives_async_to_thread(tmp_path, monkeypatch):
+    monkeypatch.setenv("DB_FILE", str(tmp_path / "quota.db"))
+    gateway = importlib.import_module("twelve_data_gateway")
+    url = "https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=15min&apikey=test"
+
+    async def price():
+        import asyncio
+        return await asyncio.to_thread(lambda: gateway.classify_url(url)[0])
+
+    import asyncio
+    assert asyncio.run(price()) == "manual"
