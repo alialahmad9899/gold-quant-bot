@@ -1,5 +1,6 @@
 import importlib
 import json
+from pathlib import Path
 
 
 def runtime(monkeypatch):
@@ -60,3 +61,11 @@ def test_fresh_price_tick_populates_live_quote_cache(monkeypatch):
     assert quote["price"] == 3342.75
     assert quote["mid"] == 3342.75
     assert quote["provider"] == "Twelve Data WebSocket"
+
+
+def test_bot_explicitly_bootstraps_twelve_data_runtime():
+    source = Path(__file__).resolve().parents[1].joinpath("bot.py").read_text(encoding="utf-8")
+    assert "_twelve_data_runtime.start_runtime()" in source
+    logger_pos = source.index("logger = logging.getLogger('xau_quant_bot')")
+    bootstrap_pos = source.index("_twelve_data_runtime.start_runtime()")
+    assert bootstrap_pos > logger_pos
