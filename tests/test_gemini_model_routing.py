@@ -117,3 +117,19 @@ def test_429_cools_down_model_without_retrying_same_model(monkeypatch):
     assert selected == "good-model"
     assert calls == ["limited-model", "good-model"]
     assert bot.MODEL_COOLDOWNS_429["limited-model"] > time.monotonic()
+
+
+def test_priority_returns_no_candidate_when_all_compatible_models_are_on_cooldown(monkeypatch):
+    bot = get_bot(monkeypatch)
+    now = time.monotonic()
+    bot.SESSION_BLACKLIST_404.clear()
+    bot.SESSION_BLACKLIST_INCOMPATIBLE.clear()
+    bot.MODEL_COOLDOWNS_429.clear()
+    bot.MODEL_COOLDOWNS_429.update({"gemini-3.5-flash": now + 60, "gemini-2.5-pro": now + 60})
+
+    monkeypatch.setattr(
+        bot,
+        "discover_available_models",
+        lambda force_refresh=False: ["gemini-3.5-flash", "gemini-2.5-pro"],
+    )
+    assert bot.prioritize_models_for_task() == []
