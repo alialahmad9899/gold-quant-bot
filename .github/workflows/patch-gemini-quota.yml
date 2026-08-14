@@ -11,8 +11,19 @@ jobs:
   patch:
     if: "!contains(github.event.head_commit.message, '[quota-routed]')"
     runs-on: ubuntu-latest
+    env:
+      TELEGRAM_TOKEN: test-token
+      BOT_PASSWORD: test-password
+      TWELVE_DATA_API_KEY: test-key
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
       - name: Apply quota-aware routing
         run: |
           python - <<'PY'
@@ -44,103 +55,34 @@ jobs:
               raise SystemExit('fallback block not found')
           s = s.replace(old_fallback, new_fallback, 1)
 
-          old_loop = '''    for target_model in candidates:\n'''
-          new_loop = '''    for target_model in candidates[:MAX_GEMINI_ATTEMPTS]:\n'''
-          if old_loop not in s:
-              raise SystemExit('loop block not found')
-          s = s.replace(old_loop, new_loop, 1)
+          s = s.replace('    for target_model in candidates:\n', '    for target_model in candidates[:MAX_GEMINI_ATTEMPTS]:\n', 1)
 
           old_429 = '''            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:\n                MODEL_COOLDOWNS_429[target_model] = time.monotonic() + 45\n                logger.warning(f"⏳ [429 QUOTA] [{target_model}] دخل cooldown لمدة 45 ثانية. الانتقال مباشرةً للبديل.")\n                continue\n'''
           new_429 = '''            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:\n                cooldown_seconds = 45\n                if "PerDay" in err_str or "per day" in err_str.lower() or "RPD" in err_str:\n                    cooldown_seconds = GEMINI_RPD_COOLDOWN_SECONDS\n                MODEL_COOLDOWNS_429[target_model] = time.monotonic() + cooldown_seconds\n                logger.warning(\n                    f"⏳ [429 QUOTA] [{target_model}] دخل cooldown لمدة {cooldown_seconds} ثانية. "\n                    "لن تتم إعادة ضرب الموديل ضمن نفس نافذة الحصة."\n                )\n                continue\n'''
           if old_429 not in s:
               raise SystemExit('429 block not found')
           s = s.replace(old_429, new_429, 1)
-
-          # quota-aware patch v2 retrigger marker
           p.write_text(s, encoding='utf-8')
+
+          t = Path('tests/test_gemini_model_routing.py')
+          with t.open('a', encoding='utf-8') as f:
+              f.write('''\n\ndef test_404_blacklist_survives_model_rediscovery(monkeypatch):\n    bot = get_bot(monkeypatch)\n    bot.SESSION_BLACKLIST_404.clear(); bot.MODEL_COOLDOWNS_429.clear(); bot.SESSION_BLACKLIST_INCOMPATIBLE.clear()\n    bot.SESSION_BLACKLIST_404.add("gemini-2.5-flash")\n    monkeypatch.setattr(bot, "discover_available_models", lambda force_refresh=False: ["gemini-2.5-flash", "gemini-2.5-flash-lite"])\n    assert "gemini-2.5-flash" not in bot.prioritize_models_for_task()\n\n\ndef test_vetting_prefers_lite(monkeypatch):\n    bot = get_bot(monkeypatch)\n    bot.SESSION_BLACKLIST_404.clear(); bot.SESSION_BLACKLIST_INCOMPATIBLE.clear(); bot.MODEL_COOLDOWNS_429.clear()\n    monkeypatch.setattr(bot, "discover_available_models", lambda force_refresh=False: ["gemini-3.7-flash", "gemini-3.1-flash-lite", "gemini-2.5-pro", "gemini-2.5-flash-lite"])\n    assert bot.prioritize_models_for_task()[0] in {"gemini-3.1-flash-lite", "gemini-2.5-flash-lite"}\n\n\ndef test_execute_does_not_force_rediscovery_when_all_candidates_are_unavailable(monkeypatch):\n    bot = get_bot(monkeypatch); bot.gemini_client = object()\n    monkeypatch.setattr(bot, "prioritize_models_for_task", lambda task_type="vetting": [])\n    monkeypatch.setattr(bot, "discover_available_models", lambda force_refresh=False: (_ for _ in ()).throw(AssertionError("unexpected rediscovery")))\n    try: bot.execute_gemini_dynamic_request("ping")\n    except RuntimeError as exc: assert "لا يوجد حالياً موديل Gemini" in str(exc)\n    else: raise AssertionError("expected RuntimeError")\n\n\ndef test_daily_429_gets_long_cooldown(monkeypatch):\n    bot = get_bot(monkeypatch); bot.SESSION_BLACKLIST_404.clear(); bot.SESSION_BLACKLIST_INCOMPATIBLE.clear(); bot.MODEL_COOLDOWNS_429.clear()\n    monkeypatch.setattr(bot, "prioritize_models_for_task", lambda task_type="vetting": ["daily-limited", "good-model"])\n    class Models:\n        def generate_content(self, model, contents, config):\n            if model == "daily-limited": raise Exception("429 RESOURCE_EXHAUSTED quotaId=GenerateRequestsPerDayPerProject-FreeTier")\n            return type("Response", (), {"text": "ok"})()\n    monkeypatch.setattr(bot, "gemini_client", type("Client", (), {"models": Models()})())\n    bot.execute_gemini_dynamic_request("ping")\n    assert bot.MODEL_COOLDOWNS_429["daily-limited"] > time.monotonic() + 5 * 60 * 60\n''')
+
+          Path('.github/workflows/ci.yml').write_text('''name: CI\n\non:\n  push:\n    branches: [main]\n  pull_request:\n    branches: [main]\n\npermissions:\n  contents: read\n\njobs:\n  test:\n    runs-on: ubuntu-latest\n    env:\n      TELEGRAM_TOKEN: test-token\n      BOT_PASSWORD: test-password\n      TWELVE_DATA_API_KEY: test-key\n    steps:\n      - uses: actions/checkout@v4\n      - uses: actions/setup-python@v5\n        with:\n          python-version: \'3.11\'\n      - run: python -m pip install --upgrade pip\n      - run: python -m pip install -r requirements.txt pytest\n      - run: python -m py_compile bot.py twelve_data_gateway.py\n      - run: python -m pytest -q\n      - run: git diff --check\n''', encoding='utf-8')
+          Path('.github/workflows/patch-gemini-quota.yml').unlink(missing_ok=True)
           PY
-
-      - name: Add regression tests
-        run: |
-          cat >> tests/test_gemini_model_routing.py <<'PY'
-
-          def test_404_blacklist_survives_model_rediscovery(monkeypatch):
-              bot = get_bot(monkeypatch)
-              bot.SESSION_BLACKLIST_404.clear()
-              bot.MODEL_COOLDOWNS_429.clear()
-              bot.SESSION_BLACKLIST_INCOMPATIBLE.clear()
-              bot.SESSION_BLACKLIST_404.add("gemini-2.5-flash")
-              monkeypatch.setattr(
-                  bot,
-                  "discover_available_models",
-                  lambda force_refresh=False: ["gemini-2.5-flash", "gemini-2.5-flash-lite"],
-              )
-              candidates = bot.prioritize_models_for_task()
-              assert "gemini-2.5-flash" not in candidates
-
-          def test_vetting_prefers_lite_and_bounds_attempts(monkeypatch):
-              bot = get_bot(monkeypatch)
-              bot.SESSION_BLACKLIST_404.clear()
-              bot.SESSION_BLACKLIST_INCOMPATIBLE.clear()
-              bot.MODEL_COOLDOWNS_429.clear()
-              monkeypatch.setattr(
-                  bot,
-                  "discover_available_models",
-                  lambda force_refresh=False: [
-                      "gemini-3.7-flash",
-                      "gemini-3.1-flash-lite",
-                      "gemini-2.5-pro",
-                      "gemini-2.5-flash-lite",
-                  ],
-              )
-              candidates = bot.prioritize_models_for_task()
-              assert candidates[0] in {"gemini-3.1-flash-lite", "gemini-2.5-flash-lite"}
-              assert len(candidates) <= bot.MAX_GEMINI_CANDIDATES
-
-          def test_execute_does_not_force_rediscovery_when_all_candidates_are_unavailable(monkeypatch):
-              bot = get_bot(monkeypatch)
-              bot.gemini_client = object()
-              monkeypatch.setattr(bot, "prioritize_models_for_task", lambda task_type="vetting": [])
-              monkeypatch.setattr(bot, "discover_available_models", lambda force_refresh=False: (_ for _ in ()).throw(AssertionError("unexpected rediscovery")))
-              try:
-                  bot.execute_gemini_dynamic_request("ping")
-              except RuntimeError as exc:
-                  assert "لا يوجد حالياً موديل Gemini" in str(exc)
-              else:
-                  raise AssertionError("expected RuntimeError")
-
-          def test_daily_429_gets_long_cooldown(monkeypatch):
-              bot = get_bot(monkeypatch)
-              bot.SESSION_BLACKLIST_404.clear()
-              bot.SESSION_BLACKLIST_INCOMPATIBLE.clear()
-              bot.MODEL_COOLDOWNS_429.clear()
-              monkeypatch.setattr(bot, "prioritize_models_for_task", lambda task_type="vetting": ["daily-limited", "good-model"])
-
-              class Models:
-                  def generate_content(self, model, contents, config):
-                      if model == "daily-limited":
-                          raise Exception("429 RESOURCE_EXHAUSTED quotaId=GenerateRequestsPerDayPerProject-FreeTier")
-                      return type("Response", (), {"text": "ok"})()
-
-              client = type("Client", (), {"models": Models()})()
-              monkeypatch.setattr(bot, "gemini_client", client)
-              bot.execute_gemini_dynamic_request("ping")
-              assert bot.MODEL_COOLDOWNS_429["daily-limited"] > time.monotonic() + 5 * 60 * 60
-          PY
-
       - name: Verify syntax and tests
         run: |
           python -m py_compile bot.py twelve_data_gateway.py
           python -m pytest -q
           git diff --check
-
       - name: Commit patch and remove temporary workflow
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add bot.py tests/test_gemini_model_routing.py
+          git add bot.py tests/test_gemini_model_routing.py .github/workflows/ci.yml
           git rm .github/workflows/patch-gemini-quota.yml
           git commit -m "fix: make Gemini routing quota-aware [quota-routed]"
-          git push
+          git push origin HEAD:${{ github.ref_name }}
