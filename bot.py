@@ -177,12 +177,7 @@ def prioritize_models_for_task(task_type="vetting"):
         and m not in SESSION_BLACKLIST_INCOMPATIBLE
         and now >= MODEL_COOLDOWNS_429.get(m, 0)
     ]
-    pool_models = active_candidates if active_candidates else [
-        m for m in available
-        if is_compatible_generate_content_model(m)
-        and m not in SESSION_BLACKLIST_404
-        and m not in SESSION_BLACKLIST_INCOMPATIBLE
-    ]
+    pool_models = active_candidates
     
     def score_model(name):
         n = name.lower()
@@ -218,9 +213,14 @@ def execute_gemini_dynamic_request(prompt, response_mime_type="application/json"
 
     candidates = prioritize_models_for_task(task_type=task_type)
     if not candidates:
-        candidates = discover_available_models(force_refresh=True)[:MAX_GEMINI_CANDIDATES]
+        candidates = [
+            m for m in discover_available_models(force_refresh=True)
+            if m not in SESSION_BLACKLIST_404
+            and m not in SESSION_BLACKLIST_INCOMPATIBLE
+            and time.monotonic() >= MODEL_COOLDOWNS_429.get(m, 0)
+        ][:MAX_GEMINI_CANDIDATES]
         if not candidates:
-            raise RuntimeError("لم يتم العثور على أي موديل متوافق فعلياً مع generate_content.")
+            raise RuntimeError("لا يوجد حالياً موديل Gemini متوافق ومتاح للخدمة؛ تم احترام cooldowns والقيود المؤقتة.")
 
     config_params = {}
     if response_mime_type:
@@ -251,8 +251,7 @@ def execute_gemini_dynamic_request(prompt, response_mime_type="application/json"
                 continue
 
             if ("This model only supports Interactions API" in err_str
-                    or "Interactions API" in err_str
-                    or "INVALID_ARGUMENT" in err_str):
+                    or "Interactions API" in err_str):
                 logger.warning(f"🚫 [INCOMPATIBLE MODEL] [{target_model}] غير متوافق مع generate_content. سيتم تخطيه لباقي الجلسة.")
                 with MODELS_DISCOVERY_LOCK:
                     SESSION_BLACKLIST_INCOMPATIBLE.add(target_model)
