@@ -100,6 +100,28 @@ LAST_MODELS_DISCOVERY_TIME = None
 MODELS_DISCOVERY_LOCK = threading.Lock()
 SESSION_BLACKLIST_404 = set()
 MODEL_COOLDOWNS_429 = {}
+SESSION_BLACKLIST_INCOMPATIBLE = set()
+MAX_GEMINI_CANDIDATES = int(os.getenv("MAX_GEMINI_CANDIDATES", "6"))
+GEMINI_INCOMPATIBLE_NAME_PATTERNS = (
+    "-live", "live-", "-image", "image-", "native-audio", "-audio",
+    "audio-", "robotics", "deep-research", "computer-use", "lyria",
+    "translate-preview", "tts", "speech",
+)
+
+def is_compatible_generate_content_model(name, model_meta=None):
+    """Return whether a discovered model is appropriate for generate_content text vetting."""
+    clean_name = str(name or "").replace("models/", "").strip().lower()
+    if not clean_name:
+        return False
+    if any(pattern in clean_name for pattern in GEMINI_INCOMPATIBLE_NAME_PATTERNS):
+        return False
+    if model_meta is not None:
+        supported = getattr(model_meta, "supported_generation_methods", None) or []
+        if supported:
+            normalized = {str(item).lower() for item in supported}
+            if not any("generatecontent" in item or item == "generate_content" for item in normalized):
+                return False
+    return True
 
 # حظر دائم للعائلات القديمة الملغاة
 DEPRECATED_MODEL_PATTERNS = ['gemini-1.5', 'gemini-2.0', 'embedding', 'aqa', 'imagen', 'whisper', 'tts']
@@ -126,16 +148,11 @@ def discover_available_models(force_refresh=False):
 
                 if any(pat in clean_name.lower() for pat in DEPRECATED_MODEL_PATTERNS):
                     continue
-                
-                supported_methods = getattr(m, 'supported_generation_methods', []) or []
-                supported_actions = getattr(m, 'supported_actions', []) or []
-                all_supported = [str(x).lower() for x in (supported_methods + supported_actions)]
-                
-                if all_supported:
-                    if any('generatecontent' in act for act in all_supported):
-                        available.append(clean_name)
-                else:
-                    available.append(clean_name)
+
+                if not is_compatible_generate_content_model(clean_name, m):
+                    continue
+
+                available.append(clean_name)
 
             if available:
                 DISCOVERED_MODELS_CACHE = available
@@ -153,8 +170,14 @@ def prioritize_models_for_task(task_type="vetting"):
     available = discover_available_models(force_refresh=False)
     now = time.monotonic()
     
-    active_candidates = [m for m in available if now >= MODEL_COOLDOWNS_429.get(m, 0)]
-    pool_models = active_candidates if active_candidates else available
+    active_candidates = [
+        m for m in available
+        if is_compatible_generate_content_model(m)
+        and m not in SESSION_BLACKLIST_404
+        and m not in SESSION_BLACKLIST_INCOMPATIBLE
+        and now >= MODEL_COOLDOWNS_429.get(m, 0)
+    ]
+    pool_models = active_candidates
     
     def score_model(name):
         n = name.lower()
@@ -182,7 +205,7 @@ def prioritize_models_for_task(task_type="vetting"):
         return score
 
     sorted_candidates = sorted(pool_models, key=score_model, reverse=True)
-    return sorted_candidates
+    return sorted_candidates[:MAX_GEMINI_CANDIDATES]
 
 def execute_gemini_dynamic_request(prompt, response_mime_type="application/json", task_type="vetting"):
     if not gemini_client:
@@ -190,9 +213,14 @@ def execute_gemini_dynamic_request(prompt, response_mime_type="application/json"
 
     candidates = prioritize_models_for_task(task_type=task_type)
     if not candidates:
-        candidates = discover_available_models(force_refresh=True)
+        candidates = [
+            m for m in discover_available_models(force_refresh=True)
+            if m not in SESSION_BLACKLIST_404
+            and m not in SESSION_BLACKLIST_INCOMPATIBLE
+            and time.monotonic() >= MODEL_COOLDOWNS_429.get(m, 0)
+        ][:MAX_GEMINI_CANDIDATES]
         if not candidates:
-            raise RuntimeError("لم يتم العثور على أي موديل متاح وداعم لـ generateContent لمفتاحك.")
+            raise RuntimeError("لا يوجد حالياً موديل Gemini متوافق ومتاح للخدمة؛ تم احترام cooldowns والقيود المؤقتة.")
 
     config_params = {}
     if response_mime_type:
@@ -202,41 +230,42 @@ def execute_gemini_dynamic_request(prompt, response_mime_type="application/json"
     last_error = None
 
     for target_model in candidates:
-        for attempt in range(2):
-            try:
-                response = gemini_client.models.generate_content(
-                    model=target_model,
-                    contents=prompt,
-                    config=cfg
-                )
-                if response and response.text:
-                    return response.text, target_model
-            except Exception as e:
-                err_str = str(e)
-                last_error = e
+        if not is_compatible_generate_content_model(target_model):
+            continue
+        try:
+            response = gemini_client.models.generate_content(
+                model=target_model,
+                contents=prompt,
+                config=cfg
+            )
+            if response and response.text:
+                return response.text, target_model
+        except Exception as e:
+            err_str = str(e)
+            last_error = e
 
-                if "404" in err_str or "NOT_FOUND" in err_str or "is not found" in err_str:
-                    logger.warning(f"🚫 [404 NOT_FOUND] الموديل [{target_model}] غير متاح. جاري وضعه في البلاك ليست المؤقت وتجربة موديل آخر...")
-                    with MODELS_DISCOVERY_LOCK:
-                        SESSION_BLACKLIST_404.add(target_model)
-                    break
+            if "404" in err_str or "NOT_FOUND" in err_str or "is not found" in err_str:
+                logger.warning(f"🚫 [404 NOT_FOUND] الموديل [{target_model}] غير متاح. سيتم تخطيه لباقي الجلسة.")
+                with MODELS_DISCOVERY_LOCK:
+                    SESSION_BLACKLIST_404.add(target_model)
+                continue
 
-                elif "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                    cooldown_time = time.monotonic() + 45
-                    MODEL_COOLDOWNS_429[target_model] = cooldown_time
-                    logger.warning(f"⏳ [429 QUOTA] بلوغ حد الطلبات على [{target_model}]. جاري تطبيق التهدئة والانتقال للبديل...")
-                    time.sleep(1.2 + (hash(str(time.time())) % 500) / 1000.0)
-                    continue
+            if ("This model only supports Interactions API" in err_str
+                    or "Interactions API" in err_str):
+                logger.warning(f"🚫 [INCOMPATIBLE MODEL] [{target_model}] غير متوافق مع generate_content. سيتم تخطيه لباقي الجلسة.")
+                with MODELS_DISCOVERY_LOCK:
+                    SESSION_BLACKLIST_INCOMPATIBLE.add(target_model)
+                continue
 
-                elif "400" in err_str or "INVALID_ARGUMENT" in err_str or "Bad Request" in err_str:
-                    logger.error(f"❌ [400 INVALID_ARGUMENT] خطأ في صياغة الطلب أو الـ Config: {err_str}")
-                    raise e
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                MODEL_COOLDOWNS_429[target_model] = time.monotonic() + 45
+                logger.warning(f"⏳ [429 QUOTA] [{target_model}] دخل cooldown لمدة 45 ثانية. الانتقال مباشرةً للبديل.")
+                continue
 
-                else:
-                    logger.warning(f"⚠️ خطأ أثناء استدعاء [{target_model}]: {err_str}")
-                    break
+            logger.warning(f"⚠️ خطأ أثناء استدعاء [{target_model}]: {err_str}")
+            continue
 
-    raise RuntimeError(f"تعذرت جميع محاولات النماذج المكتشفة ديناميكياً. آخر خطأ مسجل: {last_error}")
+    raise RuntimeError(f"تعذرت جميع موديلات Gemini المتوافقة. آخر خطأ مسجل: {last_error}")
 
 # ------------------------------------
 # 🔑 إعدادات الحماية والآدمن والكاش وأمان الخيوط والمهام
