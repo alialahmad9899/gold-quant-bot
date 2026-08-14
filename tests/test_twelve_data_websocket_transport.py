@@ -45,3 +45,18 @@ def test_subscribe_status_is_tracked_and_subscription_errors_are_visible(monkeyp
     assert state["subscription_status"] == "error"
     assert state["status"] == "SUBSCRIPTION_ERROR"
     assert "not available" in state["last_error"]
+
+
+def test_fresh_price_tick_populates_live_quote_cache(monkeypatch):
+    _, module = runtime(monkeypatch)
+    assert module.parse_twelve_data_websocket_message(json.dumps({
+        "event": "price",
+        "symbol": "XAU/USD",
+        "timestamp": 1786665600,
+        "price": 3342.75,
+    })) is True
+    quote = module.get_websocket_quote(max_age_seconds=10)
+    assert quote is not None
+    assert quote["price"] == 3342.75
+    assert quote["mid"] == 3342.75
+    assert quote["provider"] == "Twelve Data WebSocket"
