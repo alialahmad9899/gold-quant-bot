@@ -1,9 +1,16 @@
+import importlib
 import time
 
-import bot
+
+def get_bot(monkeypatch):
+    monkeypatch.setenv("CI", "true")
+    monkeypatch.delenv("TWELVE_DATA_API_KEY", raising=False)
+    monkeypatch.delenv("TWELVEDATA_API_KEY", raising=False)
+    return importlib.import_module("bot")
 
 
-def test_model_capability_filter_rejects_non_text_families():
+def test_model_capability_filter_rejects_non_text_families(monkeypatch):
+    bot = get_bot(monkeypatch)
     for name in (
         "gemini-3.1-flash-live-preview",
         "gemini-3.1-flash-image",
@@ -15,12 +22,14 @@ def test_model_capability_filter_rejects_non_text_families():
         assert bot.is_compatible_generate_content_model(name) is False
 
 
-def test_model_capability_filter_accepts_text_models():
+def test_model_capability_filter_accepts_text_models(monkeypatch):
+    bot = get_bot(monkeypatch)
     assert bot.is_compatible_generate_content_model("gemini-2.5-pro") is True
     assert bot.is_compatible_generate_content_model("gemini-3.5-flash") is True
 
 
 def test_priority_candidates_are_bounded_and_exclude_incompatible_models(monkeypatch):
+    bot = get_bot(monkeypatch)
     monkeypatch.setattr(
         bot,
         "discover_available_models",
@@ -41,11 +50,11 @@ def test_priority_candidates_are_bounded_and_exclude_incompatible_models(monkeyp
 
 
 def test_invalid_400_marks_model_blacklisted_and_moves_on(monkeypatch):
+    bot = get_bot(monkeypatch)
     bot.SESSION_BLACKLIST_404.clear()
     bot.SESSION_BLACKLIST_INCOMPATIBLE.clear()
     bot.MODEL_COOLDOWNS_429.clear()
 
-    bot.gemini_client = object()
     monkeypatch.setattr(bot, "prioritize_models_for_task", lambda task_type="vetting": ["bad-model", "good-model"])
 
     class Models:
@@ -63,6 +72,7 @@ def test_invalid_400_marks_model_blacklisted_and_moves_on(monkeypatch):
 
 
 def test_404_marks_model_blacklisted_and_moves_on(monkeypatch):
+    bot = get_bot(monkeypatch)
     bot.SESSION_BLACKLIST_404.clear()
     bot.SESSION_BLACKLIST_INCOMPATIBLE.clear()
     bot.MODEL_COOLDOWNS_429.clear()
@@ -84,6 +94,7 @@ def test_404_marks_model_blacklisted_and_moves_on(monkeypatch):
 
 
 def test_429_cools_down_model_without_retrying_same_model(monkeypatch):
+    bot = get_bot(monkeypatch)
     bot.SESSION_BLACKLIST_404.clear()
     bot.SESSION_BLACKLIST_INCOMPATIBLE.clear()
     bot.MODEL_COOLDOWNS_429.clear()
