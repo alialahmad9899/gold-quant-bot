@@ -101,7 +101,9 @@ MODELS_DISCOVERY_LOCK = threading.Lock()
 SESSION_BLACKLIST_404 = set()
 MODEL_COOLDOWNS_429 = {}
 SESSION_BLACKLIST_INCOMPATIBLE = set()
-MAX_GEMINI_CANDIDATES = int(os.getenv("MAX_GEMINI_CANDIDATES", "6"))
+MAX_GEMINI_CANDIDATES = int(os.getenv("MAX_GEMINI_CANDIDATES", "4"))
+MAX_GEMINI_ATTEMPTS = int(os.getenv("MAX_GEMINI_ATTEMPTS", "2"))
+GEMINI_RPD_COOLDOWN_SECONDS = int(os.getenv("GEMINI_RPD_COOLDOWN_SECONDS", str(6 * 60 * 60)))
 GEMINI_INCOMPATIBLE_NAME_PATTERNS = (
     "-live", "live-", "-image", "image-", "native-audio", "-audio",
     "audio-", "robotics", "deep-research", "computer-use", "lyria",
@@ -157,7 +159,6 @@ def discover_available_models(force_refresh=False):
             if available:
                 DISCOVERED_MODELS_CACHE = available
                 LAST_MODELS_DISCOVERY_TIME = now
-                SESSION_BLACKLIST_404.clear()
                 logger.info("✅ [Dynamic Discovery] تم اكتشاف الموديلات المتاحة فعلياً لمفتاحك: %s", DISCOVERED_MODELS_CACHE)
                 return [m for m in DISCOVERED_MODELS_CACHE if m not in SESSION_BLACKLIST_404]
 
@@ -179,15 +180,28 @@ def prioritize_models_for_task(task_type="vetting"):
     ]
     pool_models = active_candidates
     
+    preferred_vetting = [
+        item.strip().lower()
+        for item in os.getenv(
+            "GEMINI_VETTING_PREFERRED_MODELS",
+            "gemini-3.1-flash-lite,gemini-2.5-flash-lite,gemini-3.5-flash-lite,gemini-3.1-flash-lite-preview",
+        ).split(",")
+        if item.strip()
+    ]
+
     def score_model(name):
         n = name.lower()
         score = 0
         if task_type == "vetting":
-            if 'flash' in n and 'lite' not in n:
-                score += 30
+            if n in preferred_vetting:
+                score += 1000 - (preferred_vetting.index(n) * 50)
+            if 'lite' in n:
+                score += 80
+            elif 'flash' in n:
+                score += 50
             elif 'pro' in n:
                 score += 20
-            elif 'lite' in n:
+            if 'preview' not in n:
                 score += 10
         else:
             if 'lite' in n:
@@ -213,14 +227,7 @@ def execute_gemini_dynamic_request(prompt, response_mime_type="application/json"
 
     candidates = prioritize_models_for_task(task_type=task_type)
     if not candidates:
-        candidates = [
-            m for m in discover_available_models(force_refresh=True)
-            if m not in SESSION_BLACKLIST_404
-            and m not in SESSION_BLACKLIST_INCOMPATIBLE
-            and time.monotonic() >= MODEL_COOLDOWNS_429.get(m, 0)
-        ][:MAX_GEMINI_CANDIDATES]
-        if not candidates:
-            raise RuntimeError("لا يوجد حالياً موديل Gemini متوافق ومتاح للخدمة؛ تم احترام cooldowns والقيود المؤقتة.")
+        raise RuntimeError("لا يوجد حالياً موديل Gemini متوافق ومتاح للخدمة؛ تم احترام cooldowns والقيود المؤقتة بدون إعادة اكتشاف تسبب ضغطاً إضافياً على الحصة.")
 
     config_params = {}
     if response_mime_type:
@@ -229,7 +236,7 @@ def execute_gemini_dynamic_request(prompt, response_mime_type="application/json"
 
     last_error = None
 
-    for target_model in candidates:
+    for target_model in candidates[:MAX_GEMINI_ATTEMPTS]:
         if not is_compatible_generate_content_model(target_model):
             continue
         try:
@@ -258,8 +265,14 @@ def execute_gemini_dynamic_request(prompt, response_mime_type="application/json"
                 continue
 
             if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                MODEL_COOLDOWNS_429[target_model] = time.monotonic() + 45
-                logger.warning(f"⏳ [429 QUOTA] [{target_model}] دخل cooldown لمدة 45 ثانية. الانتقال مباشرةً للبديل.")
+                cooldown_seconds = 45
+                if "PerDay" in err_str or "per day" in err_str.lower() or "RPD" in err_str:
+                    cooldown_seconds = GEMINI_RPD_COOLDOWN_SECONDS
+                MODEL_COOLDOWNS_429[target_model] = time.monotonic() + cooldown_seconds
+                logger.warning(
+                    f"⏳ [429 QUOTA] [{target_model}] دخل cooldown لمدة {cooldown_seconds} ثانية. "
+                    "لن تتم إعادة ضرب الموديل ضمن نفس نافذة الحصة."
+                )
                 continue
 
             logger.warning(f"⚠️ خطأ أثناء استدعاء [{target_model}]: {err_str}")

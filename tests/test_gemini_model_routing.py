@@ -157,3 +157,39 @@ def test_priority_returns_no_candidate_when_all_compatible_models_are_on_cooldow
     assert bot.prioritize_models_for_task() == []
 
 # CI trigger marker: quota-aware routing patch must push its generated commit back to the PR branch.
+
+
+def test_404_blacklist_survives_model_rediscovery(monkeypatch):
+    bot = get_bot(monkeypatch)
+    bot.SESSION_BLACKLIST_404.clear(); bot.MODEL_COOLDOWNS_429.clear(); bot.SESSION_BLACKLIST_INCOMPATIBLE.clear()
+    bot.SESSION_BLACKLIST_404.add("gemini-2.5-flash")
+    monkeypatch.setattr(bot, "discover_available_models", lambda force_refresh=False: ["gemini-2.5-flash", "gemini-2.5-flash-lite"])
+    assert "gemini-2.5-flash" not in bot.prioritize_models_for_task()
+
+
+def test_vetting_prefers_lite(monkeypatch):
+    bot = get_bot(monkeypatch)
+    bot.SESSION_BLACKLIST_404.clear(); bot.SESSION_BLACKLIST_INCOMPATIBLE.clear(); bot.MODEL_COOLDOWNS_429.clear()
+    monkeypatch.setattr(bot, "discover_available_models", lambda force_refresh=False: ["gemini-3.7-flash", "gemini-3.1-flash-lite", "gemini-2.5-pro", "gemini-2.5-flash-lite"])
+    assert bot.prioritize_models_for_task()[0] in {"gemini-3.1-flash-lite", "gemini-2.5-flash-lite"}
+
+
+def test_execute_does_not_force_rediscovery_when_all_candidates_are_unavailable(monkeypatch):
+    bot = get_bot(monkeypatch); bot.gemini_client = object()
+    monkeypatch.setattr(bot, "prioritize_models_for_task", lambda task_type="vetting": [])
+    monkeypatch.setattr(bot, "discover_available_models", lambda force_refresh=False: (_ for _ in ()).throw(AssertionError("unexpected rediscovery")))
+    try: bot.execute_gemini_dynamic_request("ping")
+    except RuntimeError as exc: assert "لا يوجد حالياً موديل Gemini" in str(exc)
+    else: raise AssertionError("expected RuntimeError")
+
+
+def test_daily_429_gets_long_cooldown(monkeypatch):
+    bot = get_bot(monkeypatch); bot.SESSION_BLACKLIST_404.clear(); bot.SESSION_BLACKLIST_INCOMPATIBLE.clear(); bot.MODEL_COOLDOWNS_429.clear()
+    monkeypatch.setattr(bot, "prioritize_models_for_task", lambda task_type="vetting": ["daily-limited", "good-model"])
+    class Models:
+        def generate_content(self, model, contents, config):
+            if model == "daily-limited": raise Exception("429 RESOURCE_EXHAUSTED quotaId=GenerateRequestsPerDayPerProject-FreeTier")
+            return type("Response", (), {"text": "ok"})()
+    monkeypatch.setattr(bot, "gemini_client", type("Client", (), {"models": Models()})())
+    bot.execute_gemini_dynamic_request("ping")
+    assert bot.MODEL_COOLDOWNS_429["daily-limited"] > time.monotonic() + 5 * 60 * 60
