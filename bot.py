@@ -290,6 +290,14 @@ if not _root_logger.handlers:
     _root_logger.addHandler(_handler)
     _root_logger.addHandler(logging.StreamHandler())
 logger = logging.getLogger('xau_quant_bot')
+
+# Explicit production bootstrap: do not rely solely on sitecustomize autostart.
+try:
+    import sitecustomize as _twelve_data_runtime
+    _twelve_data_runtime.start_runtime()
+    logger.info("🚀 [Twelve Data] Explicit runtime bootstrap invoked from bot.py")
+except Exception as _twelve_data_runtime_error:
+    logger.exception("❌ [Twelve Data] Explicit runtime bootstrap failed: %s", _twelve_data_runtime_error)
 logging.getLogger('httpx').setLevel(logging.WARNING)
 logging.getLogger('httpcore').setLevel(logging.WARNING)
 
