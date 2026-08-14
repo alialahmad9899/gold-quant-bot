@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import math
 import os
 import sys
@@ -22,12 +23,15 @@ try:
 except Exception:  # pragma: no cover
     websocket = None
 
+logger = logging.getLogger("XAUUSD_QuantBot.WebSocket")
+
 _MANUAL_CALLERS = {"price", "analyze", "ai_info", "signal", "backtest", "system_health_check"}
 WS_ENDPOINT = "wss://ws.twelvedata.com/v1/quotes/price?apikey={api_key}"
 WS_SYMBOL = "XAU/USD"
 WS_STALE_SECONDS = float(os.getenv("TWELVE_DATA_WS_STALE_SECONDS", "10"))
 WS_MAX_BACKOFF_SECONDS = 900.0
 WS_HEARTBEAT_SECONDS = 10.0
+WS_SOCKET_TIMEOUT_SECONDS = 10.0
 BACKGROUND_TIMEFRAMES = (("5min", "df_gold_m5"), ("15min", "df_gold_m15"), ("1h", "df_gold_h1"))
 BACKGROUND_CYCLE_REQUESTS = len(BACKGROUND_TIMEFRAMES)
 BACKGROUND_MIN_INTERVAL_SECONDS = float(os.getenv("TWELVE_DATA_BACKGROUND_MIN_INTERVAL", "90"))
@@ -39,8 +43,20 @@ _RUNTIME_STOP = threading.Event()
 _WS_THREAD: threading.Thread | None = None
 _BG_THREAD: threading.Thread | None = None
 _WS_STATE: dict[str, Any] = {
-    "status": "DISABLED", "symbol": WS_SYMBOL, "last_error": None,
-    "last_connected_at": None, "last_tick_at": None, "reconnect_count": 0, "quote": None,
+    "status": "DISABLED",
+    "symbol": WS_SYMBOL,
+    "last_error": None,
+    "last_connected_at": None,
+    "last_tick_at": None,
+    "last_event_at": None,
+    "last_heartbeat_at": None,
+    "reconnect_count": 0,
+    "connection_attempts": 0,
+    "subscription_status": "unknown",
+    "subscribed_symbols": [],
+    "subscription_fails": [],
+    "transport": "websocket-client",
+    "quote": None,
 }
 
 
@@ -60,6 +76,34 @@ def websocket_request_url(api_key: str) -> str:
 
 def websocket_subscription_message() -> dict[str, Any]:
     return {"action": "subscribe", "params": {"symbols": WS_SYMBOL}}
+
+
+def websocket_heartbeat_message() -> dict[str, str]:
+    return {"action": "heartbeat"}
+
+
+def websocket_connection_options() -> dict[str, Any]:
+    """Return safe WSS options; bypass cloud HTTP proxies for Twelve Data by default."""
+    options: dict[str, Any] = {
+        "timeout": WS_SOCKET_TIMEOUT_SECONDS,
+        "http_no_proxy": ["ws.twelvedata.com"],
+    }
+    if os.getenv("TWELVE_DATA_WS_USE_PROXY", "0") == "1":
+        options.pop("http_no_proxy", None)
+    return options
+
+
+def _emit_ws_log(level: int, message: str, *args: Any) -> None:
+    try:
+        logger.log(level, message, *args)
+    except Exception:
+        pass
+    if level >= logging.ERROR:
+        try:
+            rendered = message % args if args else message
+            print(f"[TWELVE_DATA_WS] {rendered}", flush=True)
+        except Exception:
+            pass
 
 
 def _parse_timestamp(value: Any) -> datetime:
@@ -112,6 +156,7 @@ def update_websocket_quote(message: str | bytes | dict[str, Any]) -> bool:
     with _WS_LOCK:
         _WS_STATE["quote"] = quote
         _WS_STATE["last_tick_at"] = received_dt.isoformat()
+        _WS_STATE["last_event_at"] = received_dt.isoformat()
         _WS_STATE["status"] = "ACTIVE"
         _WS_STATE["last_error"] = None
     return True
@@ -136,57 +181,162 @@ def get_websocket_quote(max_age_seconds: float = WS_STALE_SECONDS) -> dict[str, 
 
 def websocket_status() -> dict[str, Any]:
     with _WS_LOCK:
-        return dict(_WS_STATE)
+        state = dict(_WS_STATE)
+        state["quote"] = dict(state.get("quote") or {}) or None
+        state["subscribed_symbols"] = list(state.get("subscribed_symbols") or [])
+        state["subscription_fails"] = list(state.get("subscription_fails") or [])
+        return state
+
+
+def _handle_subscription_status(payload: dict[str, Any]) -> bool:
+    status = str(payload.get("status", "")).lower()
+    success = payload.get("success") or []
+    fails = payload.get("fails") or []
+    subscribed = []
+    for item in success:
+        if isinstance(item, dict):
+            symbol = str(item.get("symbol", "")).upper()
+        else:
+            symbol = str(item).upper()
+        if symbol:
+            subscribed.append(symbol)
+
+    with _WS_LOCK:
+        _WS_STATE["subscription_status"] = status or "unknown"
+        _WS_STATE["subscribed_symbols"] = subscribed
+        _WS_STATE["subscription_fails"] = list(fails) if isinstance(fails, list) else [fails]
+        _WS_STATE["last_event_at"] = datetime.now(timezone.utc).isoformat()
+
+    if status == "ok" and WS_SYMBOL in subscribed:
+        with _WS_LOCK:
+            _WS_STATE["status"] = "SUBSCRIBED"
+            _WS_STATE["last_error"] = None
+        _emit_ws_log(logging.INFO, "✅ WebSocket subscribed successfully: %s", WS_SYMBOL)
+        return True
+
+    detail = json.dumps(fails, ensure_ascii=False)[:500]
+    with _WS_LOCK:
+        _WS_STATE["status"] = "SUBSCRIPTION_ERROR"
+        _WS_STATE["last_error"] = detail or "subscription rejected by Twelve Data"
+    _emit_ws_log(logging.ERROR, "❌ WebSocket subscription rejected for %s: %s", WS_SYMBOL, detail or "unknown reason")
+    return False
 
 
 def parse_twelve_data_websocket_message(raw_message: str | bytes) -> bool:
-    return update_websocket_quote(raw_message)
+    try:
+        payload = json.loads(raw_message)
+    except (TypeError, ValueError):
+        with _WS_LOCK:
+            _WS_STATE["last_error"] = "invalid websocket JSON payload"
+        return False
+
+    event = str(payload.get("event", "")).lower()
+    now = datetime.now(timezone.utc).isoformat()
+    with _WS_LOCK:
+        _WS_STATE["last_event_at"] = now
+
+    if event == "subscribe-status":
+        return _handle_subscription_status(payload)
+    if event == "heartbeat":
+        with _WS_LOCK:
+            _WS_STATE["last_heartbeat_at"] = now
+            if _WS_STATE.get("subscription_status") == "ok":
+                _WS_STATE["status"] = "SUBSCRIBED"
+        return True
+    if event == "price":
+        return update_websocket_quote(payload)
+
+    with _WS_LOCK:
+        _WS_STATE["last_error"] = f"unknown websocket event: {event or 'missing'}"
+    return False
 
 
 def _set_ws_status(status: str, error: str | None = None) -> None:
     with _WS_LOCK:
         _WS_STATE["status"] = status
-        _WS_STATE["last_error"] = str(error)[:300] if error else None
+        _WS_STATE["last_error"] = str(error)[:500] if error else None
+
+
+def _send_heartbeat(ws_app: Any) -> None:
+    try:
+        ws_app.send(json.dumps(websocket_heartbeat_message()))
+        with _WS_LOCK:
+            _WS_STATE["last_heartbeat_at"] = datetime.now(timezone.utc).isoformat()
+    except Exception as exc:
+        raise ConnectionError(f"heartbeat send failed: {type(exc).__name__}: {exc}") from exc
 
 
 def _websocket_worker(stop_event: threading.Event) -> None:
     api_key = os.getenv("TWELVE_DATA_API_KEY", os.getenv("TWELVEDATA_API_KEY", "")).strip()
-    if not api_key or len(api_key) < 8 or websocket is None:
-        _set_ws_status("DISABLED", "missing API key or websocket-client dependency")
+    if not api_key or len(api_key) < 8:
+        _set_ws_status("DISABLED", "missing or invalid API key")
+        _emit_ws_log(logging.ERROR, "❌ WebSocket disabled: Twelve Data API key missing/invalid")
         return
+    if websocket is None:
+        _set_ws_status("DISABLED", "websocket-client dependency unavailable")
+        _emit_ws_log(logging.ERROR, "❌ WebSocket disabled: websocket-client dependency unavailable")
+        return
+
     backoff = 2.0
     while not stop_event.is_set():
         ws_app = None
         try:
+            with _WS_LOCK:
+                _WS_STATE["connection_attempts"] = int(_WS_STATE.get("connection_attempts", 0)) + 1
+                attempt = int(_WS_STATE["connection_attempts"])
+                _WS_STATE["subscription_status"] = "pending"
+                _WS_STATE["subscribed_symbols"] = []
+                _WS_STATE["subscription_fails"] = []
             _set_ws_status("CONNECTING")
-            ws_app = websocket.create_connection(websocket_request_url(api_key), timeout=15)
-            ws_app.send(json.dumps(websocket_subscription_message()))
+            _emit_ws_log(logging.INFO, "🔌 WebSocket connecting to Twelve Data (attempt=%s)", attempt)
+
+            options = websocket_connection_options()
+            ws_app = websocket.create_connection(
+                websocket_request_url(api_key),
+                **options,
+            )
             with _WS_LOCK:
                 _WS_STATE["status"] = "CONNECTED"
                 _WS_STATE["last_connected_at"] = datetime.now(timezone.utc).isoformat()
+                _WS_STATE["last_error"] = None
+            _emit_ws_log(logging.INFO, "✅ WebSocket TCP/TLS connection established")
+
+            ws_app.send(json.dumps(websocket_subscription_message()))
+            _emit_ws_log(logging.INFO, "📡 WebSocket subscribe sent for %s", WS_SYMBOL)
             backoff = 2.0
-            next_ping = time.monotonic() + WS_HEARTBEAT_SECONDS
+            next_heartbeat = time.monotonic() + WS_HEARTBEAT_SECONDS
+
             while not stop_event.is_set():
-                now = time.monotonic()
-                if now >= next_ping:
-                    try:
-                        ws_app.ping()
-                    except Exception:
-                        pass
-                    next_ping = now + WS_HEARTBEAT_SECONDS
                 try:
                     raw = ws_app.recv()
                 except Exception as exc:
-                    if "timeout" in type(exc).__name__.lower():
+                    name = type(exc).__name__.lower()
+                    text = str(exc).lower()
+                    if "timeout" in name or "timed out" in text or "timeout" in text:
+                        if time.monotonic() >= next_heartbeat:
+                            _send_heartbeat(ws_app)
+                            next_heartbeat = time.monotonic() + WS_HEARTBEAT_SECONDS
                         continue
                     raise
+
                 if raw in (None, "", b""):
                     raise ConnectionError("Twelve Data WebSocket closed the stream")
-                parse_twelve_data_websocket_message(raw)
+
+                handled = parse_twelve_data_websocket_message(raw)
+                if not handled:
+                    state = websocket_status()
+                    if state.get("status") == "SUBSCRIPTION_ERROR":
+                        raise ConnectionError(state.get("last_error") or "subscription rejected")
+
+                if time.monotonic() >= next_heartbeat:
+                    _send_heartbeat(ws_app)
+                    next_heartbeat = time.monotonic() + WS_HEARTBEAT_SECONDS
+
         except Exception as exc:  # pragma: no cover
             with _WS_LOCK:
                 _WS_STATE["reconnect_count"] = int(_WS_STATE.get("reconnect_count", 0)) + 1
-            _set_ws_status("DISCONNECTED", exc)
+            _set_ws_status("DISCONNECTED", f"{type(exc).__name__}: {exc}")
+            _emit_ws_log(logging.ERROR, "⚠️ WebSocket disconnected: %s: %s | reconnect in %.1fs", type(exc).__name__, exc, backoff)
             stop_event.wait(timeout=backoff)
             backoff = min(WS_MAX_BACKOFF_SECONDS, backoff * 2.0)
         finally:
@@ -362,6 +512,7 @@ def start_runtime() -> None:
             _RUNTIME_STOP.clear()
             _WS_THREAD = threading.Thread(target=_websocket_worker, args=(_RUNTIME_STOP,), name="twelve-data-ws", daemon=True)
             _WS_THREAD.start()
+            _emit_ws_log(logging.INFO, "🚀 Twelve Data WebSocket worker started")
         if _BG_THREAD is None or not _BG_THREAD.is_alive():
             _BG_THREAD = threading.Thread(target=_background_worker, args=(_RUNTIME_STOP,), name="twelve-data-background", daemon=True)
             _BG_THREAD.start()
@@ -369,6 +520,7 @@ def start_runtime() -> None:
 
 def stop_runtime() -> None:
     _RUNTIME_STOP.set()
+    _emit_ws_log(logging.INFO, "🛑 Twelve Data background runtime stop requested")
 
 
 twelve_data_gateway.MINUTE_BUDGET = 4
