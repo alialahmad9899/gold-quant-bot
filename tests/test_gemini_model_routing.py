@@ -155,3 +155,5 @@ def test_priority_returns_no_candidate_when_all_compatible_models_are_on_cooldow
         lambda force_refresh=False: ["gemini-3.5-flash", "gemini-2.5-pro"],
     )
     assert bot.prioritize_models_for_task() == []
+
+# CI trigger marker: quota-aware routing patch must push its generated commit back to the PR branch.
