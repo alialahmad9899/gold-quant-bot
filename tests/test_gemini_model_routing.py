@@ -71,6 +71,28 @@ def test_invalid_400_marks_model_blacklisted_and_moves_on(monkeypatch):
     assert "bad-model" in bot.SESSION_BLACKLIST_INCOMPATIBLE
 
 
+def test_generic_400_is_not_marked_as_model_incompatible(monkeypatch):
+    bot = get_bot(monkeypatch)
+    bot.SESSION_BLACKLIST_404.clear()
+    bot.SESSION_BLACKLIST_INCOMPATIBLE.clear()
+    bot.MODEL_COOLDOWNS_429.clear()
+
+    monkeypatch.setattr(bot, "prioritize_models_for_task", lambda task_type="vetting": ["config-error-model", "good-model"])
+
+    class Models:
+        def generate_content(self, model, contents, config):
+            if model == "config-error-model":
+                raise Exception("400 INVALID_ARGUMENT: malformed request")
+            return type("Response", (), {"text": "ok"})()
+
+    client = type("Client", (), {"models": Models()})()
+    monkeypatch.setattr(bot, "gemini_client", client)
+
+    text, selected = bot.execute_gemini_dynamic_request("ping")
+    assert selected == "good-model"
+    assert "config-error-model" not in bot.SESSION_BLACKLIST_INCOMPATIBLE
+
+
 def test_404_marks_model_blacklisted_and_moves_on(monkeypatch):
     bot = get_bot(monkeypatch)
     bot.SESSION_BLACKLIST_404.clear()
