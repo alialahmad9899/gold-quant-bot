@@ -523,6 +523,31 @@ def stop_runtime() -> None:
     _emit_ws_log(logging.INFO, "🛑 Twelve Data background runtime stop requested")
 
 
+# Signal integrity bootstrap: wait until bot.py has finished defining its runtime,
+# then install the final feed/vetting/deduplication guards without changing strategy math.
+def _start_signal_safety_installer() -> None:
+    def worker() -> None:
+        deadline = time.monotonic() + 120.0
+        while time.monotonic() < deadline:
+            bot = sys.modules.get("bot") or sys.modules.get("__main__")
+            if bot is not None and all(
+                hasattr(bot, name)
+                for name in ("generate_quant_signal", "gemini_verify_signal", "log_trade", "fetch_canonical_xauusd_feed")
+            ):
+                try:
+                    import signal_safety
+                    bot._twelve_data_runtime = sys.modules.get(__name__) or sys.modules.get("sitecustomize")
+                    signal_safety.install_signal_safety(bot)
+                    logger.info("🛡️ [SIGNAL_SAFETY] Final signal integrity guard installed.")
+                except Exception as exc:
+                    logger.exception("❌ [SIGNAL_SAFETY] Installation failed: %s", exc)
+                return
+            time.sleep(0.25)
+        logger.error("❌ [SIGNAL_SAFETY] Timed out waiting for bot runtime definitions.")
+
+    threading.Thread(target=worker, name="signal-safety-installer", daemon=True).start()
+
+
 twelve_data_gateway.MINUTE_BUDGET = 4
 twelve_data_gateway.is_manual_live_price_call = _manual_call_active
 
@@ -530,6 +555,8 @@ if not getattr(requests, "_gold_quant_twelve_data_guard_installed", False):
     guarded_get = twelve_data_gateway.wrap_requests_get(requests.get)
     requests.get = wrap_websocket_quote_get(guarded_get)
     requests._gold_quant_twelve_data_guard_installed = True
+
+_start_signal_safety_installer()
 
 if os.getenv("TWELVE_DATA_RUNTIME_AUTOSTART", "1") == "1" and os.getenv("CI", "false").lower() != "true":
     start_runtime()
