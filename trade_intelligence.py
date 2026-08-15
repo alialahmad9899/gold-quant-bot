@@ -1,0 +1,86 @@
+"""
+Active Trade Intelligence layer.
+Provides deterministic trade lifecycle decisions without changing the signal engine.
+"""
+from dataclasses import dataclass, field
+from enum import Enum
+from datetime import datetime, timezone
+
+
+class TradeState(str, Enum):
+    NO_POSITION = "NO_POSITION"
+    ACTIVE = "ACTIVE"
+    TP1_REACHED = "TP1_REACHED"
+    UNDER_PRESSURE = "UNDER_PRESSURE"
+    RECOVERY_EXPECTED = "RECOVERY_EXPECTED"
+    INVALIDATED = "INVALIDATED"
+    REVERSAL_PENDING = "REVERSAL_PENDING"
+    CLOSED = "CLOSED"
+
+
+class ReviewDecision(str, Enum):
+    KEEP = "KEEP"
+    WATCH = "WATCH"
+    EXIT = "EXIT"
+    REVERSE = "REVERSE"
+
+
+@dataclass
+class TradeThesis:
+    direction: str
+    entry: float
+    h4_trend: str = ""
+    bos: bool = False
+    fvg: bool = False
+    liquidity: bool = False
+    gemini_decision: str = ""
+    confidence: float = 0.0
+
+
+@dataclass
+class ActiveTrade:
+    thesis: TradeThesis
+    state: TradeState = TradeState.ACTIVE
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    history: list = field(default_factory=list)
+
+    def transition(self, state, reason):
+        self.state = state
+        self.history.append({"time": datetime.now(timezone.utc).isoformat(), "state": state.value, "reason": reason})
+
+
+class TradeIntelligence:
+    def __init__(self):
+        self.active_trade = None
+
+    def can_open_new_trade(self):
+        return self.active_trade is None or self.active_trade.state == TradeState.CLOSED
+
+    def open_trade(self, thesis):
+        if not self.can_open_new_trade():
+            return False
+        self.active_trade = ActiveTrade(thesis=thesis)
+        return True
+
+    def review(self, market):
+        trade = self.active_trade
+        if not trade:
+            return ReviewDecision.KEEP
+
+        if market.get("structure_break_against"):
+            trade.transition(TradeState.INVALIDATED, "market structure invalidated thesis")
+            return ReviewDecision.REVERSE
+
+        if market.get("temporary_pressure"):
+            trade.transition(TradeState.UNDER_PRESSURE, "temporary adverse movement")
+            return ReviewDecision.WATCH
+
+        trade.transition(TradeState.ACTIVE, "thesis still valid")
+        return ReviewDecision.KEEP
+
+    def close(self, reason):
+        if self.active_trade:
+            self.active_trade.transition(TradeState.CLOSED, reason)
+
+
+trade_intelligence = TradeIntelligence()
