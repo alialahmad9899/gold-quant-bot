@@ -6,5 +6,6 @@ ta
 flask
 psycopg2-binary
 hmmlearn>=0.3.0
+scikit-learn>=1.4.0
 google-genai
 websocket-client>=1.8.0
