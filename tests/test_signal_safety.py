@@ -15,6 +15,8 @@ def safety():
 class FakeBot:
     def __init__(self):
         self.conn = sqlite3.connect(":memory:", check_same_thread=False)
+        self.conn.execute("CREATE TABLE trades (id INTEGER PRIMARY KEY, candle_id TEXT)")
+        self.conn.commit()
         self.runtime = SimpleNamespace(get_websocket_quote=lambda max_age_seconds=120: None)
         self._decisions = [False, True]
         self.generated = 0
@@ -100,8 +102,6 @@ def test_trade_insert_is_hard_blocked_after_ai_rejection(safety):
         "sl": 4377.2,
         "tp1": 4373.56,
         "tp2": 4372.02,
-        "rsi": 48.4,
-        "dxy_corr": -0.85,
         "confidence": 56,
         "smc_note": "تأكيد هابط من السيولة/FVG",
         "candle_id": "XAUUSD_M15_20260814_0015",

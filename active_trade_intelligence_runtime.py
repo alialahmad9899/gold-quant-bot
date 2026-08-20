@@ -1,16 +1,17 @@
-"""Phase 2 Active Trade Intelligence runtime integration helpers.
+"""Backward-compatible facade for the canonical Phase 2 lifecycle engine.
 
-Provides orchestration primitives used by the signal pipeline: position lock,
-review loop, invalidation/reversal evaluation, persistence, thesis logging and
-dynamic management.
+The repository previously exposed a separate ActiveTradeManager runtime. This
+module preserves that public API while delegating all state transitions and
+persistence to TradeIntelligence/TradeStateStore so there is one source of
+truth for active trade state.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
-import json
-from pathlib import Path
-from threading import Lock
+
+from trade_intelligence import ReviewDecision, TradeIntelligence, TradeState, TradeThesis
+from trade_state_store import TradeStateStore
 
 
 @dataclass
@@ -23,58 +24,51 @@ class TradeThesisRecord:
 
 
 class ActiveTradeManager:
+    """Compatibility adapter backed by the canonical TradeIntelligence engine."""
+
     def __init__(self, state_file="active_trade_state.json"):
-        self.lock = Lock()
-        self.path = Path(state_file)
-        self.state = self._load()
-
-    def _load(self):
-        if not self.path.exists():
-            return {"active": None, "history": []}
-        try:
-            return json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception:
-            return {"active": None, "history": []}
-
-    def _save(self):
-        self.path.write_text(json.dumps(self.state, indent=2, default=str), encoding="utf-8")
+        self.store = TradeStateStore(state_file)
+        self.engine = TradeIntelligence(self.store)
 
     def has_active_position(self):
-        return self.state.get("active") is not None
+        return self.engine.has_active_trade()
 
     def open(self, thesis: TradeThesisRecord):
-        with self.lock:
-            if self.has_active_position():
-                return False
-            self.state["active"] = asdict(thesis)
-            self.state["history"].append({"event": "OPEN", "time": datetime.now(timezone.utc).isoformat()})
-            self._save()
-            return True
+        canonical = TradeThesis(
+            direction=str(thesis.direction),
+            entry=float(thesis.entry),
+            reason=str(thesis.reason or ""),
+            structure=dict(thesis.structure or {}),
+            confidence=0.0,
+            notes=[str(thesis.reason or "")],
+            candle_id="",
+        )
+        opened = self.engine.open_trade(canonical)
+        return bool(opened)
 
     def review(self, market):
-        with self.lock:
-            trade = self.state.get("active")
-            if not trade:
-                return "NO_POSITION"
-            if market.get("invalidate"):
-                return self._transition("INVALIDATED")
-            if market.get("reverse"):
-                return self._transition("REVERSAL_PENDING")
-            if market.get("tp1"):
-                return self._transition("TP1_REACHED")
-            return "KEEP"
-
-    def _transition(self, state):
-        self.state["active"]["state"] = state
-        self.state["history"].append({"event": state, "time": datetime.now(timezone.utc).isoformat()})
-        self._save()
-        return state
+        market = dict(market or {})
+        normalized = {
+            "invalidation": bool(market.get("invalidate") or market.get("invalidation")),
+            "reversal_signal": bool(market.get("reverse") or market.get("reversal_signal")),
+            "tp1_reached": bool(market.get("tp1") or market.get("tp1_reached")),
+            "temporary_pressure": bool(market.get("temporary_pressure")),
+        }
+        decision = self.engine.review(normalized)
+        if not self.engine.active_trade:
+            return "NO_POSITION"
+        if decision == ReviewDecision.REVERSE and self.engine.active_trade.state == TradeState.INVALIDATED:
+            return "INVALIDATED"
+        if decision == ReviewDecision.REVERSE and self.engine.active_trade.state == TradeState.REVERSAL_PENDING:
+            return "REVERSAL_PENDING"
+        if self.engine.active_trade.state == TradeState.TP1_REACHED:
+            return "TP1_REACHED"
+        if self.engine.active_trade.state == TradeState.UNDER_PRESSURE:
+            return "UNDER_PRESSURE"
+        return "KEEP"
 
     def close(self, reason="closed"):
-        with self.lock:
-            self.state["history"].append({"event": "CLOSE", "reason": reason})
-            self.state["active"] = None
-            self._save()
+        self.engine.close(reason)
 
 
 active_trade_manager = ActiveTradeManager()

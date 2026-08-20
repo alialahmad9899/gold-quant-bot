@@ -377,3 +377,16 @@ def wrap_requests_get(original_get):
 
 
 _install_asyncio_to_thread_guard()
+
+
+def start_phase2_trade_intelligence_bootstrap() -> None:
+    """Attach Phase 2 lifecycle protection to the already-importing bot process."""
+    try:
+        from phase2_runtime_integration import start_phase2_runtime_bootstrap
+        start_phase2_runtime_bootstrap()
+    except Exception:
+        # Phase 2 must never prevent Twelve Data startup.
+        pass
+
+
+start_phase2_trade_intelligence_bootstrap()
