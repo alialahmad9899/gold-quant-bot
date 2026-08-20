@@ -1,10 +1,17 @@
 """Runtime bridge between the existing bot signal loop and Phase 2 lifecycle state."""
 from __future__ import annotations
 
+import os
 import threading
 import time
 from typing import Any
 
+from institutional_trade_review import (
+    TradeReviewResult,
+    apply_ai_review,
+    build_adversarial_prompt,
+    review_trade,
+)
 from trade_intelligence import TradeIntelligence, TradeThesis
 from trade_state_store import TradeStateStore
 
@@ -133,6 +140,58 @@ class Phase2RuntimeIntegration:
             cache["active_trade_management"] = result
         return result
 
+    def _collect_market_context(self, result: dict) -> tuple[dict, dict]:
+        market_summary = {
+            "h4_trend": result.get("h4_trend", ""),
+            "state_label": result.get("state_label", ""),
+            "volatility_regime": result.get("volatility_regime", ""),
+        }
+        smc = result.get("smc") or {}
+        analyzer = getattr(self.bot, "analyze_institutional_engine", None)
+        if analyzer is not None and (not market_summary["h4_trend"] or not market_summary["state_label"] or not smc):
+            try:
+                analysis = analyzer() or {}
+                market_summary["h4_trend"] = analysis.get("h4_trend", market_summary["h4_trend"])
+                market_summary["state_label"] = analysis.get("state_label", market_summary["state_label"])
+                market_summary["volatility_regime"] = analysis.get("volatility_regime", market_summary["volatility_regime"])
+                smc = dict(analysis.get("smc") or smc)
+            except Exception:
+                pass
+        return market_summary, smc
+
+    def _lessons(self) -> list[Any]:
+        try:
+            return list(getattr(self.bot, "get_recent_gemini_insights")())
+        except Exception:
+            return []
+
+    def institutional_review(self, signal: dict, market_summary: dict, smc: dict) -> TradeReviewResult:
+        lessons = self._lessons()
+        review = review_trade(signal, market_summary, lessons=lessons, smc=smc)
+
+        # Hard rules are final. Gemini is an adversarial second opinion only when
+        # the deterministic layer did not already find a hard veto.
+        use_ai = os.getenv("INSTITUTIONAL_GEMINI_REVIEW", "1") == "1"
+        executor = getattr(self.bot, "execute_gemini_dynamic_request", None)
+        if use_ai and executor and not review.hard_vetoes and review.risk_score >= int(os.getenv("INSTITUTIONAL_AI_MIN_SCORE", "58")):
+            try:
+                prompt = build_adversarial_prompt(signal, market_summary, review, lessons)
+                raw, model = executor(prompt, response_mime_type="application/json", task_type="vetting")
+                review = apply_ai_review(review, raw)
+                review.ai_review = dict(review.ai_review or {})
+                review.ai_review["model"] = model
+            except Exception as exc:
+                review.ai_review = {
+                    "approved": None,
+                    "decision": "UNAVAILABLE",
+                    "reason": f"تعذر تنفيذ المراجعة العدائية الإضافية: {type(exc).__name__}: {exc}",
+                }
+
+        cache = getattr(self.bot, "GLOBAL_CACHE", None)
+        if isinstance(cache, dict):
+            cache["institutional_trade_review"] = review.to_dict()
+        return review
+
     def _wrapped_has_active(self, signal_type: str) -> bool:
         if self.manager.has_active_trade():
             return True
@@ -152,20 +211,20 @@ class Phase2RuntimeIntegration:
         if not isinstance(result, dict) or result.get("status") != "SIGNAL":
             return result
 
-        market_summary = {
-            "h4_trend": result.get("h4_trend", ""),
-            "state_label": result.get("state_label", ""),
-        }
-        smc = result.get("smc") or {}
-        analyzer = getattr(self.bot, "analyze_institutional_engine", None)
-        if analyzer is not None and (not market_summary["h4_trend"] or not smc):
-            try:
-                analysis = analyzer() or {}
-                market_summary["h4_trend"] = analysis.get("h4_trend", market_summary["h4_trend"])
-                market_summary["state_label"] = analysis.get("state_label", market_summary["state_label"])
-                smc = dict(analysis.get("smc") or smc)
-            except Exception:
-                pass
+        market_summary, smc = self._collect_market_context(result)
+        institutional = self.institutional_review(result, market_summary, smc)
+        result["institutional_review"] = institutional.to_dict()
+        result["risk_score"] = institutional.risk_score
+        result["risk_decision"] = institutional.decision
+        result["risk_regime"] = institutional.regime
+
+        if not institutional.approved:
+            return {
+                "status": "WAIT",
+                "reason": f"فيتو مدير المخاطر المؤسسي: {institutional.reason}",
+                "price": result.get("entry", 0.0),
+                "institutional_review": institutional.to_dict(),
+            }
 
         thesis = self.build_trade_thesis(result, market_summary, smc)
         if not self.manager.open_trade(thesis):
@@ -173,6 +232,7 @@ class Phase2RuntimeIntegration:
                 "status": "WAIT",
                 "reason": "تم منع الإشارة بسبب قفل الصفقة النشطة في Phase 2.",
                 "price": result.get("entry", 0.0),
+                "institutional_review": institutional.to_dict(),
             }
         result["phase2_state"] = "ACTIVE"
         result["phase2_thesis_logged"] = True
