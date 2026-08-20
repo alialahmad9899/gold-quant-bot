@@ -1,0 +1,211 @@
+name: Runtime UI and Direction Patch
+
+on:
+  push:
+    branches: [fix/runtime-ui-direction-bias-fix]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Patch bot runtime
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          p = Path('bot.py')
+          s = p.read_text(encoding='utf-8')
+
+          old_keyboard = '''def get_main_keyboard():
+    keyboard = [
+        [KeyboardButton("⚡ إشارة فورية"), KeyboardButton("🧠 تحليل بنية السوق")],
+        [KeyboardButton("💡 معلومات من الذكاء الاصطناعي"), KeyboardButton("📊 الأسعار اللحظية")],
+        [KeyboardButton("📈 إحصائيات النظام"), KeyboardButton("📉 اختبار الاستراتيجية العكسي")],
+        [KeyboardButton("🔍 فحص الأخطاء الشامل"), KeyboardButton("🧹 تصفير البيانات")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+'''
+          new_keyboard = '''def get_main_keyboard():
+    keyboard = [
+        [KeyboardButton("⚡ إشارة فورية"), KeyboardButton("🧠 تحليل بنية السوق")],
+        [KeyboardButton("💡 معلومات من الذكاء الاصطناعي"), KeyboardButton("📊 الأسعار اللحظية")],
+        [KeyboardButton("📈 إحصائيات النظام"), KeyboardButton("📉 اختبار الاستراتيجية العكسي")],
+        [KeyboardButton("🔍 فحص الأخطاء الشامل"), KeyboardButton("🧹 تصفير البيانات")],
+        [KeyboardButton("🧑‍⚖️ محامي الصفقة"), KeyboardButton("📰 أخبار الذهب")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+'''
+          if old_keyboard not in s:
+              raise SystemExit('main keyboard anchor not found')
+          s = s.replace(old_keyboard, new_keyboard, 1)
+
+          old_handlers = '''    elif "تصفير البيانات" in text or text == "/reset_all":
+        await reset_all_data(update, context)
+    else:
+'''
+          new_handlers = '''    elif "تصفير البيانات" in text or text == "/reset_all":
+        await reset_all_data(update, context)
+    elif text == "🧑‍⚖️ محامي الصفقة":
+        from trade_lawyer import _lawyer_command
+        await _lawyer_command(update, context)
+    elif text == "📰 أخبار الذهب":
+        from trade_lawyer import _news_command
+        await _news_command(update, context)
+    else:
+'''
+          if old_handlers not in s:
+              raise SystemExit('text-handler anchor not found')
+          s = s.replace(old_handlers, new_handlers, 1)
+
+          old_h4 = '''        if not ema200.empty and not ema500.empty:
+            h4_trend = "BULLISH" if ema200.iloc[-1] > ema500.iloc[-1] else "BEARISH"
+        else:
+            h4_trend = "BULLISH" if close_h1.iloc[-1] > close_h1.iloc[-20] else "BEARISH"
+'''
+          new_h4 = '''        # True H4 trend: resample H1 closes into completed 4H candles, then compare EMA50/EMA200.
+        close_h4 = close_h1.resample("4h", label="right", closed="right").last().dropna()
+        if len(close_h4) >= 220:
+            h4_ema50 = ta.trend.EMAIndicator(close_h4, window=50).ema_indicator().dropna()
+            h4_ema200 = ta.trend.EMAIndicator(close_h4, window=200).ema_indicator().dropna()
+            h4_trend = "BULLISH" if h4_ema50.iloc[-1] > h4_ema200.iloc[-1] else "BEARISH"
+        elif len(close_h4) >= 60:
+            h4_ema20 = ta.trend.EMAIndicator(close_h4, window=20).ema_indicator().dropna()
+            h4_ema50 = ta.trend.EMAIndicator(close_h4, window=50).ema_indicator().dropna()
+            h4_trend = "BULLISH" if h4_ema20.iloc[-1] > h4_ema50.iloc[-1] else "BEARISH"
+        elif len(close_h4) >= 2:
+            h4_trend = "BULLISH" if close_h4.iloc[-1] > close_h4.iloc[-2] else "BEARISH"
+        else:
+            h4_trend = "BULLISH" if close_h1.iloc[-1] > close_h1.iloc[-20] else "BEARISH"
+'''
+          if old_h4 not in s:
+              raise SystemExit('H4 trend anchor not found')
+          s = s.replace(old_h4, new_h4, 1)
+
+          old_score = '''        signal_type = None
+        if bull_score >= 4.0 and bull_score - bear_score >= 0.75:
+            signal_type = 'BUY'
+        elif bear_score >= 4.0 and bear_score - bull_score >= 0.75:
+            signal_type = 'SELL'
+        else:
+'''
+          new_score = '''        signal_type = None
+        direction_delta = round(bull_score - bear_score, 2)
+        with cache_lock:
+            GLOBAL_CACHE["last_signal_scores"] = {
+                "bull": round(bull_score, 2),
+                "bear": round(bear_score, 2),
+                "delta": direction_delta,
+                "h4_trend": h4_trend,
+                "hmm_state": state,
+                "ema_direction": "BULLISH" if ema_fast > ema_slow else "BEARISH" if ema_fast < ema_slow else "NEUTRAL",
+                "smc_bullish": bool(smc.get("fvg_bullish") or smc.get("sweep_bullish")),
+                "smc_bearish": bool(smc.get("fvg_bearish") or smc.get("sweep_bearish")),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        if bull_score >= 4.0 and direction_delta >= 0.75:
+            signal_type = 'BUY'
+        elif bear_score >= 4.0 and direction_delta <= -0.75:
+            signal_type = 'SELL'
+        else:
+'''
+          if old_score not in s:
+              raise SystemExit('signal scoring anchor not found')
+          s = s.replace(old_score, new_score, 1)
+
+          old_app = '''    app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
+    app.add_error_handler(error_handler)
+'''
+          new_app = '''    app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
+    globals()["app"] = app
+    try:
+        from phase2_runtime_integration import Phase2RuntimeIntegration
+        _phase2_runtime = Phase2RuntimeIntegration(sys.modules[__name__]).install()
+        logger.info("✅ Phase 2 runtime explicitly installed from bot startup.")
+    except Exception as exc:
+        logger.exception("❌ Phase 2 runtime installation failed: %s", exc)
+    try:
+        from trade_lawyer import install_telegram_trade_lawyer
+        install_telegram_trade_lawyer(app, sys.modules[__name__])
+        logger.info("✅ Trade Lawyer Telegram handlers explicitly installed.")
+    except Exception as exc:
+        logger.exception("❌ Trade Lawyer Telegram handlers installation failed: %s", exc)
+    app.add_error_handler(error_handler)
+'''
+          if old_app not in s:
+              raise SystemExit('app initialization anchor not found')
+          s = s.replace(old_app, new_app, 1)
+
+          p.write_text(s, encoding='utf-8')
+          PY
+      - name: Patch Arabic Trade Lawyer output
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          p = Path('trade_lawyer.py')
+          s = p.read_text(encoding='utf-8')
+          s = s.replace('⚡ **الاستعجال:** {advice.get(\'urgency\',\'LOW\')}', '⚡ **الاستعجال:** {URGENCY_AR.get(str(advice.get(\'urgency\',\'LOW\')).upper(), str(advice.get(\'urgency\',\'LOW\')))}')
+          s = s.replace('📊 **الحالة:** {management.get(\'state\') or advice.get(\'thesis_status\') or \'ACTIVE\'}', '📊 **الحالة:** {STATE_AR.get(str(management.get(\'state\') or advice.get(\'thesis_status\') or \'ACTIVE\').upper(), str(management.get(\'state\') or advice.get(\'thesis_status\') or \'ACTIVE\'))}')
+          if 'STATE_AR =' not in s:
+              marker = 'URGENCY_AR = {"HIGH": "عالية", "MEDIUM": "متوسطة", "LOW": "منخفضة", "URGENT": "عاجلة"}\n'
+              s = s.replace(marker, marker + 'STATE_AR = {"ACTIVE": "نشطة", "TP1_REACHED": "الهدف الأول تحقق", "UNDER_PRESSURE": "تحت ضغط", "INVALIDATED": "الفكرة أبطلت", "REVERSAL_PENDING": "بانتظار انعكاس", "INTACT": "سليمة", "STRESSED": "تحت ضغط", "NEWS_STRESSED": "متأثرة بالخبر"}\n', 1)
+          s = re.sub(r'async def _news_command\(update,context\):.*?\nasync def _news_callback', '''async def _news_command(update,context):
+    bot=_get_bot_module()
+    if bot is None: return
+    if hasattr(bot,"is_authenticated") and not bot.is_authenticated(update.effective_chat.id):
+        await bot.safe_reply_text(update,"🔒 يرجى تسجيل الدخول أولاً.")
+        return
+    decision=_news_context(bot); cache=getattr(bot,"GLOBAL_CACHE",{}); latest=(cache.get("latest_news") or []) if isinstance(cache,dict) else []
+    if decision:
+        text=(f"📰 **ذكاء الأخبار اللحظي**\\n\\n"
+              f"📌 **القرار:** {news_action_ar(decision.action)}\\n"
+              f"📈 **الاتجاه:** {DIRECTION_AR.get(str(decision.direction).upper(), str(decision.direction))}\\n"
+              f"🎯 **التأثير على الذهب:** {decision.impact}/100\\n"
+              f"⚡ **الاستعجال:** {URGENCY_AR.get(str(decision.urgency).upper(), str(decision.urgency))}\\n\\n"
+              f"💡 {decision.reason}")
+    elif latest:
+        text="📰 **آخر أخبار الذهب**\\n\\n"+"\\n".join(f"• {item.get('title','')}" for item in latest[:5])
+    else:
+        text="📰 لا يوجد حالياً خبر جديد مؤثر تم التقاطه."
+    await bot.safe_reply_text(update,text,reply_markup=_lawyer_keyboard(),parse_mode="Markdown")
+async def _news_callback''', s, flags=re.S, count=1)
+          s = re.sub(r'async def _news_callback\(update,context\):.*?\nasync def _broadcast_lawyer_update', '''async def _news_callback(update,context):
+    query=update.callback_query; await query.answer(); bot=_get_bot_module()
+    if bot is None: return
+    decision=_news_context(bot); cache=getattr(bot,"GLOBAL_CACHE",{}); latest=(cache.get("latest_news") or []) if isinstance(cache,dict) else []
+    if decision:
+        text=(f"📰 **ذكاء الأخبار اللحظي**\\n\\n"
+              f"📌 **القرار:** {news_action_ar(decision.action)}\\n"
+              f"📈 **الاتجاه:** {DIRECTION_AR.get(str(decision.direction).upper(), str(decision.direction))}\\n"
+              f"🎯 **التأثير على الذهب:** {decision.impact}/100\\n"
+              f"⚡ **الاستعجال:** {URGENCY_AR.get(str(decision.urgency).upper(), str(decision.urgency))}\\n\\n"
+              f"💡 {decision.reason}")
+    elif latest:
+        text="📰 **آخر أخبار الذهب**\\n\\n"+"\\n".join(f"• {item.get('title','')}" for item in latest[:5])
+    else:
+        text="📰 لا يوجد حالياً خبر جديد مؤثر تم التقاطه."
+    await query.message.reply_text(text,reply_markup=_lawyer_keyboard(),parse_mode="Markdown")
+async def _broadcast_lawyer_update''', s, flags=re.S, count=1)
+          p.write_text(s, encoding='utf-8')
+          PY
+      - name: Add regression tests
+        run: |
+          python -m py_compile bot.py trade_lawyer.py phase2_runtime_integration.py
+      - name: Commit patch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add bot.py trade_lawyer.py .github/workflows/fix_runtime_ui_direction.yml
+          git commit -m 'Fix Telegram lawyer/news UI and restore true H4 direction logic'
+          git push
