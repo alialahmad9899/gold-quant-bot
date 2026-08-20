@@ -50,6 +50,16 @@ def test_bad_rr_is_hard_veto():
     assert any("العائد إلى المخاطرة" in veto for veto in result.hard_vetoes)
 
 
+def test_invalid_stop_and_target_direction_are_hard_vetoes():
+    signal = dict(good_buy())
+    signal["sl"] = 3010.0
+    signal["tp1"] = 2990.0
+    result = review_trade(signal, bullish_market(), lessons=[], smc={"bos_bullish": True})
+    assert result.approved is False
+    assert any("وقف BUY" in veto for veto in result.hard_vetoes)
+    assert any("TP1 في BUY" in veto for veto in result.hard_vetoes)
+
+
 def test_counter_trade_is_detected():
     market = {"h4_trend": "BEARISH", "state_label": "BEARISH"}
     result = review_trade(good_buy(), market, lessons=[], smc={"fvg_bearish": True})
