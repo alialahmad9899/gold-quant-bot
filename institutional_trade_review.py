@@ -12,7 +12,6 @@ import re
 from dataclasses import dataclass, asdict
 from typing import Any
 
-
 MIN_RR = float(os.getenv("INSTITUTIONAL_MIN_RR", "1.50"))
 MIN_CONFIDENCE = float(os.getenv("INSTITUTIONAL_MIN_CONFIDENCE", "45"))
 APPROVE_SCORE = int(os.getenv("INSTITUTIONAL_APPROVE_SCORE", "72"))
@@ -129,7 +128,7 @@ def _lesson_applies(direction: str, lesson: str, context: str) -> bool:
     words = [w for w in re.findall(r"[\w\u0600-\u06ff]+", low) if len(w) >= 4]
     context_low = context.lower()
     signal_words = [w for w in words if w in context_low]
-    return len(signal_words) >= 1 or _lesson_severity(raw) == "HIGH" and len(words) <= 4
+    return len(signal_words) >= 1 or (_lesson_severity(raw) == "HIGH" and len(words) <= 4)
 
 
 def _historical_lesson_score(direction: str, lessons: list[Any], context: str) -> tuple[int, list[str], list[str]]:
@@ -197,6 +196,15 @@ def review_trade(signal_data: dict[str, Any], market_summary: dict[str, Any], le
     if direction == "SELL" and state in {"BULLISH", "STRONG_BULLISH"}:
         hard_vetoes.append("حالة HMM صاعدة ضد SELL.")
 
+    if direction == "BUY" and sl is not None and entry is not None and sl >= entry:
+        hard_vetoes.append("وقف BUY يجب أن يكون أسفل الدخول.")
+    if direction == "SELL" and sl is not None and entry is not None and sl <= entry:
+        hard_vetoes.append("وقف SELL يجب أن يكون أعلى الدخول.")
+    if direction == "BUY" and tp1 is not None and entry is not None and tp1 <= entry:
+        hard_vetoes.append("TP1 في BUY يجب أن يكون أعلى الدخول.")
+    if direction == "SELL" and tp1 is not None and entry is not None and tp1 >= entry:
+        hard_vetoes.append("TP1 في SELL يجب أن يكون أسفل الدخول.")
+
     if rsi is not None:
         if direction == "BUY" and rsi >= 78:
             hard_vetoes.append(f"RSI مرتفع جداً ({rsi:.1f}) ويشير إلى دخول متأخر/إجهاد سعري.")
@@ -221,7 +229,6 @@ def review_trade(signal_data: dict[str, Any], market_summary: dict[str, Any], le
     historical_score, matched_lessons, lesson_vetoes = _historical_lesson_score(direction or "BUY", lessons or [], context)
     hard_vetoes.extend(lesson_vetoes)
 
-    # Deterministic quality score, intentionally conservative but not trade-blocking by default.
     structure_score = 20 if supporting_smc else 8
     trend_score = 20 if ((direction == "BUY" and h4 == "BULLISH") or (direction == "SELL" and h4 == "BEARISH")) else 7
     if state in {"RANGING", "TRANSITION", ""}:
@@ -252,7 +259,7 @@ def review_trade(signal_data: dict[str, Any], market_summary: dict[str, Any], le
     if hard_vetoes:
         decision = "REJECT"
         approved = False
-        reason = "فيتومخاطر مؤسسي: " + " | ".join(hard_vetoes[:3])
+        reason = "فيتو مخاطر مؤسسي: " + " | ".join(hard_vetoes[:3])
     elif total >= APPROVE_SCORE:
         decision = "APPROVE"
         approved = True
@@ -268,15 +275,12 @@ def review_trade(signal_data: dict[str, Any], market_summary: dict[str, Any], le
 
     thesis = (
         f"{direction or 'UNKNOWN'} مبنية على توافق H4={h4 or 'غير معروف'}، HMM={state or 'غير معروف'}، "
-        f"وتأكيد SMC={'موجود' if supporting_smc else 'ضعيف'} مع RR={rr:.2f}" if rr is not None else
+        f"وتأكيد SMC={'موجود' if supporting_smc else 'ضعيف'} مع RR={rr:.2f}"
+        if rr is not None else
         f"{direction or 'UNKNOWN'} بدون بنية مخاطرة مكتملة بما يكفي لاعتماد thesis."
     )
-    invalidation = (
-        "كسر مستوى SL أو كسر آخر بنية M15 في الاتجاه المعاكس مع تحول HMM/H4 ضد الصفقة."
-    )
-    reversal = (
-        "BOS/CHoCH معاكس + تحول H4/HMM للاتجاه المقابل + تأكيد سيولة/FVG معاكسة."
-    )
+    invalidation = "كسر مستوى SL أو كسر آخر بنية M15 في الاتجاه المعاكس مع تحول HMM/H4 ضد الصفقة."
+    reversal = "BOS/CHoCH معاكس + تحول H4/HMM للاتجاه المقابل + تأكيد سيولة/FVG معاكسة."
 
     return TradeReviewResult(
         approved=approved,
