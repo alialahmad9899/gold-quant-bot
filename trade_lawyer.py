@@ -8,9 +8,18 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+import threading
 import time
 from dataclasses import dataclass, asdict
 from typing import Any
+
+try:
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram.ext import CallbackQueryHandler, CommandHandler
+except Exception:  # pragma: no cover
+    InlineKeyboardButton = InlineKeyboardMarkup = None
+    CallbackQueryHandler = CommandHandler = None
 
 
 @dataclass
@@ -47,8 +56,8 @@ def review_trade(signal: dict, context: dict | None = None) -> TradeLawyerDecisi
         score += 15
         reasons.append("Risk reward acceptable")
     elif rr < 1:
-        score -= 18
-        warnings.append("Poor risk reward")
+        score -= 8
+        warnings.append("Risk reward weak; treated as a quality warning, not an automatic veto")
 
     if tp2 and tp1:
         reasons.append("TP structure validated")
@@ -77,9 +86,11 @@ def review_trade(signal: dict, context: dict | None = None) -> TradeLawyerDecisi
         warnings.append("Data quality warning")
 
     score = max(0, min(100, score))
-    if score < 35:
+    # Flexible policy: only clearly poor structure is rejected here. Moderate
+    # quality becomes MODIFY guidance and can still pass the wider pipeline.
+    if score < 25:
         decision = "REJECT"
-    elif score < 70:
+    elif score < 55:
         decision = "MODIFY"
     else:
         decision = "APPROVE"
@@ -107,6 +118,7 @@ class ActiveTradeLawyerAdvice:
 
 AI_INTERVAL_SECONDS = float(os.getenv("TRADE_LAWYER_AI_INTERVAL_SECONDS", "900"))
 ADD_SCORE_THRESHOLD = int(os.getenv("TRADE_LAWYER_MIN_ADD_SCORE", "68"))
+LAWYER_NOTIFICATION_MIN_SECONDS = float(os.getenv("TRADE_LAWYER_NOTIFICATION_MIN_SECONDS", "120"))
 
 
 def _direction(value: Any) -> str:
@@ -268,3 +280,137 @@ def should_call_active_ai(last_call: float | None, state: str, previous_state: s
     if last_call is None:
         return True
     return (time.monotonic() - last_call) >= AI_INTERVAL_SECONDS
+
+
+def _get_bot_module():
+    return sys.modules.get("bot") or sys.modules.get("__main__")
+
+
+def _lawyer_snapshot(bot: Any) -> dict[str, Any]:
+    cache = getattr(bot, "GLOBAL_CACHE", {})
+    advice = dict(cache.get("trade_lawyer") or {}) if isinstance(cache, dict) else {}
+    management = dict(cache.get("active_trade_management") or {}) if isinstance(cache, dict) else {}
+    return {"advice": advice, "management": management}
+
+
+def format_lawyer_message(snapshot: dict[str, Any]) -> str:
+    advice = snapshot.get("advice") or {}
+    management = snapshot.get("management") or {}
+    action = str(advice.get("action") or "HOLD").upper()
+    urgency = str(advice.get("urgency") or "LOW").upper()
+    confidence = advice.get("confidence", "-")
+    reason = advice.get("reason") or "لا يوجد تغيير جوهري في حالة الصفقة."
+    state = management.get("state") or advice.get("thesis_status") or "ACTIVE"
+    labels = {
+        "HOLD": "الاحتفاظ بالصفقة",
+        "PROTECT_PROFIT": "حماية الأرباح",
+        "REDUCE_RISK": "تخفيف المخاطرة",
+        "ADD_ON_CONFIRMATION": "تعزيز مشروط",
+        "EXIT": "الخروج",
+        "PREPARE_REVERSAL": "الاستعداد للانعكاس",
+    }
+    return (
+        "🧑‍⚖️ **محامي الصفقة**\n"
+        "───────────────────\n"
+        f"📌 **الحكم:** {labels.get(action, action)}\n"
+        f"⚡ **درجة الاستعجال:** {urgency}\n"
+        f"🎯 **الثقة:** {confidence}%\n"
+        f"📊 **حالة الصفقة:** {state}\n\n"
+        f"💡 **الرأي:** {reason}\n"
+        f"🛡️ **شرط تجنب الخطر:** {advice.get('avoid_condition') or 'لا يوجد تحذير إضافي حالياً.'}\n"
+        f"➕ **شرط التعزيز:** {advice.get('add_condition') or 'لا يوجد تعزيز مقترح حالياً.'}"
+    )
+
+
+def _lawyer_keyboard():
+    if InlineKeyboardButton is None or InlineKeyboardMarkup is None:
+        return None
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🧑‍⚖️ استشر محامي الصفقة الآن", callback_data="trade_lawyer_now")]])
+
+
+async def _lawyer_command(update: Any, context: Any) -> None:
+    bot = _get_bot_module()
+    if bot is None:
+        return
+    chat_id = update.effective_chat.id
+    if hasattr(bot, "is_authenticated") and not bot.is_authenticated(chat_id):
+        await bot.safe_reply_text(update, "🔒 يرجى تسجيل الدخول أولاً.")
+        return
+    snapshot = _lawyer_snapshot(bot)
+    advice = snapshot.get("advice")
+    if not advice:
+        await bot.safe_reply_text(update, "🧑‍⚖️ لا توجد صفقة نشطة حالياً تحتاج إلى مراجعة.")
+        return
+    await bot.safe_reply_text(update, format_lawyer_message(snapshot), reply_markup=_lawyer_keyboard(), parse_mode="Markdown")
+
+
+async def _lawyer_callback(update: Any, context: Any) -> None:
+    query = update.callback_query
+    await query.answer()
+    bot = _get_bot_module()
+    if bot is None:
+        return
+    chat_id = query.message.chat_id
+    if hasattr(bot, "is_authenticated") and not bot.is_authenticated(chat_id):
+        await query.message.reply_text("🔒 يرجى تسجيل الدخول أولاً.")
+        return
+    snapshot = _lawyer_snapshot(bot)
+    await query.message.reply_text(format_lawyer_message(snapshot), reply_markup=_lawyer_keyboard(), parse_mode="Markdown")
+
+
+async def _broadcast_lawyer_update(app: Any, bot: Any, snapshot: dict[str, Any]) -> None:
+    if not hasattr(bot, "get_subscribers"):
+        return
+    text = format_lawyer_message(snapshot)
+    for user_id in bot.get_subscribers():
+        try:
+            if hasattr(bot, "is_authenticated") and not bot.is_authenticated(user_id):
+                continue
+            await bot.safe_send_message(app.bot, chat_id=user_id, text=text, parse_mode="Markdown", reply_markup=_lawyer_keyboard())
+        except Exception as exc:
+            logger = getattr(bot, "logger", None)
+            if logger:
+                logger.warning("[TRADE_LAWYER] notification failed for %s: %s", user_id, exc)
+
+
+def install_telegram_trade_lawyer(app: Any, bot: Any) -> None:
+    """Install command/callback handlers once the Telegram Application is running."""
+    if getattr(app, "_trade_lawyer_handlers_installed", False):
+        return
+    if CommandHandler is not None:
+        app.add_handler(CommandHandler("lawyer", _lawyer_command))
+    if CallbackQueryHandler is not None:
+        app.add_handler(CallbackQueryHandler(_lawyer_callback, pattern=r"^trade_lawyer_now$"))
+    app._trade_lawyer_handlers_installed = True
+
+
+def _telegram_bridge_worker() -> None:
+    last_signature = None
+    started = time.monotonic()
+    while time.monotonic() - started < 180:
+        try:
+            bot = _get_bot_module()
+            app = getattr(bot, "app", None) if bot is not None else None
+            if bot is not None and app is not None:
+                install_telegram_trade_lawyer(app, bot)
+                snapshot = _lawyer_snapshot(bot)
+                advice = snapshot.get("advice") or {}
+                if advice:
+                    ts = (getattr(bot, "GLOBAL_CACHE", {}) or {}).get("trade_lawyer_last_update")
+                    action = str(advice.get("action") or "HOLD").upper()
+                    urgency = str(advice.get("urgency") or "LOW").upper()
+                    signature = (action, urgency, ts)
+                    now = time.monotonic()
+                    last_notify = getattr(_telegram_bridge_worker, "last_notify", 0.0)
+                    if signature != last_signature and (now - last_notify >= LAWYER_NOTIFICATION_MIN_SECONDS):
+                        if last_signature is not None and hasattr(app, "create_task"):
+                            app.create_task(_broadcast_lawyer_update(app, bot, snapshot))
+                            _telegram_bridge_worker.last_notify = now
+                        last_signature = signature
+            time.sleep(5)
+        except Exception:
+            time.sleep(5)
+
+
+# Start a lightweight bridge automatically. It never creates a trade or changes risk.
+threading.Thread(target=_telegram_bridge_worker, name="trade-lawyer-telegram-bridge", daemon=True).start()
