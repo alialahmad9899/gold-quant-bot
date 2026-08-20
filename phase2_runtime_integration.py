@@ -38,6 +38,8 @@ class Phase2RuntimeIntegration:
             "score_bear": candidate_signal.get("score_bear"),
             "signal_candle_close": candidate_signal.get("signal_candle_close"),
             "signal_candle_time": candidate_signal.get("signal_candle_time", ""),
+            "h4_trend": market_summary.get("h4_trend", ""),
+            "state_label": market_summary.get("state_label", ""),
         }
         reason = candidate_signal.get("smc_note") or "تم قبول الإشارة بعد اجتياز محرك التحليل الحالي"
         return TradeThesis(
@@ -150,11 +152,22 @@ class Phase2RuntimeIntegration:
         if not isinstance(result, dict) or result.get("status") != "SIGNAL":
             return result
 
-        thesis = self.build_trade_thesis(
-            result,
-            {"h4_trend": result.get("h4_trend", "")},
-            result.get("smc") or {},
-        )
+        market_summary = {
+            "h4_trend": result.get("h4_trend", ""),
+            "state_label": result.get("state_label", ""),
+        }
+        smc = result.get("smc") or {}
+        analyzer = getattr(self.bot, "analyze_institutional_engine", None)
+        if analyzer is not None and (not market_summary["h4_trend"] or not smc):
+            try:
+                analysis = analyzer() or {}
+                market_summary["h4_trend"] = analysis.get("h4_trend", market_summary["h4_trend"])
+                market_summary["state_label"] = analysis.get("state_label", market_summary["state_label"])
+                smc = dict(analysis.get("smc") or smc)
+            except Exception:
+                pass
+
+        thesis = self.build_trade_thesis(result, market_summary, smc)
         if not self.manager.open_trade(thesis):
             return {
                 "status": "WAIT",
