@@ -180,8 +180,8 @@ async def _news_command(update, context):
     await bot.safe_reply_text(update,text,reply_markup=_lawyer_keyboard(),parse_mode="Markdown")
 
 async def _news_callback(update, context):
-    query=update.callback_query; await query.answer(); bot=_get_bot_module()
-    if bot is None: return
+    query=update.callback_query
+    await query.answer()
     await _news_command(query, context)
 
 async def _broadcast_lawyer_update(app,bot,snapshot):
@@ -244,6 +244,14 @@ def _news_candidate(bot, decision):
     return {"status":"SIGNAL","type":"📰 شراء خبري فوري" if buy else "📰 بيع خبري فوري","direction":"BUY" if buy else "SELL","entry":price,"sl":sl,"tp1":tp1,"tp2":tp2,"confidence":decision.confidence,"smc_note":f"News Intelligence: {decision.reason}","news_driven":True,"news_impact":decision.impact,"news_urgency":decision.urgency,"reason":"إشارة خبرية مؤكدة بحركة السعر."}
 
 
+def get_live_news_context(bot, active_direction=None):
+    return _news_context(bot, active_direction)
+
+
+def get_news_candidate(bot, decision):
+    return _news_candidate(bot, decision)
+
+
 def _install_news_hooks(bot):
     if getattr(bot,"_news_hooks_installed",False): return
     original_generate=getattr(bot,"generate_quant_signal",None); original_monitor=getattr(bot,"monitor_open_trades",None)
@@ -260,7 +268,9 @@ def _install_news_hooks(bot):
             return result
         decision=_news_context(bot)
         candidate=_news_candidate(bot,decision) if decision else None
-        return candidate or result
+        if candidate and isinstance(getattr(bot,"GLOBAL_CACHE",None),dict):
+            bot.GLOBAL_CACHE["news_candidate"]=candidate
+        return result
     bot.generate_quant_signal=wrapped_generate
     if original_monitor is not None:
         def wrapped_monitor(*args,**kwargs):
