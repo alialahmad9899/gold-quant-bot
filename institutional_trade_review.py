@@ -1,8 +1,8 @@
 """Flexible institutional-style pre-trade review for XAU/USD.
 
-Hard vetoes are reserved for malformed risk structure, extreme RSI, very
-strong contradictory market evidence, and explicit high-severity lessons.
-RR/confidence are quality factors rather than automatic trade blockers.
+The deterministic engine owns hard risk vetoes. RR, confidence, regime mismatch,
+and Gemini disagreement are normally quality/advisory signals rather than hard
+blocks. Gemini may be promoted to a hard veto only with INSTITUTIONAL_AI_VETO=1.
 """
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ MIN_RR = float(os.getenv("INSTITUTIONAL_MIN_RR", "1.20"))
 MIN_CONFIDENCE = float(os.getenv("INSTITUTIONAL_MIN_CONFIDENCE", "40"))
 APPROVE_SCORE = int(os.getenv("INSTITUTIONAL_APPROVE_SCORE", "60"))
 MODIFY_SCORE = int(os.getenv("INSTITUTIONAL_MODIFY_SCORE", "48"))
+AI_VETO_ENABLED = os.getenv("INSTITUTIONAL_AI_VETO", "0") == "1"
 
 @dataclass
 class TradeReviewResult:
@@ -116,12 +117,12 @@ def review_trade(signal_data: dict[str, Any], market_summary: dict[str, Any], le
     rr = _rr(direction or "BUY", entry, sl, tp1)
     if rr is None: vetoes.append("هيكل SL/TP غير صالح للاتجاه المقترح.")
 
-    # Flexible quality policy: RR/confidence can reduce the score but do not veto by themselves.
+    # Structural correctness remains a hard safety boundary.
     if direction == "BUY" and sl is not None and entry is not None and sl >= entry: vetoes.append("وقف BUY يجب أن يكون أسفل الدخول.")
     if direction == "SELL" and sl is not None and entry is not None and sl <= entry: vetoes.append("وقف SELL يجب أن يكون أعلى الدخول.")
     if direction == "BUY" and tp1 is not None and entry is not None and tp1 <= entry: vetoes.append("TP1 في BUY يجب أن يكون أعلى الدخول.")
     if direction == "SELL" and tp1 is not None and entry is not None and tp1 >= entry: vetoes.append("TP1 في SELL يجب أن يكون أسفل الدخول.")
-    if rsi is not None and ((direction == "BUY" and rsi >= 82) or (direction == "SELL" and rsi <= 18)): vetoes.append(f"RSI متطرف جداً ({rsi:.1f}) ويشير إلى دخول متأخر/إجهاد سعري.")
+    if rsi is not None and ((direction == "BUY" and rsi >= 88) or (direction == "SELL" and rsi <= 12)): vetoes.append(f"RSI متطرف جداً ({rsi:.1f}) ويشير إلى دخول شديد التأخر.")
 
     supporting_smc, opposing_smc = _smc_alignment(direction or "BUY", smc, note)
     opposite_h4 = (direction == "BUY" and h4 == "BEARISH") or (direction == "SELL" and h4 == "BULLISH")
@@ -130,8 +131,7 @@ def review_trade(signal_data: dict[str, Any], market_summary: dict[str, Any], le
         counter_risk = "مرتفع"; vetoes.append("H4 + HMM + SMC يدعمون الاتجاه المعاكس بقوة.")
     elif opposite_h4 or opposite_state or opposing_smc:
         counter_risk = "متوسط"
-    if direction == "BUY" and dxy_corr is not None and dxy_corr > 0.65: vetoes.append(f"ارتباط DXY موجب جداً ({dxy_corr:.2f}) ضد BUY.")
-    if direction == "SELL" and dxy_corr is not None and dxy_corr < -0.65: vetoes.append(f"ارتباط DXY سالب جداً ({dxy_corr:.2f}) ضد SELL.")
+    # DXY disagreement is deliberately advisory; correlation is context, not a trade veto.
 
     context = json.dumps({"signal": signal_data, "market": market_summary}, ensure_ascii=False, default=str)
     historical_score, matched_lessons, lesson_vetoes = _historical_lesson_score(direction or "BUY", lessons or [], context); vetoes.extend(lesson_vetoes)
@@ -164,19 +164,17 @@ def review_trade(signal_data: dict[str, Any], market_summary: dict[str, Any], le
     reversal = "BOS/CHoCH معاكس + تحول H4/HMM + تأكيد سيولة/FVG للاتجاه المقابل."
     return TradeReviewResult(approved, decision, total, reason, thesis, invalidation, reversal, regime, vetoes, matched_lessons, counter_risk, scores)
 
-
 def build_adversarial_prompt(signal_data: dict[str, Any], market_summary: dict[str, Any], deterministic: TradeReviewResult, lessons: list[Any]) -> str:
     return f"""
 أنت مدير مخاطر كمي مرن متخصص في XAU/USD. افترض أن الصفقة قد تفشل وابحث عن الخطر الحقيقي، لكن لا ترفضها لمجرد أنها غير مثالية.
-لا تتجاوز hard vetoes الحتمية. إذا لم توجد، قدم رأياً متوازناً ولا تمنع التداول لمجرد عدم التطابق الكامل.
-لا تخترع بيانات. أرجع JSON فقط.
+تعامل مع Gemini كمحلل معارض ومستشار، لا كحاجز تداول صارم. لا ترفض إلا إذا وجدت خطراً واضحاً ومادياً.
+لا تتجاوز hard vetoes الحتمية. لا تخترع بيانات. أرجع JSON فقط.
 التقييم الحتمي: {json.dumps(deterministic.to_dict(), ensure_ascii=False, default=str)}
 الدروس: {chr(10).join('- ' + str(x) for x in lessons) if lessons else '- لا توجد دروس'}
 الإشارة: {json.dumps(signal_data, ensure_ascii=False, default=str)}
 السوق: {json.dumps(market_summary, ensure_ascii=False, default=str)}
 {{"approved": true, "decision": "APPROVE", "reason": "سبب عربي مختصر", "thesis": "ملخص", "invalidation": "شرط البطلان", "reversal": "شرط الانعكاس"}}
 """.strip()
-
 
 def parse_ai_review(raw: Any) -> dict[str, Any]:
     if isinstance(raw, dict): return raw
@@ -186,12 +184,29 @@ def parse_ai_review(raw: Any) -> dict[str, Any]:
     except (TypeError, ValueError):
         return {"approved": False, "decision": "INVALID", "reason": "تعذر قراءة مراجعة Gemini المؤسسية."}
 
-
 def apply_ai_review(deterministic: TradeReviewResult, raw_ai: Any) -> TradeReviewResult:
-    ai = parse_ai_review(raw_ai); ai_approved = _bool(ai.get("approved")); ai_decision = str(ai.get("decision") or ("APPROVE" if ai_approved else "REJECT")).upper(); deterministic.ai_review = {**ai, "approved": ai_approved, "decision": ai_decision}
-    if deterministic.hard_vetoes: return deterministic
+    ai = parse_ai_review(raw_ai)
+    ai_approved = _bool(ai.get("approved")); ai_decision = str(ai.get("decision") or ("APPROVE" if ai_approved else "REJECT")).upper()
+    deterministic.ai_review = {**ai, "approved": ai_approved, "decision": ai_decision, "mode": "HARD_VETO" if AI_VETO_ENABLED else "ADVISORY"}
+    if deterministic.hard_vetoes:
+        return deterministic
     if not ai_approved or ai_decision in {"REJECT", "REVERSE"}:
-        deterministic.approved = False; deterministic.decision = "REJECT"; deterministic.reason = str(ai.get("reason") or "مراجعة Gemini رأت خطراً إضافياً."); return deterministic
-    deterministic.approved = True; deterministic.decision = "APPROVE"; deterministic.reason = str(ai.get("reason") or deterministic.reason)
-    deterministic.thesis = str(ai.get("thesis") or deterministic.thesis); deterministic.invalidation = str(ai.get("invalidation") or deterministic.invalidation); deterministic.reversal = str(ai.get("reversal") or deterministic.reversal)
+        if AI_VETO_ENABLED:
+            deterministic.approved = False
+            deterministic.decision = "REJECT"
+            deterministic.reason = str(ai.get("reason") or "مراجعة Gemini رأت خطراً إضافياً.")
+        else:
+            # Default production mode: AI disagreement is logged as advisory evidence.
+            # It cannot erase a valid quantitative opportunity by itself.
+            deterministic.approved = deterministic.risk_score >= MODIFY_SCORE
+            deterministic.decision = "APPROVE_WITH_CAUTION" if deterministic.approved else deterministic.decision
+            deterministic.reason = f"ملاحظة Gemini: {ai.get('reason') or 'تحفظ تحليلي'} — لم تُستخدم كفيتو تلقائي لأن الصفقة اجتازت الحماية الحتمية."
+    else:
+        if deterministic.risk_score >= MODIFY_SCORE:
+            deterministic.approved = True
+            deterministic.decision = "APPROVE" if deterministic.risk_score >= APPROVE_SCORE else "APPROVE_WITH_CAUTION"
+        deterministic.reason = str(ai.get("reason") or deterministic.reason)
+    deterministic.thesis = str(ai.get("thesis") or deterministic.thesis)
+    deterministic.invalidation = str(ai.get("invalidation") or deterministic.invalidation)
+    deterministic.reversal = str(ai.get("reversal") or deterministic.reversal)
     return deterministic
