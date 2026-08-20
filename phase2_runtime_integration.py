@@ -6,21 +6,10 @@ import threading
 import time
 from typing import Any
 
-from institutional_trade_review import (
-    TradeReviewResult,
-    apply_ai_review,
-    build_adversarial_prompt,
-    review_trade,
-)
+from institutional_trade_review import TradeReviewResult, apply_ai_review, build_adversarial_prompt, review_trade
 from trade_intelligence import TradeIntelligence, TradeThesis
 from trade_state_store import TradeStateStore
-from trade_lawyer import (
-    ActiveTradeLawyerAdvice,
-    apply_active_ai,
-    build_active_trade_prompt,
-    deterministic_active_advice,
-    should_call_active_ai,
-)
+from trade_lawyer import ActiveTradeLawyerAdvice, apply_active_ai, build_active_trade_prompt, deterministic_active_advice, get_live_news_context, should_call_active_ai
 
 
 class Phase2RuntimeIntegration:
@@ -38,287 +27,142 @@ class Phase2RuntimeIntegration:
     @staticmethod
     def _direction(value: Any) -> str | None:
         raw = str(value or "").upper()
-        if "BUY" in raw or "شراء" in raw:
-            return "BUY"
-        if "SELL" in raw or "بيع" in raw:
-            return "SELL"
+        if "BUY" in raw or "شراء" in raw: return "BUY"
+        if "SELL" in raw or "بيع" in raw: return "SELL"
         return None
 
     def build_trade_thesis(self, candidate_signal: dict, market_summary: dict | None = None, smc: dict | None = None) -> TradeThesis:
-        market_summary = market_summary or {}
-        smc = smc or {}
+        market_summary = market_summary or {}; smc = smc or {}
         direction = self._direction(candidate_signal.get("type")) or self._direction(candidate_signal.get("direction"))
-        structure = {
-            "smc": dict(smc),
-            "smc_note": candidate_signal.get("smc_note", ""),
-            "score_bull": candidate_signal.get("score_bull"),
-            "score_bear": candidate_signal.get("score_bear"),
-            "signal_candle_close": candidate_signal.get("signal_candle_close"),
-            "signal_candle_time": candidate_signal.get("signal_candle_time", ""),
-            "h4_trend": market_summary.get("h4_trend", ""),
-            "state_label": market_summary.get("state_label", ""),
-        }
+        structure = {"smc": dict(smc), "smc_note": candidate_signal.get("smc_note", ""), "score_bull": candidate_signal.get("score_bull"), "score_bear": candidate_signal.get("score_bear"), "signal_candle_close": candidate_signal.get("signal_candle_close"), "signal_candle_time": candidate_signal.get("signal_candle_time", ""), "h4_trend": market_summary.get("h4_trend", ""), "state_label": market_summary.get("state_label", ""), "news": market_summary.get("news_decision", {})}
         reason = candidate_signal.get("smc_note") or "تم قبول الإشارة بعد اجتياز محرك التحليل الحالي"
-        return TradeThesis(
-            direction=direction or "UNKNOWN",
-            entry=float(candidate_signal.get("entry") or 0.0),
-            sl=float(candidate_signal["sl"]) if candidate_signal.get("sl") is not None else None,
-            tp1=float(candidate_signal["tp1"]) if candidate_signal.get("tp1") is not None else None,
-            tp2=float(candidate_signal["tp2"]) if candidate_signal.get("tp2") is not None else None,
-            h4_trend=str(market_summary.get("h4_trend") or ""),
-            bos=bool(smc.get("bos") or smc.get("bos_bullish") or smc.get("bos_bearish")),
-            fvg=bool(smc.get("fvg_bullish") or smc.get("fvg_bearish")),
-            liquidity=bool(smc.get("liquidity") or smc.get("sweep_bullish") or smc.get("sweep_bearish")),
-            gemini_decision=str(candidate_signal.get("gemini_note") or ""),
-            confidence=float(candidate_signal.get("confidence") or 0.0) / 100.0,
-            notes=[reason],
-            structure=structure,
-            candle_id=str(candidate_signal.get("candle_id") or ""),
-            reason=reason,
-        )
+        return TradeThesis(direction=direction or "UNKNOWN", entry=float(candidate_signal.get("entry") or 0.0), sl=float(candidate_signal["sl"]) if candidate_signal.get("sl") is not None else None, tp1=float(candidate_signal["tp1"]) if candidate_signal.get("tp1") is not None else None, tp2=float(candidate_signal["tp2"]) if candidate_signal.get("tp2") is not None else None, h4_trend=str(market_summary.get("h4_trend") or ""), bos=bool(smc.get("bos") or smc.get("bos_bullish") or smc.get("bos_bearish")), fvg=bool(smc.get("fvg_bullish") or smc.get("fvg_bearish")), liquidity=bool(smc.get("liquidity") or smc.get("sweep_bullish") or smc.get("sweep_bearish")), gemini_decision=str(candidate_signal.get("gemini_note") or ""), confidence=float(candidate_signal.get("confidence") or 0.0) / 100.0, notes=[reason], structure=structure, candle_id=str(candidate_signal.get("candle_id") or ""), reason=reason)
 
     def _ledger_has_open_trade(self) -> bool:
-        if not self._original_has_active:
-            return False
+        if not self._original_has_active: return False
         return bool(self._original_has_active("BUY") or self._original_has_active("SELL"))
 
     def _reconcile_ledger(self) -> None:
-        if self.manager.has_active_trade() and not self._ledger_has_open_trade():
-            self.manager.close("تمت مزامنة حالة Phase 2 مع دفتر الصفقات ولا توجد صفقة مفتوحة")
+        if self.manager.has_active_trade() and not self._ledger_has_open_trade(): self.manager.close("تمت مزامنة حالة Phase 2 مع دفتر الصفقات ولا توجد صفقة مفتوحة")
 
     def _review_flags(self) -> dict:
         trade = self.manager.active_trade
-        if not trade:
-            return {}
+        if not trade: return {}
         market = self.bot.get_market_data() if hasattr(self.bot, "get_market_data") else {}
-        feed = dict(market.get("price_feed") or {})
-        price = feed.get("mid") or feed.get("spot")
-        flags: dict[str, Any] = {}
-
+        feed = dict(market.get("price_feed") or {}); price = feed.get("mid") or feed.get("spot"); flags: dict[str, Any] = {}
         try:
-            price_f = float(price) if price is not None else None
-            entry = float(trade.thesis.entry)
-            sl = float(trade.thesis.sl) if trade.thesis.sl is not None else None
-            tp1 = float(trade.thesis.tp1) if trade.thesis.tp1 is not None else None
-            risk = abs(entry - sl) if sl is not None else 0.0
-            if price_f is not None and tp1 is not None:
-                flags["tp1_reached"] = price_f >= tp1 if trade.thesis.direction == "BUY" else price_f <= tp1
+            price_f = float(price) if price is not None else None; entry = float(trade.thesis.entry); sl = float(trade.thesis.sl) if trade.thesis.sl is not None else None; tp1 = float(trade.thesis.tp1) if trade.thesis.tp1 is not None else None; risk = abs(entry-sl) if sl is not None else 0.0
+            if price_f is not None and tp1 is not None: flags["tp1_reached"] = price_f >= tp1 if trade.thesis.direction == "BUY" else price_f <= tp1
             if price_f is not None and risk > 0 and not flags.get("tp1_reached"):
-                adverse = (entry - price_f) if trade.thesis.direction == "BUY" else (price_f - entry)
-                flags["temporary_pressure"] = adverse >= risk * 0.50
+                adverse = (entry-price_f) if trade.thesis.direction == "BUY" else (price_f-entry); flags["temporary_pressure"] = adverse >= risk * 0.50
             flags["price"] = price_f
-        except (TypeError, ValueError):
-            pass
+            if price_f is not None:
+                news_decision = get_live_news_context(self.bot, trade.thesis.direction)
+                if news_decision is not None: flags["news_decision"] = dict(getattr(news_decision, "__dict__", {}))
+        except (TypeError, ValueError): pass
 
         analyzer = getattr(self.bot, "analyze_institutional_engine", None)
         if analyzer is not None:
             try:
-                analysis = analyzer() or {}
-                h4_trend = str(analysis.get("h4_trend") or "")
-                state = str(analysis.get("state_label") or "")
-                smc = dict(analysis.get("smc") or {})
+                analysis = analyzer() or {}; h4_trend = str(analysis.get("h4_trend") or ""); state = str(analysis.get("state_label") or ""); smc = dict(analysis.get("smc") or {})
                 opposite_h4 = (trade.thesis.direction == "BUY" and h4_trend == "BEARISH") or (trade.thesis.direction == "SELL" and h4_trend == "BULLISH")
                 opposite_state = (trade.thesis.direction == "BUY" and state == "BEARISH") or (trade.thesis.direction == "SELL" and state == "BULLISH")
-                opposite_smc = (
-                    (trade.thesis.direction == "BUY" and (smc.get("fvg_bearish") or smc.get("sweep_bearish")))
-                    or (trade.thesis.direction == "SELL" and (smc.get("fvg_bullish") or smc.get("sweep_bullish")))
-                )
-                flags["structure_break_against"] = bool(opposite_h4 and opposite_smc)
-                flags["invalidation"] = bool(opposite_h4 and opposite_state and opposite_smc)
-                flags["reversal_signal"] = bool(opposite_h4 and opposite_state and opposite_smc)
-                flags["h4_trend"] = h4_trend
-                flags["state_label"] = state
-                flags["smc"] = smc
-            except Exception:
-                pass
+                opposite_smc = ((trade.thesis.direction == "BUY" and (smc.get("fvg_bearish") or smc.get("sweep_bearish"))) or (trade.thesis.direction == "SELL" and (smc.get("fvg_bullish") or smc.get("sweep_bullish"))))
+                flags["structure_break_against"] = bool(opposite_h4 and opposite_smc); flags["invalidation"] = bool(opposite_h4 and opposite_state and opposite_smc); flags["reversal_signal"] = bool(opposite_h4 and opposite_state and opposite_smc); flags["h4_trend"] = h4_trend; flags["state_label"] = state; flags["smc"] = smc
+            except Exception: pass
         return flags
 
     def review_active_trade(self) -> dict:
-        if not self.manager.has_active_trade():
-            return {"decision": "KEEP", "state": "NO_POSITION", "management": {}, "lawyer": {"action": "HOLD"}}
-
-        flags = self._review_flags()
-        result = self.manager.manage(flags)
-        cache = getattr(self.bot, "GLOBAL_CACHE", None)
+        if not self.manager.has_active_trade(): return {"decision": "KEEP", "state": "NO_POSITION", "management": {}, "lawyer": {"action": "HOLD"}}
+        flags = self._review_flags(); result = self.manager.manage(flags); cache = getattr(self.bot, "GLOBAL_CACHE", None)
         if isinstance(cache, dict):
             cache["active_trade_management"] = result
-
-        trade = self.manager.active_trade
-        thesis = trade.thesis
-        market = {
-            "price": flags.get("price"),
-            "h4_trend": flags.get("h4_trend", thesis.h4_trend),
-            "state_label": flags.get("state_label", ""),
-            "smc": flags.get("smc", {}),
-            "data_quality": (cache or {}).get("data_quality") if isinstance(cache, dict) else None,
-        }
+            if flags.get("news_decision"): cache["news_decision"] = flags["news_decision"]
+        trade = self.manager.active_trade; thesis = trade.thesis
+        market = {"price": flags.get("price"), "h4_trend": flags.get("h4_trend", thesis.h4_trend), "state_label": flags.get("state_label", ""), "smc": flags.get("smc", {}), "news_decision": flags.get("news_decision", {}), "data_quality": (cache or {}).get("data_quality") if isinstance(cache, dict) else None}
         review = (cache or {}).get("institutional_trade_review", {}) if isinstance(cache, dict) else {}
-        trade_payload = {
-            "direction": thesis.direction,
-            "entry": thesis.entry,
-            "sl": thesis.sl,
-            "tp1": thesis.tp1,
-            "tp2": thesis.tp2,
-            "confidence": thesis.confidence,
-            "candle_id": thesis.candle_id,
-            "reason": thesis.reason,
-        }
-        deterministic = deterministic_active_advice(trade_payload, market, result, review)
-        lawyer = deterministic
-
-        executor = getattr(self.bot, "execute_gemini_dynamic_request", None)
-        state = str(result.get("state") or "ACTIVE")
+        trade_payload = {"direction": thesis.direction, "entry": thesis.entry, "sl": thesis.sl, "tp1": thesis.tp1, "tp2": thesis.tp2, "confidence": thesis.confidence, "candle_id": thesis.candle_id, "reason": thesis.reason}
+        deterministic = deterministic_active_advice(trade_payload, market, result, review); lawyer = deterministic; executor = getattr(self.bot, "execute_gemini_dynamic_request", None); state = str(result.get("state") or "ACTIVE")
         if executor and should_call_active_ai(self._lawyer_last_ai_call, state, self._lawyer_previous_state):
             try:
-                prompt = build_active_trade_prompt(trade_payload, market, result, review, deterministic)
-                raw, model = executor(prompt, response_mime_type="application/json", task_type="vetting")
-                lawyer = apply_active_ai(deterministic, raw, model)
-                self._lawyer_last_ai_call = time.monotonic()
+                prompt = build_active_trade_prompt(trade_payload, market, result, review, deterministic); raw, model = executor(prompt, response_mime_type="application/json", task_type="vetting"); lawyer = apply_active_ai(deterministic, raw, model); self._lawyer_last_ai_call = time.monotonic()
             except Exception as exc:
-                lawyer = deterministic
-                lawyer.reason = f"{deterministic.reason} | تعذر استدعاء محامي الصفقة: {type(exc).__name__}"
+                lawyer = deterministic; lawyer.reason = f"{deterministic.reason} | تعذر استدعاء محامي الصفقة: {type(exc).__name__}"
         self._lawyer_previous_state = state
-
-        if isinstance(cache, dict):
-            cache["trade_lawyer"] = lawyer.to_dict()
-            cache["trade_lawyer_last_update"] = time.time()
-        result["lawyer"] = lawyer.to_dict()
-        return result
+        if isinstance(cache, dict): cache["trade_lawyer"] = lawyer.to_dict(); cache["trade_lawyer_last_update"] = time.time()
+        result["lawyer"] = lawyer.to_dict(); return result
 
     def _collect_market_context(self, result: dict) -> tuple[dict, dict]:
-        market_summary = {
-            "h4_trend": result.get("h4_trend", ""),
-            "state_label": result.get("state_label", ""),
-            "volatility_regime": result.get("volatility_regime", ""),
-        }
-        smc = result.get("smc") or {}
+        market_summary = {"h4_trend": result.get("h4_trend", ""), "state_label": result.get("state_label", ""), "volatility_regime": result.get("volatility_regime", "")}; smc = result.get("smc") or {}
         analyzer = getattr(self.bot, "analyze_institutional_engine", None)
         if analyzer is not None and (not market_summary["h4_trend"] or not market_summary["state_label"] or not smc):
             try:
-                analysis = analyzer() or {}
-                market_summary["h4_trend"] = analysis.get("h4_trend", market_summary["h4_trend"])
-                market_summary["state_label"] = analysis.get("state_label", market_summary["state_label"])
-                market_summary["volatility_regime"] = analysis.get("volatility_regime", market_summary["volatility_regime"])
-                smc = dict(analysis.get("smc") or smc)
-            except Exception:
-                pass
+                analysis = analyzer() or {}; market_summary["h4_trend"] = analysis.get("h4_trend", market_summary["h4_trend"]); market_summary["state_label"] = analysis.get("state_label", market_summary["state_label"]); market_summary["volatility_regime"] = analysis.get("volatility_regime", market_summary["volatility_regime"]); smc = dict(analysis.get("smc") or smc)
+            except Exception: pass
+        try:
+            news_decision = get_live_news_context(self.bot)
+            if news_decision is not None: market_summary["news_decision"] = dict(getattr(news_decision, "__dict__", {}))
+        except Exception: pass
         return market_summary, smc
 
     def _lessons(self) -> list[Any]:
-        try:
-            return list(getattr(self.bot, "get_recent_gemini_insights")())
-        except Exception:
-            return []
+        try: return list(getattr(self.bot, "get_recent_gemini_insights")())
+        except Exception: return []
 
     def _record_direction(self, result: dict) -> None:
         direction = self._direction(result.get("type"))
-        if not direction:
-            return
-        self._direction_history.append(direction)
-        self._direction_history = self._direction_history[-8:]
-        streak = 1
+        if not direction: return
+        self._direction_history.append(direction); self._direction_history = self._direction_history[-8:]; streak = 1
         for prior in reversed(self._direction_history[:-1]):
-            if prior != direction:
-                break
+            if prior != direction: break
             streak += 1
         cache = getattr(self.bot, "GLOBAL_CACHE", None)
-        if isinstance(cache, dict):
-            cache["direction_history"] = list(self._direction_history)
-            cache["direction_streak"] = {"direction": direction, "count": streak}
-            cache["direction_bias_warning"] = streak >= 3
+        if isinstance(cache, dict): cache["direction_history"] = list(self._direction_history); cache["direction_streak"] = {"direction": direction, "count": streak}; cache["direction_bias_warning"] = streak >= 3
 
     def institutional_review(self, signal: dict, market_summary: dict, smc: dict) -> TradeReviewResult:
-        lessons = self._lessons()
-        review = review_trade(signal, market_summary, lessons=lessons, smc=smc)
-        use_ai = os.getenv("INSTITUTIONAL_GEMINI_REVIEW", "1") == "1"
-        executor = getattr(self.bot, "execute_gemini_dynamic_request", None)
+        lessons = self._lessons(); review = review_trade(signal, market_summary, lessons=lessons, smc=smc); use_ai = os.getenv("INSTITUTIONAL_GEMINI_REVIEW", "1") == "1"; executor = getattr(self.bot, "execute_gemini_dynamic_request", None)
         if use_ai and executor and not review.hard_vetoes and review.risk_score >= int(os.getenv("INSTITUTIONAL_AI_MIN_SCORE", "55")):
             try:
-                prompt = build_adversarial_prompt(signal, market_summary, review, lessons)
-                raw, model = executor(prompt, response_mime_type="application/json", task_type="vetting")
-                review = apply_ai_review(review, raw)
-                review.ai_review = dict(review.ai_review or {})
-                review.ai_review["model"] = model
-            except Exception as exc:
-                review.ai_review = {"approved": None, "decision": "UNAVAILABLE", "reason": f"تعذر تنفيذ المراجعة العدائية: {type(exc).__name__}: {exc}"}
+                prompt = build_adversarial_prompt(signal, market_summary, review, lessons); raw, model = executor(prompt, response_mime_type="application/json", task_type="vetting"); review = apply_ai_review(review, raw); review.ai_review = dict(review.ai_review or {}); review.ai_review["model"] = model
+            except Exception as exc: review.ai_review = {"approved": None, "decision": "UNAVAILABLE", "reason": f"تعذر تنفيذ المراجعة العدائية: {type(exc).__name__}: {exc}"}
         cache = getattr(self.bot, "GLOBAL_CACHE", None)
-        if isinstance(cache, dict):
-            cache["institutional_trade_review"] = review.to_dict()
+        if isinstance(cache, dict): cache["institutional_trade_review"] = review.to_dict()
         return review
 
     def _wrapped_has_active(self, signal_type: str) -> bool:
-        if self.manager.has_active_trade():
-            return True
+        if self.manager.has_active_trade(): return True
         return bool(self._original_has_active(signal_type)) if self._original_has_active else False
 
     def _wrapped_generate(self, *args, **kwargs):
         if self.manager.has_active_trade():
-            review = self.review_active_trade()
-            return {
-                "status": "WAIT",
-                "reason": f"حماية Phase 2: توجد صفقة نشطة وحالتها {review['state']}؛ {review.get('lawyer', {}).get('action', 'HOLD')}.",
-                "price": self.bot.get_market_data().get("gold", 0.0),
-                "phase2": review,
-            }
-
+            review = self.review_active_trade(); return {"status": "WAIT", "reason": f"حماية Phase 2: توجد صفقة نشطة وحالتها {review['state']}؛ {review.get('lawyer', {}).get('action', 'HOLD')}.", "price": self.bot.get_market_data().get("gold", 0.0), "phase2": review}
         result = self._original_generate(*args, **kwargs)
         if not isinstance(result, dict) or result.get("status") != "SIGNAL":
-            return result
-
-        market_summary, smc = self._collect_market_context(result)
-        institutional = self.institutional_review(result, market_summary, smc)
-        result["institutional_review"] = institutional.to_dict()
-        result["risk_score"] = institutional.risk_score
-        result["risk_decision"] = institutional.decision
-        result["risk_regime"] = institutional.regime
-        if not institutional.approved:
-            return {
-                "status": "WAIT",
-                "reason": f"فيتو مدير المخاطر المؤسسي: {institutional.reason}",
-                "price": result.get("entry", 0.0),
-                "institutional_review": institutional.to_dict(),
-            }
-
-        # The risk gate stays flexible; only explicit hard vetoes reject. Quality below the
-        # preferred approval score remains MODIFY guidance, not an automatic no-trade filter.
-        if institutional.decision == "MODIFY" and os.getenv("INSTITUTIONAL_BLOCK_MODIFY", "0") != "1":
-            result["risk_decision"] = "APPROVE_WITH_CAUTION"
-
+            cache = getattr(self.bot, "GLOBAL_CACHE", None); candidate = cache.get("news_candidate") if isinstance(cache, dict) else None
+            if candidate and os.getenv("NEWS_SIGNAL_ENABLED", "1") == "1":
+                result = candidate
+                if isinstance(cache, dict): cache.pop("news_candidate", None)
+            else: return result
+        market_summary, smc = self._collect_market_context(result); institutional = self.institutional_review(result, market_summary, smc)
+        result["institutional_review"] = institutional.to_dict(); result["risk_score"] = institutional.risk_score; result["risk_decision"] = institutional.decision; result["risk_regime"] = institutional.regime
+        if not institutional.approved and institutional.decision != "MODIFY": return {"status": "WAIT", "reason": f"فيتو مدير المخاطر المؤسسي: {institutional.reason}", "price": result.get("entry", 0.0), "institutional_review": institutional.to_dict()}
+        if institutional.decision == "MODIFY" and os.getenv("INSTITUTIONAL_BLOCK_MODIFY", "0") != "1": result["risk_decision"] = "APPROVE_WITH_CAUTION"
         thesis = self.build_trade_thesis(result, market_summary, smc)
-        if not self.manager.open_trade(thesis):
-            return {
-                "status": "WAIT",
-                "reason": "تم منع الإشارة بسبب قفل الصفقة النشطة في Phase 2.",
-                "price": result.get("entry", 0.0),
-                "institutional_review": institutional.to_dict(),
-            }
-        self._record_direction(result)
-        result["phase2_state"] = "ACTIVE"
-        result["phase2_thesis_logged"] = True
-        return result
+        if not self.manager.open_trade(thesis): return {"status": "WAIT", "reason": "تم منع الإشارة بسبب قفل الصفقة النشطة في Phase 2.", "price": result.get("entry", 0.0), "institutional_review": institutional.to_dict()}
+        self._record_direction(result); result["phase2_state"] = "ACTIVE"; result["phase2_thesis_logged"] = True; return result
 
     def _wrapped_monitor(self, *args, **kwargs):
         result = self._original_monitor(*args, **kwargs)
-        if self.manager.has_active_trade():
-            self.review_active_trade()
-            self._reconcile_ledger()
+        if self.manager.has_active_trade(): self.review_active_trade(); self._reconcile_ledger()
         return result
 
     def install(self) -> "Phase2RuntimeIntegration":
-        if self._installed:
-            return self
-        self._original_has_active = getattr(self.bot, "has_active_open_trade", None)
-        self._original_generate = getattr(self.bot, "generate_quant_signal", None)
-        self._original_monitor = getattr(self.bot, "monitor_open_trades", None)
-        if self._original_has_active is None or self._original_generate is None:
-            raise AttributeError("Phase 2 integration requires signal pipeline functions")
-        self.bot.has_active_open_trade = self._wrapped_has_active
-        self.bot.generate_quant_signal = self._wrapped_generate
-        if self._original_monitor is not None:
-            self.bot.monitor_open_trades = self._wrapped_monitor
-        self._reconcile_ledger()
-        self._installed = True
-        return self
+        if self._installed: return self
+        self._original_has_active = getattr(self.bot, "has_active_open_trade", None); self._original_generate = getattr(self.bot, "generate_quant_signal", None); self._original_monitor = getattr(self.bot, "monitor_open_trades", None)
+        if self._original_has_active is None or self._original_generate is None: raise AttributeError("Phase 2 integration requires signal pipeline functions")
+        self.bot.has_active_open_trade = self._wrapped_has_active; self.bot.generate_quant_signal = self._wrapped_generate
+        if self._original_monitor is not None: self.bot.monitor_open_trades = self._wrapped_monitor
+        self._reconcile_ledger(); self._installed = True; return self
 
 
 def install_phase2_when_bot_ready(timeout_seconds: float = 60.0) -> Phase2RuntimeIntegration | None:
@@ -326,13 +170,10 @@ def install_phase2_when_bot_ready(timeout_seconds: float = 60.0) -> Phase2Runtim
     deadline = time.monotonic() + max(1.0, float(timeout_seconds))
     while time.monotonic() < deadline:
         bot = sys.modules.get("bot") or sys.modules.get("__main__")
-        if bot is not None and hasattr(bot, "generate_quant_signal"):
-            return Phase2RuntimeIntegration(bot).install()
+        if bot is not None and hasattr(bot, "generate_quant_signal"): return Phase2RuntimeIntegration(bot).install()
         time.sleep(0.25)
     return None
 
 
 def start_phase2_runtime_bootstrap() -> threading.Thread:
-    thread = threading.Thread(target=install_phase2_when_bot_ready, name="phase2-trade-intelligence-bootstrap", daemon=True)
-    thread.start()
-    return thread
+    thread = threading.Thread(target=install_phase2_when_bot_ready, name="phase2-trade-intelligence-bootstrap", daemon=True); thread.start(); return thread
