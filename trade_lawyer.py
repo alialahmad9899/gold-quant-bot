@@ -142,7 +142,10 @@ def format_lawyer_message(snapshot):
 
 def _lawyer_keyboard():
     if InlineKeyboardButton is None or InlineKeyboardMarkup is None: return None
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🧑‍⚖️ استشر محامي الصفقة الآن",callback_data="trade_lawyer_now")]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧑‍⚖️ استشر محامي الصفقة الآن",callback_data="trade_lawyer_now")],
+        [InlineKeyboardButton("📰 آخر أخبار الذهب",callback_data="news_now")],
+    ])
 
 async def _lawyer_command(update, context):
     bot=_get_bot_module();
@@ -158,6 +161,29 @@ async def _lawyer_callback(update, context):
     if bot is None: return
     await query.message.reply_text(format_lawyer_message(_lawyer_snapshot(bot)),reply_markup=_lawyer_keyboard(),parse_mode="Markdown")
 
+async def _news_command(update, context):
+    bot=_get_bot_module()
+    if bot is None: return
+    chat_id=update.effective_chat.id
+    if hasattr(bot,"is_authenticated") and not bot.is_authenticated(chat_id):
+        await bot.safe_reply_text(update,"🔒 يرجى تسجيل الدخول أولاً.")
+        return
+    decision=_news_context(bot)
+    cache=getattr(bot,"GLOBAL_CACHE",{})
+    latest=(cache.get("latest_news") or []) if isinstance(cache,dict) else []
+    if decision:
+        text=f"📰 **ذكاء الأخبار اللحظي**\n\n📌 **القرار:** {decision.action}\n🎯 **التأثير:** {decision.impact}/100\n⚡ **الاستعجال:** {decision.urgency}\n\n💡 {decision.reason}"
+    elif latest:
+        text="📰 **آخر الأخبار**\n\n" + "\n".join(f"• {item.get('title','')}" for item in latest[:5])
+    else:
+        text="📰 لا يوجد حالياً خبر جديد مؤثر تم التقاطه."
+    await bot.safe_reply_text(update,text,reply_markup=_lawyer_keyboard(),parse_mode="Markdown")
+
+async def _news_callback(update, context):
+    query=update.callback_query; await query.answer(); bot=_get_bot_module()
+    if bot is None: return
+    await _news_command(query, context)
+
 async def _broadcast_lawyer_update(app,bot,snapshot):
     if not hasattr(bot,"get_subscribers"): return
     for uid in bot.get_subscribers():
@@ -168,8 +194,12 @@ async def _broadcast_lawyer_update(app,bot,snapshot):
 
 def install_telegram_trade_lawyer(app,bot):
     if getattr(app,"_trade_lawyer_handlers_installed",False): return
-    if CommandHandler is not None: app.add_handler(CommandHandler("lawyer",_lawyer_command))
-    if CallbackQueryHandler is not None: app.add_handler(CallbackQueryHandler(_lawyer_callback,pattern=r"^trade_lawyer_now$"))
+    if CommandHandler is not None:
+        app.add_handler(CommandHandler("lawyer",_lawyer_command))
+        app.add_handler(CommandHandler("news",_news_command))
+    if CallbackQueryHandler is not None:
+        app.add_handler(CallbackQueryHandler(_lawyer_callback,pattern=r"^trade_lawyer_now$"))
+        app.add_handler(CallbackQueryHandler(_news_callback,pattern=r"^news_now$"))
     app._trade_lawyer_handlers_installed=True
 
 
@@ -220,14 +250,17 @@ def _install_news_hooks(bot):
     if original_generate is None: return
     def wrapped_generate(*args,**kwargs):
         active=bool(getattr(bot,"has_active_open_trade",lambda *_:False)("BUY") or getattr(bot,"has_active_open_trade",lambda *_:False)("SELL"))
-        if not active and os.getenv("NEWS_SIGNAL_ENABLED","1")=="1":
-            decision=_news_context(bot)
-            candidate=_news_candidate(bot,decision) if decision else None
-            if candidate:
-                # Route the news candidate through the existing institutional/Phase2 pipeline when available.
-                return candidate
+        if active:
+            return original_generate(*args,**kwargs)
+        # Technical pipeline gets first opportunity. News is an additional trigger, not a replacement.
         result=original_generate(*args,**kwargs)
-        return result
+        if isinstance(result,dict) and result.get("status")=="SIGNAL":
+            return result
+        if os.getenv("NEWS_SIGNAL_ENABLED","1")!="1":
+            return result
+        decision=_news_context(bot)
+        candidate=_news_candidate(bot,decision) if decision else None
+        return candidate or result
     bot.generate_quant_signal=wrapped_generate
     if original_monitor is not None:
         def wrapped_monitor(*args,**kwargs):
@@ -246,8 +279,7 @@ def _install_news_hooks(bot):
 
 def _news_worker():
     global _news_last_signature,_news_last_notification
-    started=time.monotonic()
-    while time.monotonic()-started < 180:
+    while True:
         try:
             bot=_get_bot_module(); app=getattr(bot,"app",None) if bot else None
             if bot:
@@ -260,11 +292,11 @@ def _news_worker():
                         text=f"📰 **ذكاء الأخبار**\n\n📌 {decision.action}\n🎯 التأثير على الذهب: {decision.impact}/100\n⚡ الاستعجال: {decision.urgency}\n\n💡 {decision.reason}"
                         if hasattr(app,"create_task"):
                             for uid in bot.get_subscribers():
-                                try: app.create_task(bot.safe_send_message(app.bot,chat_id=uid,text=text,parse_mode="Markdown"))
+                                try: app.create_task(bot.safe_send_message(app.bot,chat_id=uid,text=text,parse_mode="Markdown",reply_markup=_lawyer_keyboard()))
                                 except Exception: pass
                         _news_last_signature=sig; _news_last_notification=time.monotonic()
                 install_telegram_trade_lawyer(app,bot) if app else None
-            time.sleep(5)
+            time.sleep(max(5, int(os.getenv("NEWS_WORKER_SLEEP_SECONDS","10"))))
         except Exception:
             time.sleep(5)
 
