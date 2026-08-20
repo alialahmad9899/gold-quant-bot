@@ -5,46 +5,23 @@ and Gemini disagreement are normally quality/advisory signals rather than hard
 blocks. Gemini may be promoted to a hard veto only with INSTITUTIONAL_AI_VETO=1.
 """
 from __future__ import annotations
-
-import json
-import os
-import re
+import json, os, re
 from dataclasses import asdict, dataclass
 from typing import Any
 
-MIN_RR = float(os.getenv("INSTITUTIONAL_MIN_RR", "1.20"))
-MIN_CONFIDENCE = float(os.getenv("INSTITUTIONAL_MIN_CONFIDENCE", "40"))
-APPROVE_SCORE = int(os.getenv("INSTITUTIONAL_APPROVE_SCORE", "60"))
-MODIFY_SCORE = int(os.getenv("INSTITUTIONAL_MODIFY_SCORE", "48"))
-AI_VETO_ENABLED = os.getenv("INSTITUTIONAL_AI_VETO", "0") == "1"
+MIN_RR = float(os.getenv("INSTITUTIONAL_MIN_RR", "1.20")); MIN_CONFIDENCE = float(os.getenv("INSTITUTIONAL_MIN_CONFIDENCE", "40")); APPROVE_SCORE = int(os.getenv("INSTITUTIONAL_APPROVE_SCORE", "60")); MODIFY_SCORE = int(os.getenv("INSTITUTIONAL_MODIFY_SCORE", "48")); AI_VETO_ENABLED = os.getenv("INSTITUTIONAL_AI_VETO", "0") == "1"
 
 @dataclass
 class TradeReviewResult:
-    approved: bool
-    decision: str
-    risk_score: int
-    reason: str
-    thesis: str
-    invalidation: str
-    reversal: str
-    regime: str
-    hard_vetoes: list[str]
-    matched_lessons: list[str]
-    counter_trade_risk: str
-    component_scores: dict[str, int]
-    ai_review: dict[str, Any] | None = None
+    approved: bool; decision: str; risk_score: int; reason: str; thesis: str; invalidation: str; reversal: str; regime: str; hard_vetoes: list[str]; matched_lessons: list[str]; counter_trade_risk: str; component_scores: dict[str, int]; ai_review: dict[str, Any] | None = None
     def to_dict(self) -> dict[str, Any]: return asdict(self)
 
 def _direction(value: Any) -> str | None:
-    raw = str(value or "").upper()
-    if "BUY" in raw or "شراء" in raw: return "BUY"
-    if "SELL" in raw or "بيع" in raw: return "SELL"
-    return None
+    raw = str(value or "").upper(); return "BUY" if "BUY" in raw or "شراء" in raw else "SELL" if "SELL" in raw or "بيع" in raw else None
 
 def _float(value: Any) -> float | None:
     try:
-        value = float(value)
-        return None if value != value or value in (float("inf"), float("-inf")) else value
+        value = float(value); return None if value != value or value in (float("inf"), float("-inf")) else value
     except (TypeError, ValueError): return None
 
 def _bool(value: Any) -> bool:
@@ -54,8 +31,7 @@ def _bool(value: Any) -> bool:
 
 def _rr(direction: str, entry: float | None, sl: float | None, tp1: float | None) -> float | None:
     if not all(v is not None for v in (entry, sl, tp1)): return None
-    risk = abs(entry - sl); reward = (tp1 - entry) if direction == "BUY" else (entry - tp1)
-    return reward / risk if risk > 0 and reward > 0 else None
+    risk = abs(entry - sl); reward = (tp1 - entry) if direction == "BUY" else (entry - tp1); return reward / risk if risk > 0 and reward > 0 else None
 
 def infer_regime(market_summary: dict[str, Any]) -> str:
     h4 = str(market_summary.get("h4_trend") or "").upper(); state = str(market_summary.get("state_label") or "").upper(); vol = str(market_summary.get("volatility_regime") or "").upper()
@@ -69,15 +45,11 @@ def infer_regime(market_summary: dict[str, Any]) -> str:
     return "UNKNOWN"
 
 def _smc_alignment(direction: str, smc: dict[str, Any], note: str) -> tuple[int, int]:
-    text = str(note or "").upper()
-    bull = any(_bool(smc.get(k)) for k in ("bos_bullish", "fvg_bullish", "sweep_bullish", "liquidity_bullish")) or any(x in text for x in ("BULLISH", "شراء", "صاعد"))
-    bear = any(_bool(smc.get(k)) for k in ("bos_bearish", "fvg_bearish", "sweep_bearish", "liquidity_bearish")) or any(x in text for x in ("BEARISH", "SELL", "بيع", "هابط"))
-    return int(bull if direction == "BUY" else bear), int(bear if direction == "BUY" else bull)
+    text = str(note or "").upper(); bull = any(_bool(smc.get(k)) for k in ("bos_bullish", "fvg_bullish", "sweep_bullish", "liquidity_bullish")) or any(x in text for x in ("BULLISH", "شراء", "صاعد")); bear = any(_bool(smc.get(k)) for k in ("bos_bearish", "fvg_bearish", "sweep_bearish", "liquidity_bearish")) or any(x in text for x in ("BEARISH", "SELL", "بيع", "هابط")); return int(bull if direction == "BUY" else bear), int(bear if direction == "BUY" else bull)
 
 def _lesson_severity(text: str) -> str:
     low = str(text or "").lower()
-    if any(k in low for k in ("critical", "حرج", "veto", "لا تدخل", "ممنوع", "حظر")): return "HIGH"
-    if any(k in low for k in ("high", "خطير", "خطر")): return "HIGH"
+    if any(k in low for k in ("critical", "حرج", "veto", "لا تدخل", "ممنوع", "حظر", "high", "خطير", "خطر")): return "HIGH"
     if any(k in low for k in ("medium", "متوسط")): return "MEDIUM"
     return "LOW"
 
@@ -85,8 +57,7 @@ def _lesson_applies(direction: str, lesson: str, context: str) -> bool:
     low = str(lesson or "").lower()
     if direction == "BUY" and any(k in low for k in ("sell", "بيع", "هبوط", "هابط")) and not any(k in low for k in ("buy", "شراء", "صعود", "صاعد")): return False
     if direction == "SELL" and any(k in low for k in ("buy", "شراء", "صعود", "صاعد")) and not any(k in low for k in ("sell", "بيع", "هبوط", "هابط")): return False
-    words = [w for w in re.findall(r"[\w\u0600-\u06ff]+", low) if len(w) >= 4]
-    return any(w in context.lower() for w in words) or (_lesson_severity(low) == "HIGH" and len(words) <= 4)
+    words = [w for w in re.findall(r"[\w\u0600-\u06ff]+", low) if len(w) >= 4]; return any(w in context.lower() for w in words) or (_lesson_severity(low) == "HIGH" and len(words) <= 4)
 
 def _historical_lesson_score(direction: str, lessons: list[Any], context: str) -> tuple[int, list[str], list[str]]:
     score = 5; matched: list[str] = []; vetoes: list[str] = []
@@ -100,9 +71,7 @@ def _historical_lesson_score(direction: str, lessons: list[Any], context: str) -
     return score, matched, vetoes
 
 def review_trade(signal_data: dict[str, Any], market_summary: dict[str, Any], lessons: list[Any] | None = None, smc: dict[str, Any] | None = None) -> TradeReviewResult:
-    signal_data = dict(signal_data or {}); market_summary = dict(market_summary or {}); smc = dict(smc or signal_data.get("smc") or {})
-    direction = _direction(signal_data.get("type")) or _direction(signal_data.get("direction")); entry = _float(signal_data.get("entry")); sl = _float(signal_data.get("sl")); tp1 = _float(signal_data.get("tp1"))
-    confidence = _float(signal_data.get("confidence")) or 0.0; rsi = _float(signal_data.get("rsi")); dxy_corr = _float(signal_data.get("dxy_corr")); note = str(signal_data.get("smc_note") or ""); h4 = str(market_summary.get("h4_trend") or "").upper(); state = str(market_summary.get("state_label") or "").upper(); regime = infer_regime(market_summary)
+    signal_data = dict(signal_data or {}); market_summary = dict(market_summary or {}); smc = dict(smc or signal_data.get("smc") or {}); direction = _direction(signal_data.get("type")) or _direction(signal_data.get("direction")); entry = _float(signal_data.get("entry")); sl = _float(signal_data.get("sl")); tp1 = _float(signal_data.get("tp1")); confidence = _float(signal_data.get("confidence")) or 0.0; rsi = _float(signal_data.get("rsi")); note = str(signal_data.get("smc_note") or ""); h4 = str(market_summary.get("h4_trend") or "").upper(); state = str(market_summary.get("state_label") or "").upper(); regime = infer_regime(market_summary)
     vetoes: list[str] = []; counter_risk = "منخفض"
     if direction is None: vetoes.append("تعذر تحديد اتجاه الصفقة.")
     if entry is None or entry <= 0: vetoes.append("سعر الدخول غير صالح.")
@@ -120,11 +89,14 @@ def review_trade(signal_data: dict[str, Any], market_summary: dict[str, Any], le
     context = json.dumps({"signal": signal_data, "market": market_summary}, ensure_ascii=False, default=str); historical_score, matched_lessons, lesson_vetoes = _historical_lesson_score(direction or "BUY", lessons or [], context); vetoes.extend(lesson_vetoes)
     structure_score = 20 if supporting_smc else 10; trend_score = 20 if ((direction == "BUY" and h4 == "BULLISH") or (direction == "SELL" and h4 == "BEARISH")) else 9
     if state in {"RANGING", "TRANSITION", ""}: trend_score = min(trend_score, 13)
-    entry_score = 15 if rr is not None and rr >= 2.0 else 11 if rr is not None and rr >= MIN_RR else 7; rr_score = min(15, max(3, int((rr or 0) / 3.0 * 15))) if rr is not None else 0
+    # Calibrated scoring: entry quality measures structural entry context, while RR owns RR.
+    entry_score = 15 if supporting_smc and rr is not None and rr >= MIN_RR else 11 if supporting_smc else 8
+    rr_score = min(15, max(3, int((rr or 0) / 3.0 * 15))) if rr is not None else 0
     confidence_score = min(10, max(2, int(confidence / 10))); confidence_score = max(2, confidence_score - 1) if confidence < MIN_CONFIDENCE else confidence_score
     momentum_score = 10 if rsi is None else (8 if (direction == "BUY" and rsi < 70) or (direction == "SELL" and rsi > 30) else 5)
     if rsi is not None and ((direction == "BUY" and rsi >= 76) or (direction == "SELL" and rsi <= 24)): momentum_score = 3
-    liquidity_score = 10 if supporting_smc else 5 if opposing_smc else 3; regime_score = 5 if regime in {"TRENDING_BULLISH", "TRENDING_BEARISH"} and ((direction == "BUY" and h4 == "BULLISH") or (direction == "SELL" and h4 == "BEARISH")) else 3
+    liquidity_score = 10 if any(_bool(smc.get(k)) for k in ("liquidity_bullish", "liquidity_bearish", "sweep_bullish", "sweep_bearish")) else 5 if opposing_smc else 3
+    regime_score = 5 if regime in {"TRENDING_BULLISH", "TRENDING_BEARISH"} and ((direction == "BUY" and h4 == "BULLISH") or (direction == "SELL" and h4 == "BEARISH")) else 3
     scores = {"structure": structure_score, "trend_alignment": trend_score, "entry_quality": entry_score, "risk_reward": rr_score, "confidence": confidence_score, "momentum": momentum_score, "liquidity": liquidity_score, "regime_fit": regime_score, "historical_risk": historical_score}; total = max(0, min(100, sum(scores.values())))
     if vetoes: decision, approved, reason = "REJECT", False, "فيتو مخاطر جوهري: " + " | ".join(vetoes[:3])
     elif total >= APPROVE_SCORE: decision, approved, reason = "APPROVE", True, f"اجتازت الصفقة بوابة المخاطر بدرجة {total}/100؛ السياسة مرنة ولا تتطلب الكمال."
@@ -156,10 +128,8 @@ def apply_ai_review(deterministic: TradeReviewResult, raw_ai: Any) -> TradeRevie
     ai = parse_ai_review(raw_ai); ai_approved = _bool(ai.get("approved")); ai_decision = str(ai.get("decision") or ("APPROVE" if ai_approved else "REJECT")).upper(); deterministic.ai_review = {**ai, "approved": ai_approved, "decision": ai_decision, "mode": "HARD_VETO" if AI_VETO_ENABLED else "ADVISORY"}
     if deterministic.hard_vetoes: return deterministic
     if not ai_approved or ai_decision in {"REJECT", "REVERSE"}:
-        if AI_VETO_ENABLED:
-            deterministic.approved = False; deterministic.decision = "REJECT"; deterministic.reason = str(ai.get("reason") or "مراجعة Gemini رأت خطراً إضافياً.")
-        else:
-            deterministic.approved = deterministic.risk_score >= MODIFY_SCORE; deterministic.decision = "APPROVE_WITH_CAUTION" if deterministic.approved else deterministic.decision; deterministic.reason = f"ملاحظة Gemini: {ai.get('reason') or 'تحفظ تحليلي'} — لم تُستخدم كفيتو تلقائي لأن الصفقة اجتازت الحماية الحتمية."
+        if AI_VETO_ENABLED: deterministic.approved = False; deterministic.decision = "REJECT"; deterministic.reason = str(ai.get("reason") or "مراجعة Gemini رأت خطراً إضافياً.")
+        else: deterministic.approved = deterministic.risk_score >= MODIFY_SCORE; deterministic.decision = "APPROVE_WITH_CAUTION" if deterministic.approved else deterministic.decision; deterministic.reason = f"ملاحظة Gemini: {ai.get('reason') or 'تحفظ تحليلي'} — لم تُستخدم كفيتو تلقائي لأن الصفقة اجتازت الحماية الحتمية."
     else:
         if deterministic.risk_score >= MODIFY_SCORE: deterministic.approved = True; deterministic.decision = "APPROVE" if deterministic.risk_score >= APPROVE_SCORE else "APPROVE_WITH_CAUTION"
         deterministic.reason = str(ai.get("reason") or deterministic.reason)
