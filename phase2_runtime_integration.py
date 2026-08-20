@@ -21,12 +21,14 @@ from trade_lawyer import (
     deterministic_active_advice,
     should_call_active_ai,
 )
+from news_runtime import NewsRuntimeCoordinator
 
 
 class Phase2RuntimeIntegration:
     def __init__(self, bot_module: Any, manager: TradeIntelligence | None = None):
         self.bot = bot_module
         self.manager = manager or TradeIntelligence(TradeStateStore())
+        self.news = NewsRuntimeCoordinator()
         self._installed = False
         self._original_generate = None
         self._original_monitor = None
@@ -57,6 +59,7 @@ class Phase2RuntimeIntegration:
             "signal_candle_time": candidate_signal.get("signal_candle_time", ""),
             "h4_trend": market_summary.get("h4_trend", ""),
             "state_label": market_summary.get("state_label", ""),
+            "news": market_summary.get("news_decision", {}),
         }
         reason = candidate_signal.get("smc_note") or "تم قبول الإشارة بعد اجتياز محرك التحليل الحالي"
         return TradeThesis(
@@ -107,6 +110,8 @@ class Phase2RuntimeIntegration:
                 adverse = (entry - price_f) if trade.thesis.direction == "BUY" else (price_f - entry)
                 flags["temporary_pressure"] = adverse >= risk * 0.50
             flags["price"] = price_f
+            if price_f is not None:
+                flags.update(self.news.active_trade_context(price=price_f, active_direction=trade.thesis.direction))
         except (TypeError, ValueError):
             pass
 
@@ -142,6 +147,8 @@ class Phase2RuntimeIntegration:
         cache = getattr(self.bot, "GLOBAL_CACHE", None)
         if isinstance(cache, dict):
             cache["active_trade_management"] = result
+            cache["news_decision"] = flags.get("news_decision")
+            cache["news_decisions"] = flags.get("news_decisions", [])
 
         trade = self.manager.active_trade
         thesis = trade.thesis
@@ -150,6 +157,8 @@ class Phase2RuntimeIntegration:
             "h4_trend": flags.get("h4_trend", thesis.h4_trend),
             "state_label": flags.get("state_label", ""),
             "smc": flags.get("smc", {}),
+            "news_decision": flags.get("news_decision", {}),
+            "news_decisions": flags.get("news_decisions", []),
             "data_quality": (cache or {}).get("data_quality") if isinstance(cache, dict) else None,
         }
         review = (cache or {}).get("institutional_trade_review", {}) if isinstance(cache, dict) else {}
@@ -202,6 +211,14 @@ class Phase2RuntimeIntegration:
                 smc = dict(analysis.get("smc") or smc)
             except Exception:
                 pass
+        try:
+            market = self.bot.get_market_data() if hasattr(self.bot, "get_market_data") else {}
+            feed = dict(market.get("price_feed") or {})
+            price = feed.get("mid") or feed.get("spot") or market.get("gold")
+            news_context = self.news.entry_context(price=float(price) if price is not None else None, force=False)
+            market_summary.update(news_context)
+        except (TypeError, ValueError, Exception):
+            pass
         return market_summary, smc
 
     def _lessons(self) -> list[Any]:
@@ -263,6 +280,28 @@ class Phase2RuntimeIntegration:
 
         result = self._original_generate(*args, **kwargs)
         if not isinstance(result, dict) or result.get("status") != "SIGNAL":
+            # A strong, confirmed news event may request a fresh technical signal evaluation.
+            # We never synthesize a trade if the existing pipeline cannot produce valid levels.
+            try:
+                market = self.bot.get_market_data() if hasattr(self.bot, "get_market_data") else {}
+                feed = dict(market.get("price_feed") or {})
+                price = feed.get("mid") or feed.get("spot") or market.get("gold")
+                news = self.news.entry_context(price=float(price) if price is not None else None, force=True)
+                decision = news.get("news_decision") or {}
+                if decision.get("action") in {"NEWS_BUY", "NEWS_SELL"}:
+                    forced = self._original_generate(force_evaluate=True)
+                    if isinstance(forced, dict) and forced.get("status") == "SIGNAL":
+                        forced_dir = self._direction(forced.get("type")) or self._direction(forced.get("direction"))
+                        news_dir = "BUY" if decision["action"] == "NEWS_BUY" else "SELL"
+                        if forced_dir == news_dir:
+                            forced["news_intelligence"] = news
+                            result = forced
+                        else:
+                            return {**result, "news_intelligence": news}
+                    else:
+                        return {**result, "news_intelligence": news}
+            except Exception:
+                pass
             return result
 
         market_summary, smc = self._collect_market_context(result)
@@ -271,7 +310,7 @@ class Phase2RuntimeIntegration:
         result["risk_score"] = institutional.risk_score
         result["risk_decision"] = institutional.decision
         result["risk_regime"] = institutional.regime
-        if not institutional.approved:
+        if not institutional.approved and institutional.decision != "MODIFY":
             return {
                 "status": "WAIT",
                 "reason": f"فيتو مدير المخاطر المؤسسي: {institutional.reason}",
