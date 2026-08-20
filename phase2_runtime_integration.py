@@ -14,6 +14,13 @@ from institutional_trade_review import (
 )
 from trade_intelligence import TradeIntelligence, TradeThesis
 from trade_state_store import TradeStateStore
+from trade_lawyer import (
+    ActiveTradeLawyerAdvice,
+    apply_active_ai,
+    build_active_trade_prompt,
+    deterministic_active_advice,
+    should_call_active_ai,
+)
 
 
 class Phase2RuntimeIntegration:
@@ -24,6 +31,9 @@ class Phase2RuntimeIntegration:
         self._original_generate = None
         self._original_monitor = None
         self._original_has_active = None
+        self._lawyer_last_ai_call: float | None = None
+        self._lawyer_previous_state: str | None = None
+        self._direction_history: list[str] = []
 
     @staticmethod
     def _direction(value: Any) -> str | None:
@@ -58,11 +68,7 @@ class Phase2RuntimeIntegration:
             h4_trend=str(market_summary.get("h4_trend") or ""),
             bos=bool(smc.get("bos") or smc.get("bos_bullish") or smc.get("bos_bearish")),
             fvg=bool(smc.get("fvg_bullish") or smc.get("fvg_bearish")),
-            liquidity=bool(
-                smc.get("liquidity")
-                or smc.get("sweep_bullish")
-                or smc.get("sweep_bearish")
-            ),
+            liquidity=bool(smc.get("liquidity") or smc.get("sweep_bullish") or smc.get("sweep_bearish")),
             gemini_decision=str(candidate_signal.get("gemini_note") or ""),
             confidence=float(candidate_signal.get("confidence") or 0.0) / 100.0,
             notes=[reason],
@@ -100,6 +106,7 @@ class Phase2RuntimeIntegration:
             if price_f is not None and risk > 0 and not flags.get("tp1_reached"):
                 adverse = (entry - price_f) if trade.thesis.direction == "BUY" else (price_f - entry)
                 flags["temporary_pressure"] = adverse >= risk * 0.50
+            flags["price"] = price_f
         except (TypeError, ValueError):
             pass
 
@@ -110,16 +117,8 @@ class Phase2RuntimeIntegration:
                 h4_trend = str(analysis.get("h4_trend") or "")
                 state = str(analysis.get("state_label") or "")
                 smc = dict(analysis.get("smc") or {})
-                opposite_h4 = (
-                    trade.thesis.direction == "BUY" and h4_trend == "BEARISH"
-                ) or (
-                    trade.thesis.direction == "SELL" and h4_trend == "BULLISH"
-                )
-                opposite_state = (
-                    trade.thesis.direction == "BUY" and state == "BEARISH"
-                ) or (
-                    trade.thesis.direction == "SELL" and state == "BULLISH"
-                )
+                opposite_h4 = (trade.thesis.direction == "BUY" and h4_trend == "BEARISH") or (trade.thesis.direction == "SELL" and h4_trend == "BULLISH")
+                opposite_state = (trade.thesis.direction == "BUY" and state == "BEARISH") or (trade.thesis.direction == "SELL" and state == "BULLISH")
                 opposite_smc = (
                     (trade.thesis.direction == "BUY" and (smc.get("fvg_bearish") or smc.get("sweep_bearish")))
                     or (trade.thesis.direction == "SELL" and (smc.get("fvg_bullish") or smc.get("sweep_bullish")))
@@ -127,17 +126,63 @@ class Phase2RuntimeIntegration:
                 flags["structure_break_against"] = bool(opposite_h4 and opposite_smc)
                 flags["invalidation"] = bool(opposite_h4 and opposite_state and opposite_smc)
                 flags["reversal_signal"] = bool(opposite_h4 and opposite_state and opposite_smc)
+                flags["h4_trend"] = h4_trend
+                flags["state_label"] = state
+                flags["smc"] = smc
             except Exception:
                 pass
         return flags
 
     def review_active_trade(self) -> dict:
         if not self.manager.has_active_trade():
-            return {"decision": "KEEP", "state": "NO_POSITION", "management": {}}
-        result = self.manager.manage(self._review_flags())
+            return {"decision": "KEEP", "state": "NO_POSITION", "management": {}, "lawyer": {"action": "HOLD"}}
+
+        flags = self._review_flags()
+        result = self.manager.manage(flags)
         cache = getattr(self.bot, "GLOBAL_CACHE", None)
         if isinstance(cache, dict):
             cache["active_trade_management"] = result
+
+        trade = self.manager.active_trade
+        thesis = trade.thesis
+        market = {
+            "price": flags.get("price"),
+            "h4_trend": flags.get("h4_trend", thesis.h4_trend),
+            "state_label": flags.get("state_label", ""),
+            "smc": flags.get("smc", {}),
+            "data_quality": (cache or {}).get("data_quality") if isinstance(cache, dict) else None,
+        }
+        review = (cache or {}).get("institutional_trade_review", {}) if isinstance(cache, dict) else {}
+        trade_payload = {
+            "direction": thesis.direction,
+            "entry": thesis.entry,
+            "sl": thesis.sl,
+            "tp1": thesis.tp1,
+            "tp2": thesis.tp2,
+            "confidence": thesis.confidence,
+            "candle_id": thesis.candle_id,
+            "reason": thesis.reason,
+        }
+        deterministic = deterministic_active_advice(trade_payload, market, result, review)
+        lawyer = deterministic
+
+        executor = getattr(self.bot, "execute_gemini_dynamic_request", None)
+        state = str(result.get("state") or "ACTIVE")
+        if executor and should_call_active_ai(self._lawyer_last_ai_call, state, self._lawyer_previous_state):
+            try:
+                prompt = build_active_trade_prompt(trade_payload, market, result, review, deterministic)
+                raw, model = executor(prompt, response_mime_type="application/json", task_type="vetting")
+                lawyer = apply_active_ai(deterministic, raw, model)
+                self._lawyer_last_ai_call = time.monotonic()
+            except Exception as exc:
+                lawyer = deterministic
+                lawyer.reason = f"{deterministic.reason} | تعذر استدعاء محامي الصفقة: {type(exc).__name__}"
+        self._lawyer_previous_state = state
+
+        if isinstance(cache, dict):
+            cache["trade_lawyer"] = lawyer.to_dict()
+            cache["trade_lawyer_last_update"] = time.time()
+        result["lawyer"] = lawyer.to_dict()
         return result
 
     def _collect_market_context(self, result: dict) -> tuple[dict, dict]:
@@ -165,15 +210,29 @@ class Phase2RuntimeIntegration:
         except Exception:
             return []
 
+    def _record_direction(self, result: dict) -> None:
+        direction = self._direction(result.get("type"))
+        if not direction:
+            return
+        self._direction_history.append(direction)
+        self._direction_history = self._direction_history[-8:]
+        streak = 1
+        for prior in reversed(self._direction_history[:-1]):
+            if prior != direction:
+                break
+            streak += 1
+        cache = getattr(self.bot, "GLOBAL_CACHE", None)
+        if isinstance(cache, dict):
+            cache["direction_history"] = list(self._direction_history)
+            cache["direction_streak"] = {"direction": direction, "count": streak}
+            cache["direction_bias_warning"] = streak >= 3
+
     def institutional_review(self, signal: dict, market_summary: dict, smc: dict) -> TradeReviewResult:
         lessons = self._lessons()
         review = review_trade(signal, market_summary, lessons=lessons, smc=smc)
-
-        # Hard rules are final. Gemini is an adversarial second opinion only when
-        # the deterministic layer did not already find a hard veto.
         use_ai = os.getenv("INSTITUTIONAL_GEMINI_REVIEW", "1") == "1"
         executor = getattr(self.bot, "execute_gemini_dynamic_request", None)
-        if use_ai and executor and not review.hard_vetoes and review.risk_score >= int(os.getenv("INSTITUTIONAL_AI_MIN_SCORE", "58")):
+        if use_ai and executor and not review.hard_vetoes and review.risk_score >= int(os.getenv("INSTITUTIONAL_AI_MIN_SCORE", "55")):
             try:
                 prompt = build_adversarial_prompt(signal, market_summary, review, lessons)
                 raw, model = executor(prompt, response_mime_type="application/json", task_type="vetting")
@@ -181,12 +240,7 @@ class Phase2RuntimeIntegration:
                 review.ai_review = dict(review.ai_review or {})
                 review.ai_review["model"] = model
             except Exception as exc:
-                review.ai_review = {
-                    "approved": None,
-                    "decision": "UNAVAILABLE",
-                    "reason": f"تعذر تنفيذ المراجعة العدائية الإضافية: {type(exc).__name__}: {exc}",
-                }
-
+                review.ai_review = {"approved": None, "decision": "UNAVAILABLE", "reason": f"تعذر تنفيذ المراجعة العدائية: {type(exc).__name__}: {exc}"}
         cache = getattr(self.bot, "GLOBAL_CACHE", None)
         if isinstance(cache, dict):
             cache["institutional_trade_review"] = review.to_dict()
@@ -202,7 +256,7 @@ class Phase2RuntimeIntegration:
             review = self.review_active_trade()
             return {
                 "status": "WAIT",
-                "reason": f"حماية Phase 2: توجد صفقة نشطة وحالتها {review['state']}؛ تم منع فتح صفقة موازية حتى حسمها.",
+                "reason": f"حماية Phase 2: توجد صفقة نشطة وحالتها {review['state']}؛ {review.get('lawyer', {}).get('action', 'HOLD')}.",
                 "price": self.bot.get_market_data().get("gold", 0.0),
                 "phase2": review,
             }
@@ -217,7 +271,6 @@ class Phase2RuntimeIntegration:
         result["risk_score"] = institutional.risk_score
         result["risk_decision"] = institutional.decision
         result["risk_regime"] = institutional.regime
-
         if not institutional.approved:
             return {
                 "status": "WAIT",
@@ -225,6 +278,11 @@ class Phase2RuntimeIntegration:
                 "price": result.get("entry", 0.0),
                 "institutional_review": institutional.to_dict(),
             }
+
+        # The risk gate stays flexible; only explicit hard vetoes reject. Quality below the
+        # preferred approval score remains MODIFY guidance, not an automatic no-trade filter.
+        if institutional.decision == "MODIFY" and os.getenv("INSTITUTIONAL_BLOCK_MODIFY", "0") != "1":
+            result["risk_decision"] = "APPROVE_WITH_CAUTION"
 
         thesis = self.build_trade_thesis(result, market_summary, smc)
         if not self.manager.open_trade(thesis):
@@ -234,6 +292,7 @@ class Phase2RuntimeIntegration:
                 "price": result.get("entry", 0.0),
                 "institutional_review": institutional.to_dict(),
             }
+        self._record_direction(result)
         result["phase2_state"] = "ACTIVE"
         result["phase2_thesis_logged"] = True
         return result
@@ -264,7 +323,6 @@ class Phase2RuntimeIntegration:
 
 def install_phase2_when_bot_ready(timeout_seconds: float = 60.0) -> Phase2RuntimeIntegration | None:
     import sys
-
     deadline = time.monotonic() + max(1.0, float(timeout_seconds))
     while time.monotonic() < deadline:
         bot = sys.modules.get("bot") or sys.modules.get("__main__")
@@ -275,10 +333,6 @@ def install_phase2_when_bot_ready(timeout_seconds: float = 60.0) -> Phase2Runtim
 
 
 def start_phase2_runtime_bootstrap() -> threading.Thread:
-    thread = threading.Thread(
-        target=install_phase2_when_bot_ready,
-        name="phase2-trade-intelligence-bootstrap",
-        daemon=True,
-    )
+    thread = threading.Thread(target=install_phase2_when_bot_ready, name="phase2-trade-intelligence-bootstrap", daemon=True)
     thread.start()
     return thread
