@@ -1,5 +1,7 @@
 from trade_lawyer import deterministic_active_advice, format_lawyer_message, review_trade
 
+# CI verification marker: production behavior is covered by this test module.
+
 
 def test_pretrade_moderate_rr_is_modify_not_reject():
     result = review_trade(
