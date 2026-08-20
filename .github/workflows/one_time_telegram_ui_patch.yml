@@ -1,0 +1,64 @@
+name: One-time Telegram UI patch
+
+on:
+  push:
+    branches: [fix/quant-news-ai-calibration]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Patch persistent Arabic controls
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          bot = Path('bot.py')
+          text = bot.read_text(encoding='utf-8')
+          marker = '        [KeyboardButton("⚖️ محامي الصفقة"), KeyboardButton("📰 أخبار الذهب")],'
+          if marker not in text:
+              needle = '        [KeyboardButton("🔍 فحص الأخطاء الشامل"), KeyboardButton("🧹 تصفير البيانات")],\n'
+              if needle not in text:
+                  raise SystemExit('main keyboard anchor not found')
+              text = text.replace(needle, needle + marker + '\n', 1)
+              bot.write_text(text, encoding='utf-8')
+
+          lawyer = Path('trade_lawyer.py')
+          t = lawyer.read_text(encoding='utf-8')
+          replacements = {
+              'decision.action': '({"NEWS_BUY":"شراء فوري بناءً على الخبر","NEWS_SELL":"بيع فوري بناءً على الخبر","HOLD":"الاحتفاظ بالصفقة","EXIT":"الخروج","REDUCE_RISK":"تخفيف المخاطرة","REASSESS":"إعادة التقييم","NO_TRADE":"لا توجد صفقة"}.get(str(decision.action).upper(), str(decision.action)))',
+              'decision.urgency': '({"URGENT":"عاجل","HIGH":"مرتفع","MEDIUM":"متوسط","LOW":"منخفض"}.get(str(decision.urgency).upper(), str(decision.urgency)))',
+          }
+          # Only patch the /news display expression, not engine logic.
+          old = 'text=f"📰 **ذكاء الأخبار اللحظي**\\n\\n📌 **القرار:** {decision.action}\\n🎯 **التأثير:** {decision.impact}/100\\n⚡ **الاستعجال:** {decision.urgency}\\n\\n💡 {decision.reason}"'
+          new = 'text=f"📰 **ذكاء الأخبار اللحظي**\\n\\n📌 **القرار:** {{"NEWS_BUY":"شراء فوري بناءً على الخبر","NEWS_SELL":"بيع فوري بناءً على الخبر","HOLD":"الاحتفاظ بالصفقة","EXIT":"الخروج","REDUCE_RISK":"تخفيف المخاطرة","REASSESS":"إعادة التقييم","NO_TRADE":"لا توجد صفقة"}.get(str(decision.action).upper(), str(decision.action))}}\\n🎯 **التأثير على الذهب:** {decision.impact}/100\\n⚡ **الاستعجال:** {{"URGENT":"عاجل","HIGH":"مرتفع","MEDIUM":"متوسط","LOW":"منخفض"}.get(str(decision.urgency).upper(), str(decision.urgency))}}\\n\\n💡 {decision.reason}"'
+          if old in t and 'التأثير على الذهب' not in old:
+              t = t.replace(old, new, 1)
+          # Worker notifications must also remain Arabic.
+          t = t.replace('📌 {decision.action}\\n🎯 التأثير على الذهب:', '📌 {({"NEWS_BUY":"شراء فوري بناءً على الخبر","NEWS_SELL":"بيع فوري بناءً على الخبر","HOLD":"الاحتفاظ بالصفقة","EXIT":"الخروج","REDUCE_RISK":"تخفيف المخاطرة","REASSESS":"إعادة التقييم","NO_TRADE":"لا توجد صفقة"}.get(str(decision.action).upper(), str(decision.action)))}\\n🎯 التأثير على الذهب:')
+          t = t.replace('⚡ الاستعجال: {decision.urgency}', '⚡ الاستعجال: {({"URGENT":"عاجل","HIGH":"مرتفع","MEDIUM":"متوسط","LOW":"منخفض"}.get(str(decision.urgency).upper(), str(decision.urgency)))}')
+          lawyer.write_text(t, encoding='utf-8')
+          PY
+
+      - name: Remove one-time patch artifacts
+        run: |
+          rm -f telegram_ui_runtime.py .github/workflows/one_time_telegram_ui_patch.yml
+
+      - name: Commit and push
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add bot.py trade_lawyer.py telegram_ui_runtime.py .github/workflows/one_time_telegram_ui_patch.yml
+          git diff --cached --quiet && exit 0
+          git commit -m 'Fix Arabic Trade Lawyer and Gold News Telegram controls'
+          git push
