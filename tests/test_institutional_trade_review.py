@@ -3,10 +3,9 @@ from institutional_trade_review import apply_ai_review, review_trade
 
 def good_buy():
     return {
-        "type": "🟢 شراء مرن", "direction": "BUY", "entry": 3000.0,
-        "sl": 2990.0, "tp1": 3020.0, "tp2": 3040.0, "rsi": 58.0,
-        "dxy_corr": -0.70, "confidence": 82.0,
-        "smc_note": "bullish BOS + bullish FVG + sweep", "candle_id": "XAUUSD_M15_TEST",
+        "type": "🟢 شراء مرن", "direction": "BUY", "entry": 3000.0, "sl": 2990.0,
+        "tp1": 3020.0, "tp2": 3040.0, "rsi": 58.0, "dxy_corr": -0.70,
+        "confidence": 82.0, "smc_note": "bullish BOS + bullish FVG + sweep", "candle_id": "XAUUSD_M15_TEST",
     }
 
 
@@ -23,12 +22,11 @@ def test_healthy_trade_gets_high_score_without_ai():
     assert result.thesis and result.invalidation and result.reversal
 
 
-def test_wrong_h4_direction_is_hard_veto():
+def test_isolated_h4_conflict_is_soft_not_hard_veto():
     market = dict(bullish_market()); market["h4_trend"] = "BEARISH"
     result = review_trade(good_buy(), market, lessons=[], smc={"bos_bullish": True})
-    assert result.approved is False
-    assert result.decision == "REJECT"
-    assert any("H4" in veto for veto in result.hard_vetoes)
+    assert not any("H4" in veto for veto in result.hard_vetoes)
+    assert result.counter_trade_risk in {"متوسط", "مرتفع"}
 
 
 def test_bad_rr_is_soft_not_automatic_veto():
