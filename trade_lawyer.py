@@ -4,11 +4,40 @@ import json, os, sys, threading, time
 from dataclasses import dataclass, asdict
 from typing import Any
 try:
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    from telegram.ext import CallbackQueryHandler, CommandHandler
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+    from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler, filters
 except Exception:
-    InlineKeyboardButton = InlineKeyboardMarkup = None; CallbackQueryHandler = CommandHandler = None
+    InlineKeyboardButton = InlineKeyboardMarkup = ReplyKeyboardMarkup = KeyboardButton = None
+    CallbackQueryHandler = CommandHandler = MessageHandler = filters = None
 from news_intelligence import NewsArticle, NewsDecision, NewsIntelligence
+
+NEWS_ACTION_AR = {
+    "NEWS_BUY": "🟢 شراء فوري بناءً على الخبر",
+    "NEWS_SELL": "🔴 بيع فوري بناءً على الخبر",
+    "EXIT": "🚨 الخروج من الصفقة",
+    "REDUCE_RISK": "🛡️ تخفيف المخاطرة",
+    "WAIT_CONFIRMATION": "⏳ انتظار تأكيد سعري",
+    "REASSESS": "🔎 إعادة تقييم الصفقة",
+    "NO_TRADE": "⏸️ لا توجد صفقة",
+    "HOLD": "📌 الاحتفاظ بالصفقة",
+}
+URGENCY_AR = {"HIGH": "عالية", "MEDIUM": "متوسطة", "LOW": "منخفضة", "URGENT": "عاجلة"}
+DIRECTION_AR = {"BULLISH_GOLD": "صعود الذهب", "BEARISH_GOLD": "هبوط الذهب", "NEUTRAL": "محايد"}
+
+
+def news_action_ar(action: Any) -> str:
+    raw = str(action or "").upper()
+    return NEWS_ACTION_AR.get(raw, raw)
+
+
+def urgency_ar(value: Any) -> str:
+    raw = str(value or "").upper()
+    return URGENCY_AR.get(raw, str(value or "غير محددة"))
+
+
+def direction_ar(value: Any) -> str:
+    raw = str(value or "").upper()
+    return DIRECTION_AR.get(raw, "غير محدد")
 
 @dataclass
 class TradeLawyerDecision:
@@ -17,18 +46,18 @@ class TradeLawyerDecision:
 def review_trade(signal: dict, context: dict | None = None) -> TradeLawyerDecision:
     context=context or {}; score=50; reasons=[]; warnings=[]; entry=float(signal.get("entry",0) or 0); sl=float(signal.get("sl",0) or 0); tp1=float(signal.get("tp1",0) or 0); tp2=float(signal.get("tp2",0) or 0)
     if entry and sl:
-        if abs(entry-sl)>0: score+=5; reasons.append("SL distance valid")
-        else: score-=20; warnings.append("Invalid SL distance")
+        if abs(entry-sl)>0: score+=5; reasons.append("مسافة وقف الخسارة صالحة")
+        else: score-=20; warnings.append("مسافة وقف الخسارة غير صالحة")
     rr=abs(tp1-entry)/abs(entry-sl) if entry and tp1 and sl and abs(entry-sl)>0 else float(signal.get("risk_reward",0) or 0)
-    if rr>=2: score+=15; reasons.append("Risk reward acceptable")
-    elif rr<1: score-=8; warnings.append("Risk reward weak; advisory only")
-    if tp2 and tp1: reasons.append("TP structure validated")
-    for key,points,text in [("bos_confirmed",10,"BOS confirmed"),("choch_confirmed",8,"CHoCH confirmed"),("fvg_valid",8,"FVG valid"),("h4_aligned",10,"H4 trend aligned")]:
+    if rr>=2: score+=15; reasons.append("نسبة العائد إلى المخاطرة جيدة")
+    elif rr<1: score-=8; warnings.append("نسبة العائد إلى المخاطرة ضعيفة؛ ملاحظة استشارية فقط")
+    if tp2 and tp1: reasons.append("بنية الأهداف مؤكدة")
+    for key,points,text in [("bos_confirmed",10,"تأكيد BOS موجود"),("choch_confirmed",8,"تأكيد CHoCH موجود"),("fvg_valid",8,"FVG صالح"),("h4_aligned",10,"اتجاه H4 متوافق")]:
         if signal.get(key): score+=points; reasons.append(text)
-    if context.get("similar_trade_open"): score-=8; warnings.append("Similar active trade exists")
-    if context.get("near_major_zone"): score-=4; warnings.append("Near important price zone")
-    if context.get("live_quote_valid") is False: score-=30; warnings.append("Live quote unavailable")
-    if context.get("data_quality") not in (None,"OK","HISTORICAL_HEALTHY"): score-=15; warnings.append("Data quality warning")
+    if context.get("similar_trade_open"): score-=8; warnings.append("توجد صفقة مشابهة مفتوحة")
+    if context.get("near_major_zone"): score-=4; warnings.append("السعر قريب من منطقة مهمة")
+    if context.get("live_quote_valid") is False: score-=30; warnings.append("السعر اللحظي غير متاح")
+    if context.get("data_quality") not in (None,"OK","HISTORICAL_HEALTHY"): score-=15; warnings.append("تحذير في جودة البيانات")
     score=max(0,min(100,score)); decision="REJECT" if score<25 else "MODIFY" if score<55 else "APPROVE"; return TradeLawyerDecision(decision,score,reasons,warnings)
 
 @dataclass
@@ -48,7 +77,7 @@ def deterministic_active_advice(trade,market,management,review=None):
     if state=="INVALIDATED" or lifecycle=="REVERSE": return ActiveTradeLawyerAdvice("EXIT","URGENT",99,"الثيسس فقدت صلاحيتها أو ظهرت شروط انعكاس قوية؛ القرار النهائي يمر بمحرك المخاطر.","INVALIDATED",avoid_condition="لا تعزز قبل حسم الانعكاس.")
     if state=="TP1_REACHED": return ActiveTradeLawyerAdvice("PROTECT_PROFIT","HIGH",94,"تحقق TP1؛ الأفضل حماية الربح تدريجياً لا الإغلاق الكامل تلقائياً.","INTACT",recommended_sl=entry,recommended_tp1=tp1,recommended_tp2=tp2)
     if state=="UNDER_PRESSURE" or (r is not None and r<=-0.50): return ActiveTradeLawyerAdvice("REDUCE_RISK","HIGH",88,"الصفقة تحت ضغط واضح لكن ذلك لا يعني الخروج الفوري؛ لا توسع SL لإنقاذها.","STRESSED",add_condition="عودة البنية مع اتجاه الصفقة.",avoid_condition="عدم توسيع SL.")
-    if r is not None and r>=0.75 and risk_score>=ADD_SCORE_THRESHOLD and state=="ACTIVE": return ActiveTradeLawyerAdvice("ADD_ON_CONFIRMATION","MEDIUM",72,"يمكن التفكير بإضافة صغيرة فقط بعد pullback وتأكيد جديد، وليس بمطاردة السعر.","INTACT",add_condition="SMC confirmation جديد + RR مناسب.",avoid_condition="لا تضف بعد اندفاع ممتد.")
+    if r is not None and r>=0.75 and risk_score>=ADD_SCORE_THRESHOLD and state=="ACTIVE": return ActiveTradeLawyerAdvice("ADD_ON_CONFIRMATION","MEDIUM",72,"يمكن التفكير بإضافة صغيرة فقط بعد pullback وتأكيد جديد، وليس بمطاردة السعر.","INTACT",add_condition="تأكيد SMC جديد + RR مناسب.",avoid_condition="لا تضف بعد اندفاع ممتد.")
     return ActiveTradeLawyerAdvice("HOLD","LOW",80,"الثيسس ما زالت قابلة للحياة ولا يوجد سبب قوي للخروج أو التعزيز الفوري.","INTACT",recommended_sl=sl,recommended_tp1=tp1,recommended_tp2=tp2)
 
 def build_active_trade_prompt(trade,market,management,review,deterministic): return f'''أنت «محامي الصفقة» لصفقة XAU/USD مفتوحة. أنت مستشار مرن لا بوابة صارمة. HOLD هو الطبيعي ما دامت thesis سليمة. لا تخرج بسبب ضوضاء قصيرة، ولا توسع SL. بعد TP1 احمِ الربح تدريجياً. التعزيز مشروط بتأكيد جديد وعدم مطاردة السعر. EXIT/REVERSE فقط عند دليل واضح على invalidation. لا تخترع بيانات. الأفعال: HOLD, PROTECT_PROFIT, REDUCE_RISK, ADD_ON_CONFIRMATION, EXIT, PREPARE_REVERSAL.\n\nالحتمي: {json.dumps(deterministic.to_dict(),ensure_ascii=False)}\nالصفقة: {json.dumps(trade,ensure_ascii=False)}\nالسوق: {json.dumps(market,ensure_ascii=False)}\nالإدارة: {json.dumps(management,ensure_ascii=False)}\nالمراجعة: {json.dumps(review or {},ensure_ascii=False)}\n\nأرجع JSON فقط: {{"action":"HOLD","urgency":"LOW","confidence":80,"reason":"سبب عربي","thesis_status":"INTACT","recommended_sl":null,"recommended_tp1":null,"recommended_tp2":null,"add_condition":"","avoid_condition":""}}'''
@@ -69,10 +98,11 @@ def _get_bot_module(): return sys.modules.get("bot") or sys.modules.get("__main_
 def _lawyer_snapshot(bot):
     cache=getattr(bot,"GLOBAL_CACHE",{}); return {"advice":dict(cache.get("trade_lawyer") or {}) if isinstance(cache,dict) else {},"management":dict(cache.get("active_trade_management") or {}) if isinstance(cache,dict) else {}}
 def format_lawyer_message(snapshot):
-    advice=snapshot.get("advice") or {}; management=snapshot.get("management") or {}; action=str(advice.get("action") or "HOLD").upper(); labels={"HOLD":"الاحتفاظ بالصفقة","PROTECT_PROFIT":"حماية الأرباح","REDUCE_RISK":"تخفيف المخاطرة","ADD_ON_CONFIRMATION":"تعزيز مشروط","EXIT":"الخروج","PREPARE_REVERSAL":"الاستعداد للانعكاس"}; return f"🧑‍⚖️ **محامي الصفقة**\n───────────────────\n📌 **الحكم:** {labels.get(action,action)}\n⚡ **الاستعجال:** {advice.get('urgency','LOW')}\n🎯 **الثقة:** {advice.get('confidence','-')}%\n📊 **الحالة:** {management.get('state') or advice.get('thesis_status') or 'ACTIVE'}\n\n💡 **الرأي:** {advice.get('reason') or 'لا يوجد تغيير جوهري.'}\n🛡️ **تجنب:** {advice.get('avoid_condition') or 'لا يوجد.'}\n➕ **التعزيز:** {advice.get('add_condition') or 'لا يوجد.'}"
+    advice=snapshot.get("advice") or {}; management=snapshot.get("management") or {}; action=str(advice.get("action") or "HOLD").upper(); labels={"HOLD":"الاحتفاظ بالصفقة","PROTECT_PROFIT":"حماية الأرباح","REDUCE_RISK":"تخفيف المخاطرة","ADD_ON_CONFIRMATION":"تعزيز مشروط","EXIT":"الخروج","PREPARE_REVERSAL":"الاستعداد للانعكاس"}; return f"🧑‍⚖️ **محامي الصفقة**\n───────────────────\n📌 **الحكم:** {labels.get(action,action)}\n⚡ **الاستعجال:** {urgency_ar(advice.get('urgency'))}\n🎯 **الثقة:** {advice.get('confidence','-')}%\n📊 **الحالة:** {management.get('state') or advice.get('thesis_status') or 'نشطة'}\n\n💡 **الرأي:** {advice.get('reason') or 'لا يوجد تغيير جوهري.'}\n🛡️ **تجنب:** {advice.get('avoid_condition') or 'لا يوجد.'}\n➕ **التعزيز:** {advice.get('add_condition') or 'لا يوجد.'}"
 def _lawyer_keyboard():
     if InlineKeyboardButton is None or InlineKeyboardMarkup is None: return None
     return InlineKeyboardMarkup([[InlineKeyboardButton("🧑‍⚖️ استشر محامي الصفقة الآن",callback_data="trade_lawyer_now")],[InlineKeyboardButton("📰 آخر أخبار الذهب",callback_data="news_now")]])
+
 async def _lawyer_command(update,context):
     bot=_get_bot_module();
     if bot is None: return
@@ -83,23 +113,62 @@ async def _lawyer_command(update,context):
 async def _lawyer_callback(update,context):
     query=update.callback_query; await query.answer(); bot=_get_bot_module()
     if bot is not None: await query.message.reply_text(format_lawyer_message(_lawyer_snapshot(bot)),reply_markup=_lawyer_keyboard(),parse_mode="Markdown")
+
+async def _news_response(update, bot):
+    decision=_news_context(bot); cache=getattr(bot,"GLOBAL_CACHE",{}); latest=(cache.get("latest_news") or []) if isinstance(cache,dict) else []
+    if decision:
+        text=(f"📰 **ذكاء أخبار الذهب اللحظي**\n\n"
+              f"📌 **القرار:** {news_action_ar(decision.action)}\n"
+              f"🧭 **الاتجاه:** {direction_ar(decision.direction)}\n"
+              f"🎯 **التأثير:** {decision.impact}/100\n"
+              f"⚡ **الاستعجال:** {urgency_ar(decision.urgency)}\n\n"
+              f"💡 **التحليل:** {decision.reason}")
+    elif latest:
+        lines=[]
+        for item in latest[:5]:
+            lines.append(f"• {item.get('title','')} — {direction_ar(item.get('direction'))} — تأثير {item.get('impact','-')}/100")
+        text="📰 **آخر أخبار الذهب**\n\n"+"\n".join(lines)
+    else:
+        text="📰 لا يوجد حالياً خبر جديد مؤثر تم التقاطه."
+    await bot.safe_reply_text(update,text,reply_markup=_lawyer_keyboard(),parse_mode="Markdown")
+
 async def _news_command(update,context):
     bot=_get_bot_module();
     if bot is None: return
     if hasattr(bot,"is_authenticated") and not bot.is_authenticated(update.effective_chat.id): await bot.safe_reply_text(update,"🔒 يرجى تسجيل الدخول أولاً."); return
-    decision=_news_context(bot); cache=getattr(bot,"GLOBAL_CACHE",{}); latest=(cache.get("latest_news") or []) if isinstance(cache,dict) else []
-    if decision: text=f"📰 **ذكاء الأخبار اللحظي**\n\n📌 **القرار:** {decision.action}\n🎯 **التأثير:** {decision.impact}/100\n⚡ **الاستعجال:** {decision.urgency}\n\n💡 {decision.reason}"
-    elif latest: text="📰 **آخر الأخبار**\n\n"+"\n".join(f"• {item.get('title','')}" for item in latest[:5])
-    else: text="📰 لا يوجد حالياً خبر جديد مؤثر تم التقاطه."
-    await bot.safe_reply_text(update,text,reply_markup=_lawyer_keyboard(),parse_mode="Markdown")
+    await _news_response(update, bot)
 async def _news_callback(update,context):
     query=update.callback_query; await query.answer(); bot=_get_bot_module()
     if bot is None: return
-    decision=_news_context(bot); cache=getattr(bot,"GLOBAL_CACHE",{}); latest=(cache.get("latest_news") or []) if isinstance(cache,dict) else []
-    if decision: text=f"📰 **ذكاء الأخبار اللحظي**\n\n📌 **القرار:** {decision.action}\n🎯 **التأثير:** {decision.impact}/100\n⚡ **الاستعجال:** {decision.urgency}\n\n💡 {decision.reason}"
-    elif latest: text="📰 **آخر الأخبار**\n\n"+"\n".join(f"• {item.get('title','')}" for item in latest[:5])
-    else: text="📰 لا يوجد حالياً خبر جديد مؤثر تم التقاطه."
-    await query.message.reply_text(text,reply_markup=_lawyer_keyboard(),parse_mode="Markdown")
+    await _news_response(query, bot)
+
+async def _lawyer_button_message(update, context):
+    bot=_get_bot_module()
+    if bot is not None: await _lawyer_command(update, context)
+async def _news_button_message(update, context):
+    bot=_get_bot_module()
+    if bot is not None: await _news_command(update, context)
+
+def _install_main_keyboard(bot, app):
+    if getattr(bot,"_arabic_news_lawyer_ui_installed",False): return True
+    if ReplyKeyboardMarkup is None or KeyboardButton is None: return False
+    original=getattr(bot,"get_main_keyboard",None)
+    if original is not None and not getattr(original,"_arabic_news_lawyer_patch",False):
+        def patched_keyboard(*args,**kwargs):
+            markup=original(*args,**kwargs)
+            rows=list(getattr(markup,"keyboard",[]) or [])
+            rows.append([KeyboardButton("🧑‍⚖️ محامي الصفقة"), KeyboardButton("📰 أخبار الذهب")])
+            return ReplyKeyboardMarkup(rows,resize_keyboard=True,is_persistent=True)
+        patched_keyboard._arabic_news_lawyer_patch=True
+        bot.get_main_keyboard=patched_keyboard
+    if app is not None and MessageHandler is not None and filters is not None and not getattr(app,"_arabic_news_lawyer_handlers",False):
+        # Negative group guarantees these Arabic buttons are handled before the generic text router.
+        app.add_handler(MessageHandler(filters.Regex(r"^🧑‍⚖️ محامي الصفقة$"), _lawyer_button_message), group=-10)
+        app.add_handler(MessageHandler(filters.Regex(r"^📰 أخبار الذهب$"), _news_button_message), group=-10)
+        app._arabic_news_lawyer_handlers=True
+    bot._arabic_news_lawyer_ui_installed=True
+    return True
+
 async def _broadcast_lawyer_update(app,bot,snapshot):
     if not hasattr(bot,"get_subscribers"): return
     for uid in bot.get_subscribers():
@@ -107,11 +176,15 @@ async def _broadcast_lawyer_update(app,bot,snapshot):
             if hasattr(bot,"is_authenticated") and not bot.is_authenticated(uid): continue
             await bot.safe_send_message(app.bot,chat_id=uid,text=format_lawyer_message(snapshot),parse_mode="Markdown",reply_markup=_lawyer_keyboard())
         except Exception: pass
+
 def install_telegram_trade_lawyer(app,bot):
-    if getattr(app,"_trade_lawyer_handlers_installed",False): return
-    if CommandHandler is not None: app.add_handler(CommandHandler("lawyer",_lawyer_command)); app.add_handler(CommandHandler("news",_news_command))
-    if CallbackQueryHandler is not None: app.add_handler(CallbackQueryHandler(_lawyer_callback,pattern=r"^trade_lawyer_now$")); app.add_handler(CallbackQueryHandler(_news_callback,pattern=r"^news_now$"))
-    app._trade_lawyer_handlers_installed=True
+    if not getattr(app,"_trade_lawyer_handlers_installed",False):
+        if CommandHandler is not None:
+            app.add_handler(CommandHandler("lawyer",_lawyer_command)); app.add_handler(CommandHandler("news",_news_command))
+        if CallbackQueryHandler is not None:
+            app.add_handler(CallbackQueryHandler(_lawyer_callback,pattern=r"^trade_lawyer_now$")); app.add_handler(CallbackQueryHandler(_news_callback,pattern=r"^news_now$"))
+        app._trade_lawyer_handlers_installed=True
+    _install_main_keyboard(bot,app)
 
 _news=NewsIntelligence(); _news_last_signature=None; _news_last_notification=0.0; _news_last_poll=0.0
 
@@ -140,7 +213,7 @@ def _news_candidate(bot,decision):
     price=_price(bot)
     if not price or decision.action not in {"NEWS_BUY","NEWS_SELL"}: return None
     risk_pct=float(os.getenv("NEWS_ENTRY_RISK_PCT","0.0015")); tp1_pct=float(os.getenv("NEWS_ENTRY_TP1_PCT","0.0025")); tp2_pct=float(os.getenv("NEWS_ENTRY_TP2_PCT","0.0040")); buy=decision.action=="NEWS_BUY"; sl=price*(1-risk_pct) if buy else price*(1+risk_pct); tp1=price*(1+tp1_pct) if buy else price*(1-tp1_pct); tp2=price*(1+tp2_pct) if buy else price*(1-tp2_pct)
-    return {"status":"SIGNAL","type":"📰 شراء خبري فوري" if buy else "📰 بيع خبري فوري","direction":"BUY" if buy else "SELL","entry":price,"sl":sl,"tp1":tp1,"tp2":tp2,"confidence":decision.confidence,"smc_note":f"News Intelligence: {decision.reason}","news_driven":True,"news_impact":decision.impact,"news_urgency":decision.urgency,"reason":"إشارة خبرية مؤكدة بحركة السعر."}
+    return {"status":"SIGNAL","type":"📰 شراء خبري فوري" if buy else "📰 بيع خبري فوري","direction":"BUY" if buy else "SELL","entry":price,"sl":sl,"tp1":tp1,"tp2":tp2,"confidence":decision.confidence,"smc_note":f"ذكاء أخبار الذهب: {decision.reason}","news_driven":True,"news_impact":decision.impact,"news_urgency":decision.urgency,"reason":"إشارة خبرية مؤكدة بحركة السعر."}
 def get_live_news_context(bot,active_direction=None): return _news_context(bot,active_direction)
 def get_news_candidate(bot,decision): return _news_candidate(bot,decision)
 
@@ -179,7 +252,7 @@ def _news_worker():
                 if decision and isinstance(getattr(bot,"GLOBAL_CACHE",None),dict):
                     bot.GLOBAL_CACHE["news_decision"]=asdict(decision); sig=(decision.action,decision.direction,decision.impact)
                     if app and sig!=_news_last_signature and time.monotonic()-_news_last_notification>=NEWS_NOTIFICATION_MIN_SECONDS and hasattr(bot,"get_subscribers"):
-                        text=f"📰 **ذكاء الأخبار**\n\n📌 {decision.action}\n🎯 التأثير على الذهب: {decision.impact}/100\n⚡ الاستعجال: {decision.urgency}\n\n💡 {decision.reason}"
+                        text=(f"📰 **ذكاء أخبار الذهب**\n\n📌 **القرار:** {news_action_ar(decision.action)}\n🧭 **الاتجاه:** {direction_ar(decision.direction)}\n🎯 **التأثير على الذهب:** {decision.impact}/100\n⚡ **الاستعجال:** {urgency_ar(decision.urgency)}\n\n💡 **التحليل:** {decision.reason}")
                         if hasattr(app,"create_task"):
                             for uid in bot.get_subscribers():
                                 try: app.create_task(bot.safe_send_message(app.bot,chat_id=uid,text=text,parse_mode="Markdown",reply_markup=_lawyer_keyboard()))
