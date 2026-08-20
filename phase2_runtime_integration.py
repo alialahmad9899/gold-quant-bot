@@ -109,7 +109,7 @@ class Phase2RuntimeIntegration:
         try: return list(getattr(self.bot, "get_recent_gemini_insights")())
         except Exception: return []
 
-    def _record_direction(self, result: dict) -> None:
+    def _record_direction(self, result: dict, outcome: str = "candidate") -> None:
         direction = self._direction(result.get("type"))
         if not direction: return
         self._direction_history.append(direction); self._direction_history = self._direction_history[-8:]; streak = 1
@@ -117,7 +117,14 @@ class Phase2RuntimeIntegration:
             if prior != direction: break
             streak += 1
         cache = getattr(self.bot, "GLOBAL_CACHE", None)
-        if isinstance(cache, dict): cache["direction_history"] = list(self._direction_history); cache["direction_streak"] = {"direction": direction, "count": streak}; cache["direction_bias_warning"] = streak >= 3
+        if isinstance(cache, dict):
+            cache["direction_history"] = list(self._direction_history)
+            cache["direction_streak"] = {"direction": direction, "count": streak}
+            cache["direction_bias_warning"] = streak >= 3
+        try:
+            from production_hardening import record_direction
+            record_direction(self.bot, direction, outcome, str(result.get("candle_id") or ""))
+        except Exception: pass
 
     def institutional_review(self, signal: dict, market_summary: dict, smc: dict) -> TradeReviewResult:
         lessons = self._lessons(); review = review_trade(signal, market_summary, lessons=lessons, smc=smc); use_ai = os.getenv("INSTITUTIONAL_GEMINI_REVIEW", "1") == "1"; executor = getattr(self.bot, "execute_gemini_dynamic_request", None)
@@ -143,13 +150,18 @@ class Phase2RuntimeIntegration:
                 result = candidate
                 if isinstance(cache, dict): cache.pop("news_candidate", None)
             else: return result
+        self._record_direction(result, "candidate")
         market_summary, smc = self._collect_market_context(result); institutional = self.institutional_review(result, market_summary, smc)
         result["institutional_review"] = institutional.to_dict(); result["risk_score"] = institutional.risk_score; result["risk_decision"] = institutional.decision; result["risk_regime"] = institutional.regime
-        if not institutional.approved and institutional.decision != "MODIFY": return {"status": "WAIT", "reason": f"فيتو مدير المخاطر المؤسسي: {institutional.reason}", "price": result.get("entry", 0.0), "institutional_review": institutional.to_dict()}
+        if not institutional.approved and institutional.decision != "MODIFY":
+            self._record_direction(result, "rejected")
+            return {"status": "WAIT", "reason": f"فيتو مدير المخاطر المؤسسي: {institutional.reason}", "price": result.get("entry", 0.0), "institutional_review": institutional.to_dict()}
         if institutional.decision == "MODIFY" and os.getenv("INSTITUTIONAL_BLOCK_MODIFY", "0") != "1": result["risk_decision"] = "APPROVE_WITH_CAUTION"
         thesis = self.build_trade_thesis(result, market_summary, smc)
-        if not self.manager.open_trade(thesis): return {"status": "WAIT", "reason": "تم منع الإشارة بسبب قفل الصفقة النشطة في Phase 2.", "price": result.get("entry", 0.0), "institutional_review": institutional.to_dict()}
-        self._record_direction(result); result["phase2_state"] = "ACTIVE"; result["phase2_thesis_logged"] = True; return result
+        if not self.manager.open_trade(thesis):
+            self._record_direction(result, "position_lock")
+            return {"status": "WAIT", "reason": "تم منع الإشارة بسبب قفل الصفقة النشطة في Phase 2.", "price": result.get("entry", 0.0), "institutional_review": institutional.to_dict()}
+        self._record_direction(result, "accepted"); result["phase2_state"] = "ACTIVE"; result["phase2_thesis_logged"] = True; return result
 
     def _wrapped_monitor(self, *args, **kwargs):
         result = self._original_monitor(*args, **kwargs)
@@ -162,6 +174,11 @@ class Phase2RuntimeIntegration:
         if self._original_has_active is None or self._original_generate is None: raise AttributeError("Phase 2 integration requires signal pipeline functions")
         self.bot.has_active_open_trade = self._wrapped_has_active; self.bot.generate_quant_signal = self._wrapped_generate
         if self._original_monitor is not None: self.bot.monitor_open_trades = self._wrapped_monitor
+        try:
+            from production_hardening import start as start_hardening
+            start_hardening(self.bot)
+        except Exception as exc:
+            getattr(self.bot, "logger", None) and self.bot.logger.warning("Production hardening bootstrap deferred: %s", exc)
         self._reconcile_ledger(); self._installed = True; return self
 
 
