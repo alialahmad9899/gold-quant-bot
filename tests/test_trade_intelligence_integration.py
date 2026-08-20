@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 from phase2_runtime_integration import Phase2RuntimeIntegration
 from trade_intelligence import TradeIntelligence, TradeState
 from trade_state_store import TradeStateStore
@@ -12,6 +10,9 @@ class FakeBot:
         self.generate_calls = 0
         self.monitor_calls = 0
         self.market_price = 3001.0
+        self.h4_trend = "BULLISH"
+        self.state_label = "BULLISH"
+        self.smc = {"fvg_bullish": True, "sweep_bullish": True}
 
         def has_active_open_trade(signal_type):
             return self._open
@@ -51,9 +52,9 @@ class FakeBot:
 
         def analyze_institutional_engine():
             return {
-                "h4_trend": "BULLISH",
-                "state_label": "BULLISH",
-                "smc": {"fvg_bullish": True, "sweep_bullish": True},
+                "h4_trend": self.h4_trend,
+                "state_label": self.state_label,
+                "smc": dict(self.smc),
             }
 
         self.analyze_institutional_engine = analyze_institutional_engine
@@ -69,6 +70,7 @@ def test_signal_pipeline_registers_trade_thesis_and_locks_opposite_direction(tmp
     assert first["phase2_state"] == "ACTIVE"
     assert first["phase2_thesis_logged"] is True
     assert manager.active_trade.thesis.direction == "BUY"
+    assert manager.active_trade.thesis.h4_trend == "BULLISH"
     assert manager.active_trade.thesis.structure["smc_note"] == "تأكيد صاعد"
 
     second = bot.generate_quant_signal()
@@ -78,10 +80,10 @@ def test_signal_pipeline_registers_trade_thesis_and_locks_opposite_direction(tmp
     assert bridge.manager.has_active_trade()
 
 
-def test_runtime_review_marks_tp1_and_reconciles_final_ledger_close(tmp_path):
+def test_runtime_review_reconciles_final_ledger_close(tmp_path):
     bot = FakeBot(tmp_path / "unused.json")
     manager = TradeIntelligence(TradeStateStore(str(tmp_path / "state.json")))
-    bridge = Phase2RuntimeIntegration(bot, manager).install()
+    Phase2RuntimeIntegration(bot, manager).install()
 
     result = bot.generate_quant_signal()
     assert result["status"] == "SIGNAL"
@@ -98,5 +100,23 @@ def test_dynamic_management_is_exposed_on_bot_cache(tmp_path):
     bot.generate_quant_signal()
 
     bot.market_price = 3010.5
-    bot.monitor_open_trades()
-    assert "active_trade_management" in bot.GLOBAL_CACHE
+    result = bot.monitor_open_trades()
+    assert result is None
+    assert bot.GLOBAL_CACHE["active_trade_management"]["state"] == TradeState.TP1_REACHED.value
+
+
+def test_invalidation_and_reversal_are_derived_from_existing_market_analysis(tmp_path):
+    bot = FakeBot(tmp_path / "unused.json")
+    manager = TradeIntelligence(TradeStateStore(str(tmp_path / "state.json")))
+    bridge = Phase2RuntimeIntegration(bot, manager).install()
+    bot.generate_quant_signal()
+
+    bot.h4_trend = "BEARISH"
+    bot.state_label = "BEARISH"
+    bot.smc = {"fvg_bearish": True, "sweep_bearish": True}
+    bot.market_price = 2997.0
+    result = bridge.review_active_trade()
+
+    assert result["decision"] == "REVERSE"
+    assert result["state"] == TradeState.INVALIDATED.value
+    assert result["management"]["reverse_candidate"] is True
