@@ -1,0 +1,1 @@
+Temporary trigger for the post-merge Telegram UI patch. This file is safe to remove after the patch runs.
