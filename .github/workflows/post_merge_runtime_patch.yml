@@ -1,0 +1,96 @@
+name: Post-merge runtime patch
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Apply runtime fixes
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('bot.py'); s=p.read_text(encoding='utf-8')
+          kb='''def get_main_keyboard():
+    keyboard = [
+        [KeyboardButton("⚡ إشارة فورية"), KeyboardButton("🧠 تحليل بنية السوق")],
+        [KeyboardButton("💡 معلومات من الذكاء الاصطناعي"), KeyboardButton("📊 الأسعار اللحظية")],
+        [KeyboardButton("📈 إحصائيات النظام"), KeyboardButton("📉 اختبار الاستراتيجية العكسي")],
+        [KeyboardButton("🔍 فحص الأخطاء الشامل"), KeyboardButton("🧹 تصفير البيانات")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+'''
+          kb2=kb.replace('        [KeyboardButton("🔍 فحص الأخطاء الشامل"), KeyboardButton("🧹 تصفير البيانات")]','        [KeyboardButton("🔍 فحص الأخطاء الشامل"), KeyboardButton("🧹 تصفير البيانات")],\n        [KeyboardButton("🧑‍⚖️ محامي الصفقة"), KeyboardButton("📰 أخبار الذهب")]')
+          if kb in s: s=s.replace(kb,kb2,1)
+          h='''    elif "تصفير البيانات" in text or text == "/reset_all":
+        await reset_all_data(update, context)
+    else:
+'''
+          h2='''    elif "تصفير البيانات" in text or text == "/reset_all":
+        await reset_all_data(update, context)
+    elif text == "🧑‍⚖️ محامي الصفقة":
+        from trade_lawyer import _lawyer_command
+        await _lawyer_command(update, context)
+    elif text == "📰 أخبار الذهب":
+        from trade_lawyer import _news_command
+        await _news_command(update, context)
+    else:
+'''
+          if h in s: s=s.replace(h,h2,1)
+          old='''        if not ema200.empty and not ema500.empty:
+            h4_trend = "BULLISH" if ema200.iloc[-1] > ema500.iloc[-1] else "BEARISH"
+        else:
+            h4_trend = "BULLISH" if close_h1.iloc[-1] > close_h1.iloc[-20] else "BEARISH"
+'''
+          new='''        close_h4 = close_h1.resample("4h", label="right", closed="right").last().dropna()
+        if len(close_h4) >= 220:
+            h4_ema50 = ta.trend.EMAIndicator(close_h4, window=50).ema_indicator().dropna()
+            h4_ema200 = ta.trend.EMAIndicator(close_h4, window=200).ema_indicator().dropna()
+            h4_trend = "BULLISH" if h4_ema50.iloc[-1] > h4_ema200.iloc[-1] else "BEARISH"
+        elif len(close_h4) >= 60:
+            h4_ema20 = ta.trend.EMAIndicator(close_h4, window=20).ema_indicator().dropna()
+            h4_ema50 = ta.trend.EMAIndicator(close_h4, window=50).ema_indicator().dropna()
+            h4_trend = "BULLISH" if h4_ema20.iloc[-1] > h4_ema50.iloc[-1] else "BEARISH"
+        elif len(close_h4) >= 2:
+            h4_trend = "BULLISH" if close_h4.iloc[-1] > close_h4.iloc[-2] else "BEARISH"
+        else:
+            h4_trend = "BULLISH" if close_h1.iloc[-1] > close_h1.iloc[-20] else "BEARISH"
+'''
+          if old in s: s=s.replace(old,new,1)
+          old='''    app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
+    app.add_error_handler(error_handler)
+'''
+          new='''    app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
+    globals()["app"] = app
+    try:
+        from phase2_runtime_integration import Phase2RuntimeIntegration
+        _phase2_runtime = Phase2RuntimeIntegration(sys.modules[__name__]).install()
+    except Exception as exc:
+        logger.exception("Phase 2 runtime installation failed: %s", exc)
+    try:
+        from trade_lawyer import install_telegram_trade_lawyer
+        install_telegram_trade_lawyer(app, sys.modules[__name__])
+    except Exception as exc:
+        logger.exception("Trade Lawyer Telegram handlers installation failed: %s", exc)
+    app.add_error_handler(error_handler)
+'''
+          if old in s: s=s.replace(old,new,1)
+          p.write_text(s,encoding='utf-8')
+          PY
+      - name: Verify and commit
+        run: |
+          python -m py_compile bot.py trade_lawyer.py phase2_runtime_integration.py
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add bot.py .github/workflows/post_merge_runtime_patch.yml
+          git diff --cached --quiet || (git commit -m 'Apply post-merge runtime UI and H4 direction fixes' && git push)
