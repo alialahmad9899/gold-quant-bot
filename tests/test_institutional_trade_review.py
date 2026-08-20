@@ -78,7 +78,7 @@ def test_ai_cannot_override_deterministic_hard_veto():
 def test_ai_adversarial_rejection_can_veto_clean_deterministic_trade():
     result = review_trade(good_buy(), bullish_market(), lessons=[], smc={"bos_bullish": True, "fvg_bullish": True, "sweep_bullish": True})
     assert result.approved is True
-    merged = apply_ai_review(result, {"approved": False, "decision": "REJECT", "reason": "وجدت احتمال fake breakout")
+    merged = apply_ai_review(result, {"approved": False, "decision": "REJECT", "reason": "وجدت احتمال fake breakout"})
     assert merged.approved is False
     assert merged.decision == "REJECT"
     assert merged.reason == "وجدت احتمال fake breakout"
