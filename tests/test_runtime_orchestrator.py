@@ -15,15 +15,16 @@ def _h1_frame(rows=1000):
     }, index=idx)
 
 
-def test_h1_history_request_is_upgraded_to_1000():
+def test_xau_h1_history_request_is_upgraded_to_1000():
     url = "https://api.twelvedata.com/time_series?symbol=XAU%2FUSD&interval=1h&outputsize=150&apikey=test"
+    assert ro._is_xau_h1_url(url) is True
     upgraded = ro._upgrade_h1_outputsize(url)
     assert "outputsize=1000" in upgraded
 
 
-def test_non_xau_or_non_h1_requests_are_unchanged():
+def test_non_xau_or_non_h1_request_is_not_selected_for_upgrade():
     dxy = "https://api.twelvedata.com/time_series?symbol=DXY&interval=15min&outputsize=120&apikey=test"
-    assert ro._upgrade_h1_outputsize(dxy) == dxy
+    assert ro._is_xau_h1_url(dxy) is False
 
 
 def test_h4_resample_produces_enough_bars_for_ema_200():
@@ -40,9 +41,10 @@ def test_existing_phase2_wrapper_is_detected_without_stacking():
     class Phase2RuntimeIntegration:
         pass
 
-    class FakeBot:
-        def __init__(self):
-            self.generate_quant_signal = Phase2RuntimeIntegration().install if hasattr(Phase2RuntimeIntegration, "install") else None
+    class Bound:
+        __self__ = Phase2RuntimeIntegration()
 
-    fake = FakeBot()
-    assert ro._existing_phase2(fake) is None
+    class FakeBot:
+        generate_quant_signal = Bound()
+
+    assert ro._existing_phase2(FakeBot()).__class__.__name__ == "Phase2RuntimeIntegration"
