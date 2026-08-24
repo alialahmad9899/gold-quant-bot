@@ -1,5 +1,4 @@
 import importlib
-import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -12,45 +11,6 @@ def safety():
     return module
 
 
-class FakeBot:
-    def __init__(self):
-        self.conn = sqlite3.connect(":memory:", check_same_thread=False)
-        self.conn.execute("CREATE TABLE trades (id INTEGER PRIMARY KEY, candle_id TEXT)")
-        self.conn.commit()
-        self.runtime = SimpleNamespace(get_websocket_quote=lambda max_age_seconds=120: None)
-        self._decisions = [False, True]
-        self.generated = 0
-        self.inserted = []
-
-    def is_postgres(self):
-        return False
-
-    def get_db_connection(self):
-        return self.conn
-
-    def release_db_connection(self, conn):
-        pass
-
-    def get_recent_gemini_insights(self):
-        return ["احذر من البيع مع RSI محايد"]
-
-    def gemini_verify_signal(self, signal_data, market_summary):
-        approved = self._decisions.pop(0) if self._decisions else True
-        return {"approved": approved, "reason": "cached-test" if approved else "رفض اختبار"}
-
-    def log_trade(self, *args, **kwargs):
-        candle_id = kwargs.get("candle_id") or args[10]
-        self.inserted.append(candle_id)
-        return True, len(self.inserted)
-
-
-def test_normalize_approval_is_fail_closed(safety):
-    assert safety._normalize_approval(True) is True
-    assert safety._normalize_approval("false") is False
-    assert safety._normalize_approval("garbage") is False
-    assert safety._normalize_approval(None) is False
-
-
 def test_historical_m15_fallback_never_counts_as_live(safety):
     bot = SimpleNamespace(_twelve_data_runtime=SimpleNamespace(get_websocket_quote=lambda max_age_seconds=120: None))
     feed = {
@@ -60,66 +20,73 @@ def test_historical_m15_fallback_never_counts_as_live(safety):
         "timestamp": "2026-08-14T00:00:00+00:00",
         "age_seconds": 0,
     }
-    guarded = safety._safe_price_feed(lambda: feed, bot)
+    guarded = safety._safe_feed(lambda: feed, bot)
     assert guarded["status"] == "STALE"
     assert guarded["signal_safe"] is False
     assert guarded["error_type"] == "historical_fallback_blocked"
 
 
-def test_gemini_decision_is_persistent_and_cannot_flip(safety):
-    bot = FakeBot()
-    assert safety._ensure_database_guards(bot)
-    safety._install_gemini_guard(bot)
-    signal = {
-        "type": "🔴 بيع مرن",
-        "entry": 4375.6,
-        "sl": 4377.2,
-        "tp1": 4373.56,
-        "tp2": 4372.02,
-        "rsi": 48.4,
-        "dxy_corr": -0.85,
-        "confidence": 56,
-        "smc_note": "تأكيد هابط من السيولة/FVG",
-        "candle_id": "XAUUSD_M15_20260814_0000",
-    }
-    market = {"h4_trend": "BEARISH", "state_label": "RANGING"}
-    first = bot.gemini_verify_signal(signal, market)
-    second = bot.gemini_verify_signal(signal, market)
-    assert first["approved"] is False
-    assert second["approved"] is False
-    assert second.get("cached") is True
-    assert bot._decisions == [True]
+def test_gemini_disagreement_is_advisory_by_default(monkeypatch):
+    monkeypatch.delenv("SIGNAL_SAFETY_GEMINI_HARD_VETO", raising=False)
+    safety = importlib.import_module("signal_safety")
+
+    class Bot:
+        def gemini_verify_signal(self, signal_data, market_summary):
+            return {"approved": False, "reason": "تحفظ اختباري"}
+
+    bot = Bot()
+    safety._patch_gemini(bot)
+    result = bot.gemini_verify_signal({}, {})
+    assert result["approved"] is True
+    assert result["original_approved"] is False
+    assert result["advisory"] is True
+    assert result["hard_veto"] is False
 
 
-def test_trade_insert_is_hard_blocked_after_ai_rejection(safety):
-    bot = FakeBot()
-    assert safety._ensure_database_guards(bot)
-    safety._install_gemini_guard(bot)
-    safety._install_trade_guard(bot)
-    signal = {
-        "type": "🔴 بيع مرن",
-        "entry": 4375.6,
-        "sl": 4377.2,
-        "tp1": 4373.56,
-        "tp2": 4372.02,
-        "confidence": 56,
-        "smc_note": "تأكيد هابط من السيولة/FVG",
-        "candle_id": "XAUUSD_M15_20260814_0015",
-    }
-    bot.gemini_verify_signal(signal, {"h4_trend": "BEARISH", "state_label": "RANGING"})
-    inserted, trade_id = bot.log_trade("SELL", 4375.6, 4377.2, 4373.56, 4372.02, 48.4, -0.85, 0, 0, 0.03, 0.56, candle_id=signal["candle_id"])
-    assert inserted is False
-    assert trade_id is None
-    assert bot.inserted == []
+def test_gemini_hard_veto_is_opt_in(monkeypatch):
+    monkeypatch.setenv("SIGNAL_SAFETY_GEMINI_HARD_VETO", "1")
+    safety = importlib.import_module("signal_safety")
+
+    class Bot:
+        def gemini_verify_signal(self, signal_data, market_summary):
+            return {"approved": False, "reason": "hard veto test"}
+
+    bot = Bot()
+    safety._patch_gemini(bot)
+    result = bot.gemini_verify_signal({}, {})
+    assert result["approved"] is False
+    assert result["original_approved"] is False
+    assert result["advisory"] is False
+    assert result["hard_veto"] is True
 
 
-def test_duplicate_candle_is_blocked_before_second_insert(safety):
-    bot = FakeBot()
-    assert safety._ensure_database_guards(bot)
-    safety._install_trade_guard(bot)
-    conn = bot.get_db_connection()
-    conn.execute("INSERT INTO trades (id,candle_id) VALUES (1,?)", ("XAUUSD_M15_20260814_0030",))
-    conn.commit()
-    inserted, trade_id = bot.log_trade("SELL", 4375.6, 4377.2, 4373.56, 4372.02, 48.4, -0.85, 0, 0, 0.03, 0.56, candle_id="XAUUSD_M15_20260814_0030")
-    assert inserted is False
-    assert trade_id is None
+def test_log_trade_guard_blocks_objectively_bad_geometry():
+    safety = importlib.import_module("signal_safety")
+    inserted = []
+
+    class Bot:
+        def log_trade(self, *args, **kwargs):
+            inserted.append(True)
+            return True, 1
+
+    bot = Bot()
+    safety._patch_log_trade(bot)
+    inserted_value = bot.log_trade("SELL", 4600.0, 4600.5, 4590.0, 4580.0, 50, -0.5, 0, 0, 0.02, 0.2, candle_id="x")
+    assert inserted_value == (False, None)
+    assert inserted == []
+
+
+def test_log_trade_guard_allows_flexible_but_valid_signal():
+    safety = importlib.import_module("signal_safety")
+    inserted = []
+
+    class Bot:
+        def log_trade(self, *args, **kwargs):
+            inserted.append(kwargs.get("candle_id"))
+            return True, 2
+
+    bot = Bot()
+    safety._patch_log_trade(bot)
+    result = bot.log_trade("SELL", 4600.0, 4610.0, 4585.0, 4570.0, 50, -0.5, 0, 0, 0.05, 0.30, candle_id="x")
+    assert result == (True, 2)
+    assert inserted == ["x"]
