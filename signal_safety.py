@@ -3,8 +3,8 @@
 Hard safety is limited to stale/invalid execution data and objectively invalid
 trade geometry. Gemini is advisory by default and the canonical decision layer
 owns the final policy. News runtime is started independently for timestamped
-reaction tracking and event clustering. The execution bridge persists final
-signals for Trade Lawyer and performance statistics.
+reaction tracking and event clustering. Execution, diagnostics, and Telegram
+routing are installed as separate production bridges.
 """
 from __future__ import annotations
 import logging, os, threading
@@ -13,7 +13,7 @@ from typing import Any
 try:
     import psycopg2
 except Exception:
-    psycopg2 = None
+    psycopg2=None
 LOGGER=logging.getLogger("XAUUSD_QuantBot.SignalSafety")
 _LOCK=threading.RLock(); _INSTALLED=False
 MAX_SIGNAL_FEED_AGE_SECONDS=float(os.getenv("SIGNAL_MAX_PRICE_AGE_SECONDS","120")); GEMINI_HARD_VETO=os.getenv("SIGNAL_SAFETY_GEMINI_HARD_VETO","0") == "1"; MIN_CONFIDENCE=float(os.getenv("FINAL_MIN_CONFIDENCE","0.25")); MIN_RR=float(os.getenv("FINAL_MIN_RR","1.20")); MIN_STOP_PCT=float(os.getenv("FINAL_MIN_STOP_PCT","0.00120"))
@@ -88,4 +88,7 @@ def install_signal_safety(bot:Any|None=None):
         try:
             import execution_bridge; execution_bridge.install(bot); bot._execution_bridge=execution_bridge
         except Exception as exc: LOGGER.exception("❌ Execution bridge installation failed: %s",exc)
-        _INSTALLED=True; LOGGER.info("✅ Canonical safety installed: decision + news + diagnostics + execution bridges active.")
+        try:
+            import telegram_ui_fix; telegram_ui_fix.install(bot); bot._telegram_ui_fix=telegram_ui_fix
+        except Exception as exc: LOGGER.exception("❌ Telegram UI hardening installation failed: %s",exc)
+        _INSTALLED=True; LOGGER.info("✅ Canonical safety installed: decision + news + diagnostics + execution + Telegram UI bridges active.")
