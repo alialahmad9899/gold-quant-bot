@@ -16,7 +16,7 @@ except Exception:
     psycopg2=None
 LOGGER=logging.getLogger("XAUUSD_QuantBot.SignalSafety")
 _LOCK=threading.RLock(); _INSTALLED=False
-MAX_SIGNAL_FEED_AGE_SECONDS=float(os.getenv("SIGNAL_MAX_PRICE_AGE_SECONDS","120")); GEMINI_HARD_VETO=os.getenv("SIGNAL_SAFETY_GEMINI_HARD_VETO","0") == "1"; MIN_CONFIDENCE=float(os.getenv("FINAL_MIN_CONFIDENCE","0.25")); MIN_RR=float(os.getenv("FINAL_MIN_RR","1.20")); MIN_STOP_PCT=float(os.getenv("FINAL_MIN_STOP_PCT","0.00120"))
+MAX_SIGNAL_FEED_AGE_SECONDS=float(os.getenv("SIGNAL_MAX_PRICE_AGE_SECONDS","120")); MIN_CONFIDENCE=float(os.getenv("FINAL_MIN_CONFIDENCE","0.25")); MIN_RR=float(os.getenv("FINAL_MIN_RR","1.20")); MIN_STOP_PCT=float(os.getenv("FINAL_MIN_STOP_PCT","0.00120"))
 
 def _parse_dt(value):
     try:
@@ -47,12 +47,13 @@ def _patch_feed(bot):
 def _patch_gemini(bot):
     original=getattr(bot,"gemini_verify_signal",None)
     if original is None or getattr(original,"_canonical_safety",False): return
+    hard_veto=os.getenv("SIGNAL_SAFETY_GEMINI_HARD_VETO","0")=="1"
     def advisory(signal_data,market_summary):
         try: raw=original(signal_data,market_summary)
         except Exception as exc: raw={"approved":False,"reason":f"تعذر تنفيذ مراجعة Gemini: {type(exc).__name__}: {exc}"}
         if not isinstance(raw,dict): raw={"approved":False,"reason":"رد Gemini غير صالح."}
         original_approved=bool(raw.get("approved",False)); reason=str(raw.get("reason") or "").strip() or ("موافقة Gemini" if original_approved else "تحفظ Gemini")
-        if GEMINI_HARD_VETO: return {**raw,"approved":original_approved,"original_approved":original_approved,"advisory":False,"hard_veto":not original_approved,"reason":reason}
+        if hard_veto: return {**raw,"approved":original_approved,"original_approved":original_approved,"advisory":False,"hard_veto":not original_approved,"reason":reason}
         return {**raw,"approved":True,"original_approved":original_approved,"advisory":not original_approved,"hard_veto":False,"reason":reason}
     advisory._canonical_safety=True; bot.gemini_verify_signal=advisory; bot._raw_gemini_verify_signal=original
 
