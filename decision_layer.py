@@ -12,7 +12,7 @@ import requests
 import ta
 
 LOGGER = logging.getLogger("XAUUSD_QuantBot.DecisionLayer")
-_LOCK = threading.RLock(); _INSTALLED=False; _PATCHED=False
+_LOCK=threading.RLock(); _INSTALLED=False; _PATCHED=False
 _DXY_STATE={"symbol":None,"updated":0.0,"df":pd.DataFrame(),"quote":None,"error":None}
 _PRICE_HISTORY=deque(maxlen=3000)
 _LAST_LAWYER_ALERT=("",0.0)
@@ -42,11 +42,10 @@ def _ensure_schema(bot):
     conn=None
     try:
         conn=bot.get_db_connection(); pg=_is_pg(bot,conn); cur=conn.cursor()
-        stmts=(
-          ["CREATE TABLE IF NOT EXISTS decision_audit (id BIGSERIAL PRIMARY KEY,candle_id TEXT,direction TEXT,final_decision TEXT,confidence REAL,risk_score REAL,bull_score REAL,bear_score REAL,margin REAL,h4_trend TEXT,hmm_state TEXT,dxy_corr REAL,dxy_trend TEXT,dxy_pressure TEXT,rr REAL,reason TEXT,ai_approved INTEGER,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)","CREATE INDEX IF NOT EXISTS idx_decision_audit_created ON decision_audit(created_at)","CREATE INDEX IF NOT EXISTS idx_decision_audit_direction ON decision_audit(direction,created_at)","CREATE TABLE IF NOT EXISTS signal_setup_dedupe (setup_key TEXT PRIMARY KEY,direction TEXT,candle_id TEXT,price REAL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"]
-          if pg else
-          ["CREATE TABLE IF NOT EXISTS decision_audit (id INTEGER PRIMARY KEY AUTOINCREMENT,candle_id TEXT,direction TEXT,final_decision TEXT,confidence REAL,risk_score REAL,bull_score REAL,bear_score REAL,margin REAL,h4_trend TEXT,hmm_state TEXT,dxy_corr REAL,dxy_trend TEXT,dxy_pressure TEXT,rr REAL,reason TEXT,ai_approved INTEGER,created_at TEXT DEFAULT CURRENT_TIMESTAMP)","CREATE INDEX IF NOT EXISTS idx_decision_audit_created ON decision_audit(created_at)","CREATE INDEX IF NOT EXISTS idx_decision_audit_direction ON decision_audit(direction,created_at)","CREATE TABLE IF NOT EXISTS signal_setup_dedupe (setup_key TEXT PRIMARY KEY,direction TEXT,candle_id TEXT,price REAL,created_at TEXT DEFAULT CURRENT_TIMESTAMP"])
-        )
+        if pg:
+            stmts=["CREATE TABLE IF NOT EXISTS decision_audit (id BIGSERIAL PRIMARY KEY,candle_id TEXT,direction TEXT,final_decision TEXT,confidence REAL,risk_score REAL,bull_score REAL,bear_score REAL,margin REAL,h4_trend TEXT,hmm_state TEXT,dxy_corr REAL,dxy_trend TEXT,dxy_pressure TEXT,rr REAL,reason TEXT,ai_approved INTEGER,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)","CREATE INDEX IF NOT EXISTS idx_decision_audit_created ON decision_audit(created_at)","CREATE INDEX IF NOT EXISTS idx_decision_audit_direction ON decision_audit(direction,created_at)","CREATE TABLE IF NOT EXISTS signal_setup_dedupe (setup_key TEXT PRIMARY KEY,direction TEXT,candle_id TEXT,price REAL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"]
+        else:
+            stmts=["CREATE TABLE IF NOT EXISTS decision_audit (id INTEGER PRIMARY KEY AUTOINCREMENT,candle_id TEXT,direction TEXT,final_decision TEXT,confidence REAL,risk_score REAL,bull_score REAL,bear_score REAL,margin REAL,h4_trend TEXT,hmm_state TEXT,dxy_corr REAL,dxy_trend TEXT,dxy_pressure TEXT,rr REAL,reason TEXT,ai_approved INTEGER,created_at TEXT DEFAULT CURRENT_TIMESTAMP)","CREATE INDEX IF NOT EXISTS idx_decision_audit_created ON decision_audit(created_at)","CREATE INDEX IF NOT EXISTS idx_decision_audit_direction ON decision_audit(direction,created_at)","CREATE TABLE IF NOT EXISTS signal_setup_dedupe (setup_key TEXT PRIMARY KEY,direction TEXT,candle_id TEXT,price REAL,created_at TEXT DEFAULT CURRENT_TIMESTAMP)"]
         for s in stmts: cur.execute(s)
         conn.commit()
     except Exception as exc:
@@ -67,7 +66,7 @@ def _save_audit(bot,p):
         conn=bot.get_db_connection(); pg=_is_pg(bot,conn); cur=conn.cursor(); ph="%s" if pg else "?"
         keys=("candle_id","direction","final_decision","confidence","risk_score","bull_score","bear_score","margin","h4_trend","hmm_state","dxy_corr","dxy_trend","dxy_pressure","rr","reason","ai_approved")
         vals=tuple(p.get(k) for k in keys); cur.execute(f"INSERT INTO decision_audit({','.join(keys)}) VALUES ({','.join([ph]*len(keys))})",vals); conn.commit()
-    except Exception: 
+    except Exception:
         try:
             if conn: conn.rollback()
         except Exception: pass
@@ -216,7 +215,7 @@ def _generate(bot):
     if not ok: return {"status":"WAIT","reason":f"مستويات Entry/SL/TP غير صالحة: {why}","price":price}
     candle_time=pd.Timestamp(df.index[-1]).isoformat(); candle_id=f"XAUUSD_M15_{pd.Timestamp(df.index[-1]).strftime('%Y%m%d_%H%M')}"; note="تأكيد صاعد من السيولة/FVG" if direction=="BUY" else "تأكيد هابط من السيولة/FVG"
     sig={"status":"SIGNAL","type":"🟢 شراء مرن" if direction=="BUY" else "🔴 بيع مرن","entry":round(entry,2),"sl":sl,"tp1":tp1,"tp2":tp2,"rr":round(rr,2),"rsi":round(rsi,1),"dxy_corr":round(dxy,3) if data.get("dxy_corr") is not None else None,"dxy_trend":data.get("dxy_trend","UNKNOWN"),"dxy_pressure":data.get("dxy_pressure","NEUTRAL"),"confidence":int(conf*100),"risk":"1% مبدئياً (تُراجع حسب الثقة والتذبذب)","smc_note":note,"candle_id":candle_id,"signal_candle_close":round(float(c.iloc[-1]),2),"signal_candle_time":candle_time,"score_bull":sc["bull_score"],"score_bear":sc["bear_score"],"direction_margin":sc["margin"],"h4_trend":data["h4_trend"],"hmm_state":data["state_label"],"stop_distance":round(dist,2)}
-    ai=bot.gemini_verify_signal(sig,{"h4_trend":data["h4_trend"],"state_label":data["state_label"],"dxy_trend":data.get("dxy_trend"),"dxy_pressure":data.get("dxy_pressure"),"dxy_corr":data.get("dxy_corr"),"rr":rr}); sig["gemini_note"]=str(ai.get("reason") or "تمت المراجعة"); sig["ai_approved"]=ai.get("approved"); sig["ai_advisory"]=not bool(ai.get("approved")); sig["ai_score"]=1.0 if ai.get("approved") else 0.0; sig["final_decision"]="APPROVE_WITH_CAUTION" if not ai.get("approved") else "APPROVE"; sig["decision_state"]="TRADE_READY"; sig["final_reason"]="التحفظ من Gemini استشاري فقط؛ القرار الكمي النهائي يسمح بالدخول بحذر." if not ai.get("approved") else "اجتازت الإشارة التقييم الكمي ووافق Gemini."; return sig
+    ai=bot.gemini_verify_signal(sig,{"h4_trend":data["h4_trend"],"state_label":data["state_label"],"dxy_trend":data.get("dxy_trend"),"dxy_pressure":data.get("dxy_pressure"),"dxy_corr":data.get("dxy_corr"),"rr":rr}); raw_ai_approved=ai.get("original_approved",ai.get("approved")); sig["gemini_note"]=str(ai.get("reason") or "تمت المراجعة"); sig["ai_approved"]=raw_ai_approved; sig["ai_advisory"]=not bool(raw_ai_approved); sig["ai_score"]=1.0 if raw_ai_approved else 0.0; sig["final_decision"]="APPROVE_WITH_CAUTION" if not raw_ai_approved else "APPROVE"; sig["decision_state"]="TRADE_READY"; sig["final_reason"]="التحفظ من Gemini استشاري فقط؛ القرار الكمي النهائي يسمح بالدخول بحذر." if not raw_ai_approved else "اجتازت الإشارة التقييم الكمي ووافق Gemini."; return sig
 
 def _patch_generation(bot):
     def wrapped(*args,**kwargs):
