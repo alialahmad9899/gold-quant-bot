@@ -1,5 +1,7 @@
 from datetime import datetime, timezone, timedelta
 
+import pytest
+
 from production_hardening import parse_economic_surprise, price_reaction_from_event, semantic_news_signal
 
 
@@ -8,13 +10,13 @@ def test_surprise_parsing_actual_vs_forecast():
     assert result["actual"] == 3.4
     assert result["forecast"] == 3.0
     assert result["previous"] == 3.2
-    assert result["surprise"] == 0.4
+    assert result["surprise"] == pytest.approx(0.4)
 
 
 def test_positive_macro_surprise_is_gold_bearish():
     result = semantic_news_signal("US CPI Actual 3.4 Forecast 3.0", "inflation remains sticky")
     assert result["direction"] == "BEARISH_GOLD"
-    assert result["surprise"]["surprise"] == 0.4
+    assert result["surprise"]["surprise"] == pytest.approx(0.4)
 
 
 def test_negative_macro_surprise_is_gold_bullish():
