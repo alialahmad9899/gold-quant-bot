@@ -4,7 +4,11 @@ The project historically started several wrappers from independent daemon thread
 That can make wrapper order nondeterministic. This module installs the runtime in
 one explicit order after the canonical decision layer is ready:
 
-    Decision Layer -> Phase 2 -> Execution -> Diagnostics/UI
+    Decision Layer -> Phase 2 -> Execution
+
+If the legacy Twelve Data bootstrap has already attached a Phase2 wrapper after
+the decision layer became ready, that exact integration object is reused rather
+than stacking a second lifecycle manager.
 
 It also upgrades XAU/USD H1 history requests in-place so the canonical H4 EMA50 /
 EMA200 calculation has enough source candles. No second gold-price provider is
@@ -13,7 +17,6 @@ introduced; all market data still comes from Twelve Data.
 from __future__ import annotations
 
 import logging
-import re
 import threading
 import time
 from typing import Any
@@ -108,14 +111,10 @@ def _patch_market_cache(bot: Any) -> None:
         h4 = _h4_from_h1(h1)
         if len(h4) >= H4_REQUIRED_BARS:
             return data
-        # Never silently relabel a short H1 sample as a valid institutional H4 trend.
         LOGGER.warning("[H4_HISTORY] only %s H4 bars available; canonical H4 EMA50/EMA200 requires >= %s", len(h4), H4_REQUIRED_BARS)
-        try:
-            cache = getattr(bot, "GLOBAL_CACHE", None)
-            if isinstance(cache, dict):
-                cache["h4_history_health"] = {"bars": len(h4), "required": H4_REQUIRED_BARS, "valid": False}
-        except Exception:
-            pass
+        cache = getattr(bot, "GLOBAL_CACHE", None)
+        if isinstance(cache, dict):
+            cache["h4_history_health"] = {"bars": len(h4), "required": H4_REQUIRED_BARS, "valid": False}
         return data
 
     wrapped._h4_history_guard = True
@@ -129,11 +128,8 @@ def _mark_h4_health(bot: Any) -> None:
         cache = getattr(bot, "GLOBAL_CACHE", None)
         if isinstance(cache, dict):
             cache["h4_history_health"] = {
-                "bars": len(h4),
-                "required": H4_REQUIRED_BARS,
-                "valid": len(h4) >= H4_REQUIRED_BARS,
-                "ema_fast": 50,
-                "ema_slow": 200,
+                "bars": len(h4), "required": H4_REQUIRED_BARS,
+                "valid": len(h4) >= H4_REQUIRED_BARS, "ema_fast": 50, "ema_slow": 200,
             }
     except Exception as exc:
         LOGGER.warning("[H4_HISTORY] health calculation failed: %s", exc)
@@ -152,14 +148,22 @@ def _wait_for_decision_layer(timeout: float = 120.0) -> bool:
     return False
 
 
+def _existing_phase2(bot: Any):
+    current = getattr(bot, "generate_quant_signal", None)
+    owner = getattr(current, "__self__", None)
+    if owner is not None and owner.__class__.__name__ == "Phase2RuntimeIntegration":
+        return owner
+    return None
+
+
 def _install_phase2_and_execution(bot: Any) -> None:
-    # Phase 2 must wrap the already-patched canonical decision layer.
     from phase2_runtime_integration import Phase2RuntimeIntegration
-    manager_holder = getattr(bot, "_phase2_runtime_integration", None)
-    if not manager_holder:
+    integration = getattr(bot, "_phase2_runtime_integration", None) or _existing_phase2(bot)
+    if integration is None:
         integration = Phase2RuntimeIntegration(bot)
         integration.install()
-        bot._phase2_runtime_integration = integration
+    bot._phase2_runtime_integration = integration
+
     # Execution must be outermost so only final Phase 2-approved signals reach the ledger.
     import execution_bridge
     execution_bridge.install(bot)
