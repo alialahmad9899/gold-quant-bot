@@ -15,9 +15,7 @@ except Exception:
     psycopg2 = None
 LOGGER=logging.getLogger("XAUUSD_QuantBot.SignalSafety")
 _LOCK=threading.RLock(); _INSTALLED=False
-MAX_SIGNAL_FEED_AGE_SECONDS=float(os.getenv("SIGNAL_MAX_PRICE_AGE_SECONDS","120"))
-GEMINI_HARD_VETO=os.getenv("SIGNAL_SAFETY_GEMINI_HARD_VETO","0") == "1"
-MIN_CONFIDENCE=float(os.getenv("FINAL_MIN_CONFIDENCE","0.25")); MIN_RR=float(os.getenv("FINAL_MIN_RR","1.20")); MIN_STOP_PCT=float(os.getenv("FINAL_MIN_STOP_PCT","0.00120"))
+MAX_SIGNAL_FEED_AGE_SECONDS=float(os.getenv("SIGNAL_MAX_PRICE_AGE_SECONDS","120")); GEMINI_HARD_VETO=os.getenv("SIGNAL_SAFETY_GEMINI_HARD_VETO","0") == "1"; MIN_CONFIDENCE=float(os.getenv("FINAL_MIN_CONFIDENCE","0.25")); MIN_RR=float(os.getenv("FINAL_MIN_RR","1.20")); MIN_STOP_PCT=float(os.getenv("FINAL_MIN_STOP_PCT","0.00120"))
 
 def _parse_dt(value):
     try:
@@ -35,10 +33,8 @@ def _safe_feed(original,bot):
     safe=dict(feed); provider=str(safe.get("provider") or ""); age=safe.get("age_seconds")
     if age is None and (safe.get("source_timestamp") or safe.get("timestamp")):
         dt=_parse_dt(safe.get("source_timestamp") or safe.get("timestamp")); age=(datetime.now(timezone.utc)-dt).total_seconds() if dt else None
-    if "M15 Close" in provider:
-        safe.update({"status":"STALE","signal_safe":False,"error_type":"historical_fallback_blocked","error_message":"Historical M15 close cannot authorize a live trade."}); return safe
-    if age is not None and float(age)>MAX_SIGNAL_FEED_AGE_SECONDS:
-        safe.update({"status":"STALE","signal_safe":False,"error_type":"live_feed_stale","error_message":f"Live XAU/USD feed is {float(age):.1f}s old."}); return safe
+    if "M15 Close" in provider: safe.update({"status":"STALE","signal_safe":False,"error_type":"historical_fallback_blocked","error_message":"Historical M15 close cannot authorize a live trade."}); return safe
+    if age is not None and float(age)>MAX_SIGNAL_FEED_AGE_SECONDS: safe.update({"status":"STALE","signal_safe":False,"error_type":"live_feed_stale","error_message":f"Live XAU/USD feed is {float(age):.1f}s old."}); return safe
     safe["signal_safe"]=safe.get("status")=="ACTIVE"; return safe
 
 def _patch_feed(bot):
@@ -55,8 +51,7 @@ def _patch_gemini(bot):
         except Exception as exc: raw={"approved":False,"reason":f"تعذر تنفيذ مراجعة Gemini: {type(exc).__name__}: {exc}"}
         if not isinstance(raw,dict): raw={"approved":False,"reason":"رد Gemini غير صالح."}
         original_approved=bool(raw.get("approved",False)); reason=str(raw.get("reason") or "").strip() or ("موافقة Gemini" if original_approved else "تحفظ Gemini")
-        if GEMINI_HARD_VETO:
-            return {**raw,"approved":original_approved,"original_approved":original_approved,"advisory":False,"hard_veto":not original_approved,"reason":reason}
+        if GEMINI_HARD_VETO: return {**raw,"approved":original_approved,"original_approved":original_approved,"advisory":False,"hard_veto":not original_approved,"reason":reason}
         return {**raw,"approved":True,"original_approved":original_approved,"advisory":not original_approved,"hard_veto":False,"reason":reason}
     advisory._canonical_safety=True; bot.gemini_verify_signal=advisory; bot._raw_gemini_verify_signal=original
 
@@ -86,4 +81,7 @@ def install_signal_safety(bot:Any|None=None):
         try:
             import news_runtime; news_runtime.start(bot); bot._news_runtime=news_runtime
         except Exception as exc: LOGGER.exception("❌ News runtime installation failed: %s",exc)
-        _INSTALLED=True; LOGGER.info("✅ Canonical safety installed: Gemini advisory by default; decision layer + news runtime own final policy.")
+        try:
+            import runtime_diagnostics; runtime_diagnostics.install(bot); bot._runtime_diagnostics=runtime_diagnostics
+        except Exception as exc: LOGGER.exception("❌ Runtime diagnostics installation failed: %s",exc)
+        _INSTALLED=True; LOGGER.info("✅ Canonical safety installed: Gemini advisory by default; decision, news and diagnostics layers active.")
