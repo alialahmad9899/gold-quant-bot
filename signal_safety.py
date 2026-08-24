@@ -3,7 +3,8 @@
 Hard safety is limited to stale/invalid execution data and objectively invalid
 trade geometry. Gemini is advisory by default and the canonical decision layer
 owns the final policy. News runtime is started independently for timestamped
-reaction tracking and event clustering.
+reaction tracking and event clustering. The execution bridge persists final
+signals for Trade Lawyer and performance statistics.
 """
 from __future__ import annotations
 import logging, os, threading
@@ -84,4 +85,7 @@ def install_signal_safety(bot:Any|None=None):
         try:
             import runtime_diagnostics; runtime_diagnostics.install(bot); bot._runtime_diagnostics=runtime_diagnostics
         except Exception as exc: LOGGER.exception("❌ Runtime diagnostics installation failed: %s",exc)
-        _INSTALLED=True; LOGGER.info("✅ Canonical safety installed: Gemini advisory by default; decision, news and diagnostics layers active.")
+        try:
+            import execution_bridge; execution_bridge.install(bot); bot._execution_bridge=execution_bridge
+        except Exception as exc: LOGGER.exception("❌ Execution bridge installation failed: %s",exc)
+        _INSTALLED=True; LOGGER.info("✅ Canonical safety installed: decision + news + diagnostics + execution bridges active.")
