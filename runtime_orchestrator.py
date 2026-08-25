@@ -1,19 +1,4 @@
-"""Deterministic production bootstrap for the canonical XAU/USD runtime.
-
-The project historically started several wrappers from independent daemon threads.
-That can make wrapper order nondeterministic. This module installs the runtime in
-one explicit order after the canonical decision layer is ready:
-
-    Decision Layer -> Phase 2 -> Execution
-
-If the legacy Twelve Data bootstrap has already attached a Phase2 wrapper after
-the decision layer became ready, that exact integration object is reused rather
-than stacking a second lifecycle manager.
-
-It also upgrades XAU/USD H1 history requests in-place so the canonical H4 EMA50 /
-EMA200 calculation has enough source candles. No second gold-price provider is
-introduced; all market data still comes from Twelve Data.
-"""
+"""Deterministic production bootstrap for the canonical XAU/USD runtime."""
 from __future__ import annotations
 
 import logging
@@ -164,7 +149,6 @@ def _install_phase2_and_execution(bot: Any) -> None:
         integration.install()
     bot._phase2_runtime_integration = integration
 
-    # Execution must be outermost so only final Phase 2-approved signals reach the ledger.
     import execution_bridge
     execution_bridge.install(bot)
     bot._execution_bridge = execution_bridge
@@ -182,10 +166,16 @@ def install(bot: Any, timeout: float = 120.0) -> bool:
     try:
         _patch_market_cache(bot)
         _mark_h4_health(bot)
+
+        # Production fixes wrap the canonical Decision Layer before Phase 2.
+        import production_fix
+        production_fix.install(bot)
+        bot._production_fix = production_fix
+
         _install_phase2_and_execution(bot)
         with _LOCK:
             _INSTALLED = True
-        LOGGER.info("✅ Deterministic runtime order installed: Decision -> Phase2 -> Execution")
+        LOGGER.info("✅ Deterministic runtime order installed: Decision -> ProductionFix -> Phase2 -> Execution")
         return True
     except Exception as exc:
         LOGGER.exception("❌ Deterministic runtime orchestration failed: %s", exc)
