@@ -57,8 +57,6 @@ def _finite_price(value):
     except (TypeError,ValueError): return None
 
 def _live_price(bot):
-    # Prefer the already available live/market cache. Never import a bootstrap module
-    # from inside a signal check because imports may start background workers.
     try:
         market=bot.get_market_data() or {}; feed=market.get("price_feed") or {}
         for raw in (feed.get("mid"),feed.get("spot"),market.get("gold")):
@@ -68,8 +66,7 @@ def _live_price(bot):
     try:
         sitecustomize=sys.modules.get("sitecustomize")
         if sitecustomize is not None:
-            quote=sitecustomize.get_websocket_quote()
-            return _finite_price((quote or {}).get("price"))
+            quote=sitecustomize.get_websocket_quote(); return _finite_price((quote or {}).get("price"))
     except Exception: pass
     return None
 
@@ -163,11 +160,37 @@ def _lawyer_snapshot(bot):
             try: bot.release_db_connection(conn)
             except Exception: pass
 
+def _parse_direction(raw):
+    value=str(raw or "").upper()
+    if "BUY" in value or "شراء" in value: return "BUY"
+    if "SELL" in value or "بيع" in value: return "SELL"
+    return "UNKNOWN"
+
 def _stats_message(bot):
     conn=None
     try:
-        conn=bot.get_db_connection(); cur=conn.cursor(); cur.execute("SELECT COUNT(*) FROM runtime_decision_events"); total=int(cur.fetchone()[0] or 0); cur.execute("SELECT direction,COUNT(*) FROM runtime_decision_events GROUP BY direction"); candidates=dict(cur.fetchall()); cur.execute("SELECT direction,COUNT(*) FROM runtime_decision_events WHERE final_decision IN ('APPROVE','APPROVE_WITH_CAUTION') GROUP BY direction"); approved=dict(cur.fetchall()); cur.execute("SELECT COUNT(*) FROM trades WHERE outcome IS NULL AND trade_status IN ('OPEN','TP1_HIT')"); active=int(cur.fetchone()[0] or 0); return f"📊 تقرير القرار\nالمرشحون المسجلون: {total}\nBUY: {candidates.get('BUY',0)} مرشح / {approved.get('BUY',0)} مقبول\nSELL: {candidates.get('SELL',0)} مرشح / {approved.get('SELL',0)} مقبول\nالصفقات النشطة: {active}\n\nالإحصائيات مبنية على سجل القرارات، وليس على عدد الرسائل المرسلة فقط."
-    except Exception as exc: return f"⚠️ تعذر قراءة تقرير القرار حالياً: {type(exc).__name__}: {exc}"
+        conn=bot.get_db_connection(); cur=conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM trades")
+        trade_total=int(cur.fetchone()[0] or 0)
+        cur.execute("SELECT signal_type, COUNT(*) FROM trades GROUP BY signal_type")
+        trade_rows=cur.fetchall()
+        trade_buy=sum(int(count or 0) for signal_type,count in trade_rows if _parse_direction(signal_type)=="BUY")
+        trade_sell=sum(int(count or 0) for signal_type,count in trade_rows if _parse_direction(signal_type)=="SELL")
+        cur.execute("SELECT COUNT(*) FROM runtime_decision_events")
+        audit_total=int(cur.fetchone()[0] or 0)
+        cur.execute("SELECT COUNT(*) FROM trades WHERE outcome IS NULL AND trade_status IN ('OPEN','TP1_HIT')")
+        active=int(cur.fetchone()[0] or 0)
+        cur.execute("SELECT COUNT(*) FROM trades WHERE outcome IS NOT NULL")
+        closed=int(cur.fetchone()[0] or 0)
+        return ("📊 تقرير النظام\n"
+                f"الإشارات المسجلة فعلياً: {trade_total}\n"
+                f"BUY: {trade_buy}\n"
+                f"SELL: {trade_sell}\n"
+                f"الصفقات المغلقة: {closed}\n"
+                f"الصفقات النشطة: {active}\n"
+                f"أحداث تدقيق القرار: {audit_total}\n\n"
+                "المصدر المرجعي للإشارات هو سجل الصفقات المحفوظ؛ أحداث القرار تستخدم للتدقيق وليست بديلاً عنه.")
+    except Exception as exc: return f"⚠️ تعذر قراءة تقرير النظام حالياً: {type(exc).__name__}: {exc}"
     finally:
         if conn is not None:
             try: bot.release_db_connection(conn)
