@@ -5,7 +5,8 @@ local-development fallback so the lifecycle API stays backward compatible.
 """
 from __future__ import annotations
 
-import json, os, sqlite3
+import json, os, sqlite3, re
+from urllib.parse import urlsplit
 from pathlib import Path
 from threading import Lock
 
@@ -18,16 +19,33 @@ except Exception:  # pragma: no cover
 class TradeStateStore:
     def __init__(self, path: str | None = None):
         self.path = Path(path or os.getenv("TRADE_STATE_FILE", "trade_state.json"))
-        self.database_url = os.getenv("DATABASE_URL", "").strip()
+        self.database_url = self._effective_database_url()
         self.lock = Lock()
         self._ensure_database()
+
+    def _effective_database_url(self) -> str:
+        raw = os.getenv("DATABASE_URL", "").strip()
+        ref = os.getenv("SUPABASE_PROJECT_REF", "").strip()
+        if not raw or not ref:
+            return raw
+        try:
+            parsed = urlsplit(raw)
+            host = (parsed.hostname or "").lower()
+            if host.endswith(".pooler.supabase.com") and (parsed.port in (None, 5432)):
+                if parsed.username == "postgres":
+                    scheme_prefix = f"{parsed.scheme}://postgres"
+                    if raw.startswith(scheme_prefix):
+                        return raw[:len(scheme_prefix)] + f".{ref}" + raw[len(scheme_prefix):]
+        except Exception:
+            pass
+        return raw
 
     def _ensure_database(self) -> None:
         if not self.database_url: return
         conn = None
         try:
             if self.database_url.startswith(("postgres://", "postgresql://")) and psycopg2:
-                conn = psycopg2.connect(self.database_url)
+                conn = psycopg2.connect(self.database_url, sslmode="require", connect_timeout=5)
                 cur = conn.cursor(); cur.execute("CREATE TABLE IF NOT EXISTS trade_runtime_state (state_key TEXT PRIMARY KEY, payload JSONB NOT NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"); conn.commit()
             elif self.database_url.startswith("sqlite:///"):
                 db = self.database_url.removeprefix("sqlite:///"); conn = sqlite3.connect(db); conn.execute("CREATE TABLE IF NOT EXISTS trade_runtime_state (state_key TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at TEXT DEFAULT CURRENT_TIMESTAMP)"); conn.commit()
