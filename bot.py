@@ -15,6 +15,7 @@ import time
 import threading
 import warnings
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urlsplit
 import numpy as np
 import pandas as pd
 from hmmlearn.hmm import GaussianHMM
@@ -74,6 +75,7 @@ if not TOKEN:
     raise ValueError("❌ خطأ أمني حرج: متغير البيئة TELEGRAM_TOKEN غير مضبوط! يرجى ضبط التوكن في متغيرات البيئة على المنصة.")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+SUPABASE_PROJECT_REF = os.getenv("SUPABASE_PROJECT_REF", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", os.getenv("TWELVEDATA_API_KEY", ""))
 
@@ -479,14 +481,42 @@ def arabic_trade_status(value):
 # ------------------------------------
 pg_pool = None
 
+def _effective_database_url():
+    """Normalize Supabase Shared/Session Pooler URLs without exposing secrets.
+    
+    Supabase Session Pooler expects the project-qualified postgres identity
+    (postgres.<project-ref>) on port 5432. Keep direct/non-pooler URLs untouched.
+    """
+    if not DATABASE_URL:
+        return DATABASE_URL
+    try:
+        parsed = urlsplit(DATABASE_URL)
+        host = (parsed.hostname or "").lower()
+        if (
+            host.endswith(".pooler.supabase.com")
+            and (parsed.port in (None, 5432))
+            and SUPABASE_PROJECT_REF
+        ):
+            user = parsed.username or ""
+            if user == "postgres":
+                scheme = parsed.scheme
+                prefix = f"{scheme}://"
+                needle = prefix + "postgres"
+                if DATABASE_URL.startswith(needle):
+                    return DATABASE_URL[:len(needle)] + f".{SUPABASE_PROJECT_REF}" + DATABASE_URL[len(needle):]
+    except Exception:
+        pass
+    return DATABASE_URL
+
 def is_postgres():
+
     return DATABASE_URL is not None and len(DATABASE_URL.strip()) > 0
 
 def init_db_pool():
     global pg_pool
     if is_postgres():
         try:
-            url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+            url = _effective_database_url().replace("postgres://", "postgresql://", 1)
             pg_pool = psycopg2.pool.ThreadedConnectionPool(1, 10, url, sslmode='require', connect_timeout=5)
             print("✅ تم إنشاء مجمع اتصالات PostgreSQL بنجاح.")
         except Exception as e:
