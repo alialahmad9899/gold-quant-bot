@@ -16,7 +16,6 @@ import requests
 
 
 DEX_BASE = "https://api.dexscreener.com"
-MORALIS_UNIVERSAL = "https://api.moralis.com/v1"
 MORALIS_DEEP = "https://deep-index.moralis.io/api/v2.2"
 GOPLUS = "https://api.gopluslabs.io/api/v1"
 
