@@ -20,6 +20,7 @@ class Storage:
         self.database_url = self._effective_database_url((database_url or "").strip())
         self.sqlite_path = sqlite_path
         self.pg = self.database_url.lower().startswith(("postgres://", "postgresql://"))
+        self.database_error = None
         self._lock = threading.RLock()
         self._init_db()
 
@@ -55,6 +56,17 @@ class Storage:
         return conn
 
     def _init_db(self):
+        try:
+            self._init_db_once()
+        except Exception as exc:
+            if not self.pg or os.getenv("DATABASE_STRICT", "0") == "1":
+                raise
+            self.database_error = str(exc)
+            self.pg = False
+            self.database_url = ""
+            self._init_db_once()
+
+    def _init_db_once(self):
         with self._lock, self._connect() as conn:
             if self.pg:
                 cur = conn.cursor()
