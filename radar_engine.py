@@ -160,6 +160,7 @@ class HTTP:
 class DexScreenerClient:
     def __init__(self, http: HTTP):
         self.http = http
+        self.status = {"state": "UNKNOWN", "detail": "لم يُختبر بعد", "discovered": 0}
 
     def _latest(self, endpoint: str) -> list[dict]:
         data = self.http.get_json(f"{DEX_BASE}{endpoint}")
@@ -175,6 +176,7 @@ class DexScreenerClient:
     def discover_addresses(self) -> list[tuple[str, str, int]]:
         seen: set[tuple[str, str]] = set()
         found: list[tuple[str, str, int]] = []
+        errors: list[str] = []
         sources = (
             ("/token-profiles/latest/v1", 1),
             ("/token-boosts/latest/v1", 2),
@@ -192,12 +194,24 @@ class DexScreenerClient:
                     if key not in seen:
                         seen.add(key)
                         found.append((chain, addr, weight))
-            except Exception:
-                continue
+            except Exception as exc:
+                errors.append(f"{endpoint}: {_provider_error(exc)[1]}")
+        if found:
+            self.status = {
+                "state": "OK",
+                "detail": f"اكتشاف ناجح: {len(found)} عنوان"
+                + (f" | تحذير: {errors[-1]}" if errors else ""),
+                "discovered": len(found),
+            }
+        elif errors:
+            self.status = {"state": "ERROR", "detail": errors[-1], "discovered": 0}
+        else:
+            self.status = {"state": "EMPTY", "detail": "لم يرجع DEX Screener عناوين", "discovered": 0}
         return found
 
     def fetch_pairs(self, chain: str, addresses: list[str]) -> list[dict]:
         out: list[dict] = []
+        errors: list[str] = []
         for i in range(0, len(addresses), 30):
             batch = addresses[i:i + 30]
             joined = ",".join(batch)
@@ -205,8 +219,13 @@ class DexScreenerClient:
                 data = self.http.get_json(f"{DEX_BASE}/tokens/v1/{chain}/{joined}")
                 if isinstance(data, list):
                     out.extend(x for x in data if isinstance(x, dict))
-            except Exception:
-                continue
+            except Exception as exc:
+                errors.append(f"{chain}: {_provider_error(exc)[1]}")
+        if out:
+            self.status["state"] = "OK"
+            self.status["detail"] = f"أزواج السوق: {len(out)}"
+        elif errors:
+            self.status = {"state": "ERROR", "detail": errors[-1], "discovered": self.status.get("discovered", 0)}
         return out
 
 
