@@ -20,10 +20,10 @@ MORALIS_DEEP = "https://deep-index.moralis.io/api/v2.2"
 GOPLUS = "https://api.gopluslabs.io/api/v1"
 
 EVM_ALIASES = {
-    "ethereum": "ethereum",
-    "eth": "ethereum",
-    "bsc": "binance",
-    "binance": "binance",
+    "ethereum": "eth",
+    "eth": "eth",
+    "bsc": "bsc",
+    "binance": "bsc",
     "base": "base",
     "arbitrum": "arbitrum",
     "polygon": "polygon",
