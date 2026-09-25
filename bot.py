@@ -102,6 +102,13 @@ async def run_scan() -> list[dict]:
         state["last_scan_count"] = len(result)
         state["last_error"] = None
         storage.save_candidates(result)
+        logger.info(
+            "scan ok: discovered=%s market_rows=%s candidates=%s providers=%s",
+            getattr(engine, "last_scan", {}).get("discovered", 0),
+            getattr(engine, "last_scan", {}).get("market_rows", 0),
+            len(result),
+            {k: v.get("state") for k, v in getattr(engine, "last_provider_status", {}).items()},
+        )
         return result
     except Exception as exc:
         state["last_error"] = str(exc)
