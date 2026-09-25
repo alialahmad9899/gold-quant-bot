@@ -1,45 +1,81 @@
-# Gold Quant Bot
+# Crypto Radar
 
-بوت تداول كمي للذهب XAU/USD يعمل عبر Telegram، ويجمع بين التحليل متعدد الأطر، SMC/HMM/ML، إدارة دورة حياة الصفقة، Gemini، Trade Lawyer، وLive News Intelligence.
+هذا المشروع لم يعد بوت تداول ذهب. تمت إعادة بنائه كـ **Crypto Intelligence Radar** لمراقبة العملات الصغيرة والناشئة وتحليل مؤشرات الزخم والسيولة والأمان وSmart Money والأخبار، مع تنبيهات وتقارير عبر Telegram.
 
-## بنية المشروع
+## ما الذي يفعله الآن؟
 
-- `bot.py` — التطبيق الرئيسي ومحركات السوق والصفقات والتعلم.
-- `phase2_runtime_integration.py` — ربط الإشارة بدورة حياة الصفقة ومحامي الصفقة.
-- `institutional_trade_review.py` — مراجعة مخاطر مرنة قبل الدخول.
-- `signal_safety.py` — حواجز سلامة البيانات وتكرار الشمعة.
-- `news_intelligence.py` — تجميع وتحليل الأخبار قرب اللحظة.
-- `production_hardening.py` — معايرة Gemini، الأخبار، اتجاهات BUY/SELL، وobservability.
-- `tests/` — اختبارات regression.
+- يكتشف توكنات ناشئة عبر عدة مسارات من DEX Screener، مع مسار إضافي من Moralis عندما يكون مفتاحه مضبوطًا.
+- يفلتر السيولة والقيمة السوقية والحجم قبل التحليل الأعمق.
+- يستخدم GoPlus اختياريًا لفحص مخاطر العقود. توثيق GoPlus الحالي يوفّر Token Security API لـ EVM وSolana.
+- يستخدم Moralis اختياريًا لتحليل أفضل المتداولين، ثم يربط المحافظ الرابحة تاريخيًا بتحركاتها الحديثة على التوكن. Moralis يوثّق حاليًا endpoint مستقلًا لـ Top Traders by Token مع بيانات PnL والحجوم، إضافة إلى بيانات swap للمحافظ.
+- يقرأ عدة خلاصات أخبار + GDELT ويطابق الخبر مع اسم ورمز التوكن.
+- يعطي درجة تحليلية من 100، لكنها **ليست احتمالًا رياضيًا للصعود** ولا ضمانًا للربح.
+- لا ينفذ شراء أو بيع تلقائيًا.
 
-## بيانات السوق
+## فلسفة الإشارة
 
-Twelve Data هو مصدر XAU/USD الوحيد في الإنتاج. يتم فصل **Live Quote** عن **Historical Candles**؛ WebSocket يستخدم للسعر الحي عند توفره، وTime Series التاريخية تستخدم للتحليل M15/H1/H4. لا يوجد Yahoo Finance fallback للذهب.
+الهدف ليس اكتشاف عملة صعدت 300% بعد فوات الفرصة، بل اكتشاف الحالات التي تتقاطع فيها مؤشرات متعددة: سيولة مناسبة، تسارع بالحجم، ضغط شراء، حركة سعر مبكرة، أمان مقبول، وSmart Money عند توفر بيانات on-chain.
 
-## ذكاء الأخبار
+Boosts في DEX Screener تُعامل كإشارة ظهور/اهتمام وليست دليل جودة؛ DEX Screener نفسه يوضح أن الـBoost لا يضمن تصنيفًا أو نتيجة للسعر.
 
-توجد طبقة Live News Intelligence تجمع RSS/GDELT، تصنف أثر الخبر على الذهب، تلتقط Actual/Forecast/Previous عندما تكون منشورة، تجمع المقالات التي تمثل الحدث نفسه، وتربط الخبر بمراقبة حركة السعر قبل اعتبار الخبر سبباً لدخول فوري. الأخبار لا تتجاوز بوابات المخاطر أو تستبدل Twelve Data.
+## متغيرات البيئة
 
-## الذكاء الاصطناعي المرن
+المطلوب:
 
-Gemini في المراجعة المؤسسية مستشار adversarial وليس بوابة صارمة افتراضياً. الـhard veto محصور في المخاطر البنيوية/البيانات غير الصالحة وقواعد المخاطر الصريحة. يمكن تفعيل Gemini hard veto صراحة عبر `INSTITUTIONAL_AI_VETO=1` أو `SIGNAL_SAFETY_GEMINI_HARD_VETO=1`.
+- `TELEGRAM_TOKEN`
+- `BOT_PASSWORD`
 
-## Trade Lawyer
+للمراقبة على مستوى أعلى:
 
-محامي الصفقة يعمل تلقائياً أثناء وجود صفقة نشطة ويقدم HOLD / PROTECT_PROFIT / REDUCE_RISK / ADD_ON_CONFIRMATION / EXIT / PREPARE_REVERSAL، مع أوامر Telegram `/lawyer` و`/news` والأزرار التفاعلية.
+- `DATABASE_URL` — يفضّل PostgreSQL على Render/Supabase.
+- `MORALIS_API_KEY` — Smart Money وTop Traders.
+- `GOPLUS_API_KEY` — فحص أمان العقود.
+- `NEWS_FEEDS` — مصادر RSS مفصولة بفواصل.
 
-## التشغيل
+إعدادات اختيارية:
 
-اضبط متغيرات البيئة المطلوبة: `TELEGRAM_TOKEN` و`BOT_PASSWORD` و`DATABASE_URL` عند استخدام PostgreSQL، و`GEMINI_API_KEY` عند تفعيل Gemini، و`TWELVE_DATA_API_KEY`. ثم ثبّت الاعتماديات من `requirements.txt` وشغّل `python bot.py`.
+`MIN_LIQUIDITY_USD=20000`
+`MIN_MARKET_CAP_USD=50000`
+`MAX_MARKET_CAP_USD=25000000`
+`MAX_CANDIDATES=12`
+`SCAN_INTERVAL_SECONDS=300`
+`ALERT_SCORE_THRESHOLD=84`
+`ALERT_COOLDOWN_SECONDS=21600`
+`REPORT_HOUR=8`
+`REPORT_MINUTE=0`
+`BOT_TIMEZONE=Europe/Amsterdam`
+`ADMIN_CHAT_ID=0`
 
-## قاعدة البيانات
+## Render
 
-يفضل PostgreSQL عند توفير `DATABASE_URL`. SQLite متاح للتشغيل المحلي/التطويري. حالة اتجاهات BUY/SELL وملخصات أحداث الأخبار تحفظ في قاعدة البيانات عند توفرها.
+الخدمة الحالية يمكن أن تبقى Web Service بنفس:
 
-## التحقق
+`pip install -r requirements.txt`
 
-الحد الأدنى قبل النشر:
+و:
 
-`python3 -m py_compile bot.py`
+`python bot.py`
 
-`pytest -q`
+الخدمة تفتح health endpoint على `PORT` وتعيد JSON بسيطًا من `/` حتى تكون حالة العملية قابلة للفحص.
+
+## Telegram
+
+الأوامر الرئيسية:
+
+`/auth كلمة_المرور`
+`/scan`
+`/report`
+`/top`
+`/status`
+`/about`
+`/logout`
+
+## ملاحظات الدقة
+
+DEX Screener يوفّر حاليًا token profiles وboosts، وواجهات البحث/الأزواج والتوكنات، مع حدود طلبات موثقة؛ لذلك الكاش والفلترة المبكرة مقصودان لتقليل ضغط API.
+
+GDELT DOC API يدعم البحث بالكلمات والعبارات ويمكن تضييق النافذة الزمنية، وهو مستخدم هنا كمصدر خبر إضافي لا كمصدر وحيد.
+
+## المرحلة التالية
+
+بعد تشغيل الرادار وجمع snapshots فعلية، يمكن بناء backtesting حقيقي على البيانات المخزنة لمعرفة: ما الخصائص التي ظهرت قبل 2x و5x و10x تاريخيًا، وما نسبة الإنذارات الكاذبة. لا يتم افتراض هذه النسب قبل وجود بيانات.
