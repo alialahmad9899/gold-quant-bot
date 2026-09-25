@@ -600,7 +600,8 @@ def candidate_signal(candidate: dict[str, Any]) -> str:
         and buyer_ratio >= 0.58
         and accel >= 1.10
         and 1.0 <= h1 <= 35
-        and sm.get("available")\n        and sm.get("net_flow_usd", 0) >= 0
+        and sm.get("available")
+        and sm.get("net_flow_usd", 0) >= 0
     ):
         return "BUY_WATCH"
     if score >= 52 and completeness >= 0.5:
