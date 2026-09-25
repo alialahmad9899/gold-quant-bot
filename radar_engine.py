@@ -240,7 +240,8 @@ class GoPlusClient:
             self.status = {"state": "MISSING", "detail": "GOPLUS_API_KEY غير مضبوط"}
             return {"status": "UNKNOWN", "reason": "api_key_missing"}
 
-        token = self.api_key[7:].strip() if self.api_key.lower().startswith("bearer ") else self.api_key\n        headers = {"Authorization": f"Bearer {token}"}
+        token = self.api_key[7:].strip() if self.api_key.lower().startswith("bearer ") else self.api_key
+        headers = {"Authorization": f"Bearer {token}"}
         if chain == "solana":
             url = f"{GOPLUS}/solana/token_security"
         else:
