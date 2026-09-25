@@ -52,12 +52,39 @@ def _age_hours(pair_created_at: Any) -> float | None:
     return max(0.0, (time.time() - ts / 1000.0) / 3600.0)
 
 
-def _first_dict(data: Any) -> dict:
+def _result_rows(data: Any) -> list[dict]:
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
     if isinstance(data, dict):
-        return data
-    if isinstance(data, list) and data and isinstance(data[0], dict):
-        return data[0]
-    return {}
+        for key in ("result", "data", "tokens", "pairs", "wallets"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return [x for x in value if isinstance(x, dict)]
+    return []
+
+
+class HTTPStatusError(RuntimeError):
+    def __init__(self, status_code: int, url: str, message: str = ""):
+        self.status_code = status_code
+        self.url = url
+        self.message = message
+        detail = f"HTTP {status_code}"
+        if message:
+            detail += f": {message[:220]}"
+        super().__init__(detail)
+
+
+def _provider_error(exc: Exception) -> tuple[str, str]:
+    status = getattr(exc, "status_code", None)
+    if status == 401:
+        return "UNAUTHORIZED", "المفتاح مرفوض (401)"
+    if status == 403:
+        return "FORBIDDEN", "الوصول مرفوض (403)"
+    if status == 404:
+        return "NOT_FOUND", "المسار غير موجود (404)"
+    if status == 429:
+        return "RATE_LIMIT", "تم بلوغ حد الطلبات (429)"
+    return "ERROR", str(exc)[:220]
 
 
 @dataclass
@@ -106,21 +133,29 @@ class HTTP:
         self.session.headers.update({"User-Agent": "CryptoRadar/1.0"})
 
     def get_json(self, url: str, params: dict[str, Any] | None = None, headers: dict[str, str] | None = None) -> Any:
-        last = None
+        last: Exception | None = None
         for attempt in range(3):
             try:
                 r = self.session.get(url, params=params, headers=headers, timeout=self.timeout)
                 if r.status_code == 429:
-                    time.sleep(1.5 * (attempt + 1))
-                    continue
-                r.raise_for_status()
-                return r.json()
+                    last = HTTPStatusError(429, r.url, r.text)
+                    if attempt < 2:
+                        time.sleep(1.5 * (attempt + 1))
+                        continue
+                    raise last
+                if r.status_code >= 400:
+                    raise HTTPStatusError(r.status_code, r.url, r.text)
+                try:
+                    return r.json()
+                except ValueError as exc:
+                    raise RuntimeError(f"JSON غير صالح من {r.url}: {exc}") from exc
+            except HTTPStatusError:
+                raise
             except Exception as exc:
                 last = exc
                 if attempt < 2:
                     time.sleep(0.8 * (attempt + 1))
         raise RuntimeError(str(last) if last else "HTTP request failed")
-
 
 class DexScreenerClient:
     def __init__(self, http: HTTP):
@@ -179,8 +214,32 @@ class GoPlusClient:
     def __init__(self, http: HTTP, api_key: str):
         self.http = http
         self.api_key = api_key.strip()
+        self.status = {"state": "CONFIGURED" if self.api_key else "MISSING", "detail": "جاهز للفحص"}
+
+    @staticmethod
+    def _extract_token_result(data: Any, address: str) -> dict[str, Any]:
+        if not isinstance(data, dict):
+            return {}
+        raw = data.get("result")
+        if not isinstance(raw, dict):
+            return {}
+        for key in (address, address.lower(), address.upper()):
+            value = raw.get(key)
+            if isinstance(value, dict):
+                return value
+        values = [v for v in raw.values() if isinstance(v, dict)]
+        if len(values) == 1:
+            return values[0]
+        flat_keys = {"is_honeypot", "blacklist", "is_open_source", "buy_tax", "sell_tax"}
+        if flat_keys.intersection(raw):
+            return raw
+        return {}
 
     def check(self, chain: str, address: str) -> dict[str, Any]:
+        if not self.api_key:
+            self.status = {"state": "MISSING", "detail": "GOPLUS_API_KEY غير مضبوط"}
+            return {"status": "UNKNOWN", "reason": "api_key_missing"}
+
         headers = {"Authorization": f"Bearer {self.api_key}"}
         if chain == "solana":
             url = f"{GOPLUS}/solana/token_security"
@@ -191,59 +250,98 @@ class GoPlusClient:
                 "optimism": "10", "avalanche": "43114",
             }.get(chain)
             if not chain_id:
+                self.status = {"state": "UNSUPPORTED", "detail": f"السلسلة {chain} غير مدعومة"}
                 return {"status": "UNKNOWN", "reason": "chain_not_supported"}
             url = f"{GOPLUS}/token_security/{chain_id}"
-        data = self.http.get_json(url, params={"contract_addresses": address}, headers=headers)
-        result = _first_dict(data.get("result") if isinstance(data, dict) else {})
-        if not result:
-            return {"status": "UNKNOWN", "reason": "no_result"}
 
-        def flag(name: str) -> bool:
-            value = result.get(name)
-            return str(value).lower() in {"1", "true", "yes"}
+        started = time.monotonic()
+        try:
+            data = self.http.get_json(url, params={"contract_addresses": address}, headers=headers)
+            elapsed_ms = round((time.monotonic() - started) * 1000)
+            if isinstance(data, dict) and data.get("code") not in (None, 1, "1"):
+                detail = str(data.get("message") or f"GoPlus code={data.get('code')}")
+                self.status = {"state": "REJECTED", "detail": detail, "latency_ms": elapsed_ms}
+                return {"status": "UNKNOWN", "reason": "goplus_rejected", "provider_message": detail}
 
-        blockers = []
-        for field, reason in (
-            ("is_honeypot", "honeypot"),
-            ("blacklist", "blacklist"),
-            ("is_blacklisted", "blacklisted"),
-            ("can_take_back_ownership", "take_back_ownership"),
-            ("owner_change_balance", "owner_can_change_balance"),
-            ("hidden_owner", "hidden_owner"),
-            ("selfdestruct", "selfdestruct"),
-        ):
-            if flag(field):
-                blockers.append(reason)
+            result = self._extract_token_result(data, address)
+            if not result:
+                self.status = {"state": "EMPTY", "detail": "GoPlus أعاد نتيجة بدون بيانات توكن", "latency_ms": elapsed_ms}
+                return {"status": "UNKNOWN", "reason": "no_token_result"}
 
-        buy_tax = _num(result.get("buy_tax"))
-        sell_tax = _num(result.get("sell_tax"))
-        if buy_tax > 10:
-            blockers.append("high_buy_tax")
-        if sell_tax > 10:
-            blockers.append("high_sell_tax")
+            def flag(name: str) -> bool:
+                return str(result.get(name)).lower() in {"1", "true", "yes"}
 
-        status = "FAIL" if blockers else "PASS"
-        return {
-            "status": status,
-            "blockers": blockers,
-            "buy_tax": buy_tax,
-            "sell_tax": sell_tax,
-            "open_source": flag("is_open_source"),
-            "proxy": flag("is_proxy"),
-            "mintable": flag("is_mintable"),
-            "raw": result,
-        }
+            blockers = []
+            for field, reason in (
+                ("is_honeypot", "honeypot"),
+                ("blacklist", "blacklist"),
+                ("is_blacklisted", "blacklisted"),
+                ("can_take_back_ownership", "take_back_ownership"),
+                ("owner_change_balance", "owner_can_change_balance"),
+                ("hidden_owner", "hidden_owner"),
+                ("selfdestruct", "selfdestruct"),
+            ):
+                if flag(field):
+                    blockers.append(reason)
+
+            buy_tax = _num(result.get("buy_tax"))
+            sell_tax = _num(result.get("sell_tax"))
+            if buy_tax > 10:
+                blockers.append("high_buy_tax")
+            if sell_tax > 10:
+                blockers.append("high_sell_tax")
+
+            soft_flags = []
+            if not flag("is_open_source"):
+                soft_flags.append("not_open_source")
+            if flag("is_proxy"):
+                soft_flags.append("proxy")
+            if flag("is_mintable"):
+                soft_flags.append("mintable")
+
+            status = "FAIL" if blockers else "PASS"
+            self.status = {
+                "state": "OK",
+                "detail": f"فحص أمني ناجح: {status}",
+                "latency_ms": elapsed_ms,
+            }
+            return {
+                "status": status,
+                "blockers": blockers,
+                "soft_flags": soft_flags,
+                "buy_tax": buy_tax,
+                "sell_tax": sell_tax,
+                "open_source": flag("is_open_source"),
+                "proxy": flag("is_proxy"),
+                "mintable": flag("is_mintable"),
+                "raw": result,
+            }
+        except Exception as exc:
+            state, detail = _provider_error(exc)
+            self.status = {"state": state, "detail": detail}
+            return {
+                "status": "UNKNOWN",
+                "reason": "provider_error",
+                "provider_state": state,
+                "provider_detail": detail,
+            }
 
 
 class MoralisClient:
-    """Optional smart-money layer. It is deliberately not required for market scanning."""
+    """Optional on-chain intelligence layer using the current Moralis Token/Wallet APIs."""
 
     def __init__(self, http: HTTP, api_key: str):
         self.http = http
         self.api_key = api_key.strip()
+        self.status = {"state": "CONFIGURED" if self.api_key else "MISSING", "detail": "جاهز للفحص"}
+
+    @staticmethod
+    def chain_alias(chain: str) -> str | None:
+        return EVM_ALIASES.get(chain)
 
     def trending(self) -> list[dict]:
         if not self.api_key:
+            self.status = {"state": "MISSING", "detail": "MORALIS_API_KEY غير مضبوط"}
             return []
         try:
             data = self.http.get_json(
@@ -251,77 +349,89 @@ class MoralisClient:
                 params={"limit": 100},
                 headers={"X-API-Key": self.api_key},
             )
-            return data if isinstance(data, list) else []
-        except Exception:
+            rows = _result_rows(data)
+            self.status = {"state": "OK", "detail": f"Trending: {len(rows)} توكن"}
+            return rows
+        except Exception as exc:
+            state, detail = _provider_error(exc)
+            self.status = {"state": state, "detail": detail}
             return []
 
-    def top_traders(self, chain: str, address: str) -> dict[str, Any]:
-        alias = EVM_ALIASES.get(chain)
-        if not self.api_key or not alias:
-            return {}
+    def top_traders(self, chain: str, address: str) -> list[dict]:
+        alias = self.chain_alias(chain)
+        if not self.api_key:
+            self.status = {"state": "MISSING", "detail": "MORALIS_API_KEY غير مضبوط"}
+            return []
+        if not alias:
+            self.status = {"state": "UNSUPPORTED", "detail": f"السلسلة {chain} غير مدعومة في Moralis"}
+            return []
         try:
-            return self.http.get_json(
-                f"{MORALIS_UNIVERSAL}/chains/{alias}/tokens/{address}/top-traders",
-                params={
-                    "period": "30",
-                    "sortBy": "totalPnl",
-                    "excludeLowLiquidity": "true",
-                    "minTradeCount": 3,
-                    "limit": 10,
-                },
-                headers={"X-Api-Key": self.api_key},
+            data = self.http.get_json(
+                f"{MORALIS_DEEP}/erc20/{address}/top-gainers",
+                params={"chain": alias, "limit": 10},
+                headers={"X-API-Key": self.api_key},
             )
-        except Exception:
-            return {}
+            rows = _result_rows(data)
+            self.status = {"state": "OK", "detail": f"Top Traders: {len(rows)} محفظة"}
+            return rows
+        except Exception as exc:
+            state, detail = _provider_error(exc)
+            self.status = {"state": state, "detail": detail}
+            return []
 
     def recent_wallet_swaps(self, chain: str, wallet: str, token: str) -> list[dict]:
-        if not self.api_key or chain not in EVM_ALIASES:
+        alias = self.chain_alias(chain)
+        if not self.api_key or not alias:
             return []
-        alias = {"ethereum": "eth", "bsc": "bsc", "binance": "bsc"}.get(chain, chain)
-        since = (datetime.now(timezone.utc) - timedelta(hours=12)).strftime("%Y-%m-%dT%H:%M:%SZ")
         try:
             data = self.http.get_json(
                 f"{MORALIS_DEEP}/wallets/{wallet}/swaps",
                 params={
                     "chain": alias,
                     "tokenAddress": token,
-                    "fromDate": since,
                     "limit": 20,
                     "order": "DESC",
                 },
                 headers={"X-API-Key": self.api_key},
             )
-            return data.get("result", []) if isinstance(data, dict) else []
-        except Exception:
+            return _result_rows(data)
+        except Exception as exc:
+            state, detail = _provider_error(exc)
+            self.status = {"state": state, "detail": detail}
             return []
 
     def analyze(self, chain: str, address: str) -> dict[str, Any]:
-        data = self.top_traders(chain, address)
-        rows = data.get("result", []) if isinstance(data, dict) else []
+        rows = self.top_traders(chain, address)
         if not rows:
-            return {"available": False, "smart_money_count": 0, "current_buy_usd": 0.0,
-                    "current_sell_usd": 0.0, "net_flow_usd": 0.0, "wallets": []}
+            return {
+                "available": False,
+                "smart_money_count": 0,
+                "current_buy_usd": 0.0,
+                "current_sell_usd": 0.0,
+                "net_flow_usd": 0.0,
+                "wallets": [],
+            }
 
         good = []
-        for row in rows[:5]:
-            pnl = _num(row.get("totalPnlUsd"))
-            roi = _num(row.get("roi"))
-            wallet = str(row.get("walletAddress") or "").strip()
+        for row in rows[:10]:
+            pnl = _num(row.get("totalPnlUsd", row.get("realizedPnlUsd")))
+            roi = _num(row.get("roi", row.get("totalPnlPercent")))
+            wallet = str(row.get("address") or row.get("walletAddress") or row.get("wallet") or "").strip()
             if wallet and (pnl > 0 or roi > 0):
-                good.append((wallet, row))
+                good.append((wallet, pnl, roi))
 
         buy_usd = sell_usd = 0.0
         wallets = []
-        for wallet, row in good[:3]:
+        for wallet, pnl, roi in good[:5]:
             swaps = self.recent_wallet_swaps(chain, wallet, address)
             last_action = None
-            for swap in swaps[:5]:
-                action = str(swap.get("transactionType") or "").lower()
-                value = _num(swap.get("totalValueUsd"))
-                if action == "buy":
+            for swap in swaps[:20]:
+                action = str(swap.get("transactionType") or swap.get("type") or swap.get("side") or "").lower()
+                value = _num(swap.get("totalValueUsd") or swap.get("valueUsd") or swap.get("value"))
+                if action in {"buy", "swap_buy"}:
                     buy_usd += value
                     last_action = "BUY"
-                elif action == "sell":
+                elif action in {"sell", "swap_sell"}:
                     sell_usd += value
                     last_action = "SELL"
             wallets.append({
@@ -331,6 +441,8 @@ class MoralisClient:
                 "recent_action": last_action,
             })
 
+        self.status["state"] = "OK"
+        self.status["detail"] = f"Smart Money: {len(good)} محافظ مربحة"
         return {
             "available": True,
             "smart_money_count": len(good),
@@ -461,6 +573,40 @@ def market_score(m: MarketSnapshot) -> float:
     return _clamp(score, 0.0, 60.0)
 
 
+def candidate_signal(candidate: dict[str, Any]) -> str:
+    m = candidate.get("market", {})
+    score = _num(candidate.get("score"))
+    sec = candidate.get("security_status")
+    completeness = _num(candidate.get("data_completeness"))
+    buyers = _num(m.get("buys_1h"))
+    sells = _num(m.get("sells_1h"))
+    total = buyers + sells
+    buyer_ratio = buyers / total if total else 0.5
+    accel = _num(m.get("volume_acceleration"))
+    h1 = _num(m.get("price_h1"))
+    liquidity = _num(m.get("liquidity_usd"))
+    risk_flags = set(candidate.get("risk_flags", []))
+    sm = candidate.get("smart_money", {}) or {}
+
+    if sec == "FAIL" or liquidity < 20_000:
+        return "AVOID"
+    if "sell_pressure" in risk_flags or "already_vertical" in risk_flags:
+        return "WATCH"
+    if (
+        sec == "PASS"
+        and completeness >= 0.75
+        and score >= 78
+        and buyer_ratio >= 0.58
+        and accel >= 1.10
+        and 1.0 <= h1 <= 35
+        and (not sm.get("available") or sm.get("net_flow_usd", 0) >= 0)
+    ):
+        return "BUY_WATCH"
+    if score >= 52 and completeness >= 0.5:
+        return "WATCH"
+    return "AVOID"
+
+
 class RadarEngine:
     def __init__(self):
         self.http = HTTP()
@@ -475,6 +621,8 @@ class RadarEngine:
         self.max_candidates = int(os.getenv("MAX_CANDIDATES", "12"))
         self.security_limit = int(os.getenv("SECURITY_CHECK_LIMIT", "25"))
         self.smart_money_limit = int(os.getenv("SMART_MONEY_CHECK_LIMIT", "10"))
+        self.last_scan = {"discovered": 0, "market_rows": 0, "candidates": 0}
+        self.last_provider_status = {}
 
     def _market_rows(self) -> list[MarketSnapshot]:
         discovered = self.dex.discover_addresses()
@@ -555,8 +703,46 @@ class RadarEngine:
             dedup.setdefault((row.chain, row.address.lower()), row)
         return list(dedup.values())
 
+    def diagnose(self) -> dict[str, Any]:
+        result = {
+            "dex": dict(self.dex.status),
+            "moralis": dict(self.moralis.status),
+            "goplus": (
+                dict(self.goplus.status)
+                if self.goplus
+                else {"state": "MISSING", "detail": "GOPLUS_API_KEY غير مضبوط"}
+            ),
+        }
+
+        try:
+            discovered = self.dex.discover_addresses()
+            result["dex"] = {
+                "state": self.dex.status.get("state"),
+                "detail": f"اكتشاف DEX: {len(discovered)} عنوان",
+            }
+        except Exception:
+            result["dex"] = dict(self.dex.status)
+
+        if self.moralis.api_key:
+            self.moralis.trending()
+            result["moralis"] = dict(self.moralis.status)
+
+        if self.goplus:
+            probe = self.goplus.check(
+                "ethereum",
+                "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+            )
+            result["goplus"] = dict(self.goplus.status)
+            result["goplus"]["probe_status"] = probe.get("status")
+
+        self.last_provider_status = result
+        return result
+
     def scan(self) -> list[dict[str, Any]]:
         rows = self._market_rows()
+        self.last_scan["discovered"] = self.dex.status.get("discovered", 0)
+        self.last_scan["market_rows"] = len(rows)
+
         rows.sort(key=market_score, reverse=True)
         rows = rows[: max(self.security_limit, self.smart_money_limit, self.max_candidates)]
 
@@ -564,14 +750,19 @@ class RadarEngine:
         candidates: list[dict[str, Any]] = []
         for idx, m in enumerate(rows):
             base = market_score(m)
+
             security = {"status": "UNKNOWN"}
             if self.goplus and idx < self.security_limit:
-                try:
-                    security = self.goplus.check(m.chain, m.address)
-                except Exception as exc:
-                    security = {"status": "UNKNOWN", "reason": str(exc)}
+                security = self.goplus.check(m.chain, m.address)
 
-            sm = {"available": False, "smart_money_count": 0, "net_flow_usd": 0.0, "current_buy_usd": 0.0, "current_sell_usd": 0.0, "wallets": []}
+            sm = {
+                "available": False,
+                "smart_money_count": 0,
+                "net_flow_usd": 0.0,
+                "current_buy_usd": 0.0,
+                "current_sell_usd": 0.0,
+                "wallets": [],
+            }
             if self.moralis.api_key and idx < self.smart_money_limit:
                 sm = self.moralis.analyze(m.chain, m.address)
 
@@ -589,11 +780,17 @@ class RadarEngine:
             if news.get("mentions", 0) > 0:
                 score += min(4, news["mentions"])
 
-            available_components = 4  # market, security, smart money, news
-            present = 1 + int(security.get("status") != "UNKNOWN") + int(sm.get("available")) + int(news.get("mentions", 0) > 0)
+            available_components = 4
+            present = (
+                1
+                + int(security.get("status") != "UNKNOWN")
+                + int(sm.get("available"))
+                + int(news.get("mentions", 0) > 0)
+            )
             completeness = round(present / available_components, 2)
 
             risk_flags = list(security.get("blockers", []))
+            risk_flags.extend(security.get("soft_flags", [])[:3])
             if m.liquidity_usd < 50_000:
                 risk_flags.append("low_liquidity")
             if m.volume_acceleration > 10:
@@ -621,7 +818,24 @@ class RadarEngine:
                 "market": asdict(m),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
+            candidate["signal"] = candidate_signal(candidate)
             candidates.append(candidate)
 
-        candidates.sort(key=lambda x: x["score"], reverse=True)
+        candidates.sort(
+            key=lambda x: (
+                x["signal"] != "BUY_WATCH",
+                -x["score"],
+                x["security_status"] != "PASS",
+            )
+        )
+        self.last_scan["candidates"] = min(len(candidates), self.max_candidates)
+        self.last_provider_status = {
+            "dex": dict(self.dex.status),
+            "moralis": dict(self.moralis.status),
+            "goplus": (
+                dict(self.goplus.status)
+                if self.goplus
+                else {"state": "MISSING", "detail": "GOPLUS_API_KEY غير مضبوط"}
+            ),
+        }
         return candidates[: self.max_candidates]
