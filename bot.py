@@ -49,8 +49,8 @@ def is_authorized(chat_id: int) -> bool:
 def keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("🔎 فحص الآن"), KeyboardButton("🏆 الأعلى")],
-            [KeyboardButton("🌅 التقرير"), KeyboardButton("📊 الحالة")],
+            [KeyboardButton("🔎 فحص الآن"), KeyboardButton("🟢 فرص شراء"), KeyboardButton("🏆 الأعلى")],
+            [KeyboardButton("🌅 التقرير"), KeyboardButton("🧪 فحص الخدمات"), KeyboardButton("📊 الحالة")],
             [KeyboardButton("ℹ️ عن الرادار"), KeyboardButton("🚪 خروج")],
         ],
         resize_keyboard=True,
@@ -74,9 +74,16 @@ def candidate_text(c: dict, rank: int | None = None) -> str:
         f"صافي {sm.get('net_flow_usd', 0):,.0f}$"
         if sm.get("available") else "🧠 Smart Money: غير متاح حاليًا"
     )
+    signal_map = {
+        "BUY_WATCH": "🟢 فرصة شراء",
+        "WATCH": "🟡 مراقبة",
+        "AVOID": "🔴 تجنب",
+    }
+    signal = signal_map.get(c.get("signal"), "⚪ غير حاسم")
     return (
         f"{label}🪙 {c['symbol']} — {c['name']}\n"
-        f"⛓️ {c['chain']} | الدرجة {c['score']}/100 | أمان {sec}\n"
+        f"⛓️ {c['chain']} | القرار: {signal}\n"
+        f"📊 الدرجة: {c['score']}/100 | أمان: {sec}\n"
         f"💵 السعر: {m.get('price_usd', 0):.10g}\n"
         f"💧 السيولة: {m.get('liquidity_usd', 0):,.0f}$ | MCap: {m.get('market_cap', 0):,.0f}$\n"
         f"📈 الحجم 1h: {m.get('volume_1h', 0):,.0f}$ | تسارع {m.get('volume_acceleration', 0):.1f}x\n"
@@ -191,6 +198,69 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(f"❌ تعذر إنشاء التقرير: {exc}")
 
 
+async def buy_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_chat.id):
+        return await deny(update)
+    try:
+        candidates = await run_scan()
+        picks = [x for x in candidates if x.get("signal") == "BUY_WATCH"]
+        if not picks:
+            return await update.effective_message.reply_text(
+                "🟡 حاليًا ما في مرشح استوفى شروط فرصة الشراء. هذا أفضل من إعطاء إشارة ناقصة البيانات."
+            )
+        parts = []
+        for i, c in enumerate(picks[:5], 1):
+            parts.append(
+                f"{i}. {candidate_text(c)}\n"
+                "🛒 الإجراء: راجع الرابط يدويًا قبل أي تنفيذ."
+            )
+        await update.effective_message.reply_text(
+            "\n\n".join(parts),
+            disable_web_page_preview=True,
+        )
+    except Exception as exc:
+        await update.effective_message.reply_text(f"❌ تعذر استخراج فرص الشراء: {exc}")
+
+
+async def services(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_chat.id):
+        return await deny(update)
+    try:
+        result = await asyncio.to_thread(engine.diagnose)
+
+        def line(name: str, item: dict) -> str:
+            state_name = item.get("state", "UNKNOWN")
+            detail = item.get("detail", "لا توجد تفاصيل")
+            icon = {
+                "OK": "✅",
+                "CONFIGURED": "🟡",
+                "MISSING": "⚠️",
+                "UNAUTHORIZED": "❌",
+                "FORBIDDEN": "⛔",
+                "RATE_LIMIT": "⏳",
+                "NOT_FOUND": "❌",
+                "REJECTED": "❌",
+                "EMPTY": "⚠️",
+                "ERROR": "❌",
+            }.get(state_name, "⚪")
+            return f"{icon} {name}: {state_name}\n   {detail}"
+
+        await update.effective_message.reply_text(
+            "🧪 فحص الخدمات\n\n"
+            + "\n\n".join(
+                line(label, result.get(key, {}))
+                for key, label in (
+                    ("dex", "DEX Screener"),
+                    ("moralis", "Moralis"),
+                    ("goplus", "GoPlus"),
+                )
+            )
+            + "\n\nملاحظة: الفحص يميّز بين المفتاح المفقود، المفتاح المرفوض، وحدّ الطلبات."
+        )
+    except Exception as exc:
+        await update.effective_message.reply_text(f"❌ تعذر فحص الخدمات: {exc}")
+
+
 async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_chat.id):
         return await deny(update)
@@ -208,14 +278,25 @@ async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_chat.id):
         return await deny(update)
+    provider = getattr(engine, "last_provider_status", {}) or {}
+
+    def provider_line(name: str) -> str:
+        item = provider.get(name, {}) or {}
+        state_name = item.get("state", "UNKNOWN")
+        detail = item.get("detail", "")
+        icon = "✅" if state_name == "OK" else "❌" if state_name in {"UNAUTHORIZED", "FORBIDDEN", "ERROR", "REJECTED"} else "⚠️"
+        return f"{icon}{name}: {state_name}" + (f" — {detail}" if detail else "")
+
+    scan_meta = getattr(engine, "last_scan", {}) or {}
     await update.effective_message.reply_text(
         "📊 Crypto Radar\n"
         f"الحالة: {'يعمل' if state['running'] else 'متوقف'}\n"
         f"آخر فحص: {state['last_scan_at'] or 'لم يبدأ'}\n"
-        f"آخر عدد: {state['last_scan_count']}\n"
+        f"اكتشف: {scan_meta.get('discovered', 0)} | اجتاز السوق: {scan_meta.get('market_rows', 0)} | النتائج: {scan_meta.get('candidates', 0)}\n"
         f"قاعدة البيانات: {storage.stats()['backend']}\n"
-        f"Moralis: {'✅' if os.getenv('MORALIS_API_KEY') else '⚠️ غير مضبوط'}\n"
-        f"GoPlus: {'✅' if os.getenv('GOPLUS_API_KEY') else '⚠️ غير مضبوط'}\n"
+        + provider_line("moralis") + "\n"
+        + provider_line("goplus") + "\n"
+        + provider_line("dex") + "\n"
         f"آخر خطأ: {state['last_error'] or 'لا يوجد'}"
     )
 
@@ -235,8 +316,10 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await deny(update)
     mapping = {
         "🔎 فحص الآن": scan,
+        "🟢 فرص شراء": buy_watch,
         "🏆 الأعلى": top,
         "🌅 التقرير": report,
+        "🧪 فحص الخدمات": services,
         "📊 الحالة": status,
         "ℹ️ عن الرادار": about,
         "🚪 خروج": logout,
@@ -300,6 +383,7 @@ def main():
     for name, fn in {
         "start": start, "auth": auth, "logout": logout, "scan": scan,
         "report": report, "top": top, "status": status, "about": about,
+        "buy_watch": buy_watch, "services": services,
     }.items():
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
@@ -316,6 +400,13 @@ def main():
             name="daily-report",
         )
     logger.info("Crypto Radar starting")
+    logger.info(
+        "Provider config: Moralis=%s GoPlus=%s DB=%s scan_interval=%ss",
+        bool(os.getenv("MORALIS_API_KEY")),
+        bool(os.getenv("GOPLUS_API_KEY") or os.getenv("GOPLUS_ACCESS_TOKEN")),
+        storage.stats()["backend"],
+        SCAN_INTERVAL,
+    )
     app.run_polling(drop_pending_updates=True)
 
 
