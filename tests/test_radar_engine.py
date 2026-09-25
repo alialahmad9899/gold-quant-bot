@@ -2,7 +2,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from radar_engine import GoPlusClient, MarketSnapshot, MoralisClient, candidate_signal, market_score
+from radar_engine import DexScreenerClient, GoPlusClient, MarketSnapshot, MoralisClient, candidate_signal, market_score
 
 
 def make(**kwargs):
@@ -85,3 +85,14 @@ def test_moralis_uses_current_token_top_gainers_endpoint():
     assert rows and rows[0]["address"] == "0xwallet"
     assert "/erc20/0xtoken/top-gainers" in http.calls[0][0]
     assert http.calls[0][1]["chain"] == "eth"
+
+
+
+def test_dex_client_tracks_provider_status():
+    class EmptyHTTP:
+        def get_json(self, url, params=None, headers=None):
+            return []
+
+    client = DexScreenerClient(EmptyHTTP())
+    assert client.discover_addresses() == []
+    assert client.status["state"] == "EMPTY"
