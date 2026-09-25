@@ -240,7 +240,7 @@ class GoPlusClient:
             self.status = {"state": "MISSING", "detail": "GOPLUS_API_KEY غير مضبوط"}
             return {"status": "UNKNOWN", "reason": "api_key_missing"}
 
-        headers = {"Authorization": f"Bearer {self.api_key}"}
+        token = self.api_key[7:].strip() if self.api_key.lower().startswith("bearer ") else self.api_key\n        headers = {"Authorization": f"Bearer {token}"}
         if chain == "solana":
             url = f"{GOPLUS}/solana/token_security"
         else:
@@ -599,7 +599,7 @@ def candidate_signal(candidate: dict[str, Any]) -> str:
         and buyer_ratio >= 0.58
         and accel >= 1.10
         and 1.0 <= h1 <= 35
-        and (not sm.get("available") or sm.get("net_flow_usd", 0) >= 0)
+        and sm.get("available")\n        and sm.get("net_flow_usd", 0) >= 0
     ):
         return "BUY_WATCH"
     if score >= 52 and completeness >= 0.5:
