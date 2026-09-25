@@ -37,7 +37,7 @@ def test_candidate_signal_requires_security_for_buy_watch():
         "security_status": "PASS",
         "data_completeness": 1.0,
         "risk_flags": [],
-        "smart_money": {"available": False, "net_flow_usd": 0},
+        "smart_money": {"available": True, "net_flow_usd": 25_000},
         "market": {
             "buys_1h": 700, "sells_1h": 300,
             "volume_acceleration": 1.8, "price_h1": 12,
