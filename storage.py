@@ -6,6 +6,7 @@ import sqlite3
 import threading
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlsplit
 
 
 def _utc_now() -> str:
@@ -16,12 +17,28 @@ class Storage:
     """Small persistence layer: PostgreSQL in production, SQLite fallback locally."""
 
     def __init__(self, database_url: str | None = None, sqlite_path: str = "radar.db"):
-        self.database_url = (database_url or "").strip()
+        self.database_url = self._effective_database_url((database_url or "").strip())
         self.sqlite_path = sqlite_path
         self.pg = self.database_url.lower().startswith(("postgres://", "postgresql://"))
         self._lock = threading.RLock()
         self._init_db()
 
+    @staticmethod
+    def _effective_database_url(raw: str) -> str:
+        ref = os.getenv("SUPABASE_PROJECT_REF", "").strip()
+        if not raw or not ref:
+            return raw
+        try:
+            parsed = urlsplit(raw)
+            host = (parsed.hostname or "").lower()
+            user = parsed.username or ""
+            if host.endswith(".pooler.supabase.com") and user == "postgres":
+                marker = "://postgres"
+                if marker in raw:
+                    return raw.replace(marker, f"://postgres.{ref}", 1)
+        except Exception:
+            pass
+        return raw
     def _pg_connect(self):
         import psycopg2
         url = self.database_url
